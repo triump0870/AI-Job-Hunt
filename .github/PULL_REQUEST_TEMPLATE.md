@@ -19,4 +19,4 @@
 
 - [ ] I understand that the [CLA](https://github.com/triump0870/AI-Job-Hunt/blob/main/CLA.md) grants **Rohan Roy** broad nonexclusive rights, **including commercial hosting, sublicensing and proprietary relicensing**, without royalties. My own copyright is retained.
 
-The CLA is signed through CLA Assistant: its bot comments on this pull request with a link the first time you contribute. A pull request is merged only once the `license/cla` check is green; a checked box is not a signature.
+The CLA is signed on this pull request: the first time you contribute, the CLA Assistant bot comments with the sentence to post. A pull request is merged only once the `CLA Assistant` check is green; a checked box is not a signature.
