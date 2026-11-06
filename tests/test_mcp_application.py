@@ -13,7 +13,15 @@ from app.db import SessionLocal
 from app.main import app
 from app.mcp import tools
 from app.mcp.server import build_server, run_tool
-from app.models import Application, ApplicationEvent, ConversationAction, Evidence, Job, KnowledgeAnswer, ResumeVariant
+from app.models import (
+    Application,
+    ApplicationEvent,
+    ConversationAction,
+    Evidence,
+    Job,
+    KnowledgeAnswer,
+    ResumeVariant,
+)
 from app.services import llm
 from app.services.knowledge import question_key
 from app.services.user_settings import profile_for
@@ -146,7 +154,7 @@ def test_packet_is_the_approved_version_as_uploadable_files(account, packet_dir)
     assert out["ok"] and out["resume"]["version"] == 2 and out["resume"]["reviewer_score"] == 92
     assert out["cover_letter"] == "Dear Grab," and out["screening_answer_drafts"] == {"why": "Payments"}
     assert out["apply_url"] == "https://grab.example.test/apply/1" and out["rules"]
-    files = {f["format"]: f for f in out["files"]}
+    files = {f["format"]: f for f in out["files"] if f["role"] == "resume"}
     assert set(files) == {"pdf", "docx"}
     assert files["pdf"]["filename"] == "test-candidate-grab-v2.pdf" and files["docx"]["filename"] == "test-candidate-grab-v2.docx"
     pdf = Path(files["pdf"]["path"])
@@ -155,8 +163,9 @@ def test_packet_is_the_approved_version_as_uploadable_files(account, packet_dir)
     assert files["pdf"]["size_bytes"] == pdf.stat().st_size and "content_base64" not in files["pdf"]
 
     inline = call(account["user_id"], "get_job_packet", job_id=account["grab"], formats=["docx"], include_content=True)
-    [docx] = inline["files"]
+    docx, letter = inline["files"]
     assert docx["format"] == "docx" and base64.b64decode(docx["content_base64"]).startswith(b"PK")
+    assert docx["role"] == "resume" and letter["role"] == "cover_letter" and letter["format"] == "docx"
     assert call(account["user_id"], "get_job_packet", job_id=account["grab"], formats=["exe"])["ok"] is False
 
 
@@ -390,3 +399,205 @@ def test_tools_are_served_and_audited_without_content(account):
     assert rows[1].arguments_summary["question"] == {"length": len("Secret project codename?")}
     assert rows[2].entity_id == account["grab"] and rows[2].result_summary == {"outcome": "SUBMITTED"}
     assert rows[2].arguments_summary["outcome"] == "submitted"
+
+
+# ───────────── routes: who applies ─────────────
+
+def _set_url(user_id, job_id, url):
+    with session(user_id) as db:
+        job = db.get(Job, job_id)
+        job.direct_apply_url, job.url = url, url
+        db.commit()
+
+
+@pytest.mark.parametrize("url, ats, who", [
+    ("https://www.linkedin.com/jobs/view/4465457931", "linkedin", "person"),
+    ("https://www.indeed.com/viewjob?jk=abc", "indeed", "person"),
+    ("https://jobs.ashbyhq.com/acme/123", "ashby", "person"),
+    ("https://boards.greenhouse.io/grab/jobs/123", "greenhouse", "claude"),
+    ("https://careers.grab.example.test/apply/1", "generic", "claude"),
+])
+def test_each_job_says_who_applies(account, url, ats, who):
+    uid = account["user_id"]
+    _set_url(uid, account["grab"], url)
+    listed = next(j for j in call(uid, "list_jobs_for_application")["jobs"] if j["job_id"] == account["grab"])
+    route = listed["route"]
+    assert route["ats"] == ats and route["who_applies"] == who and route["reason"]
+    assert route["apply_domain"] == url.split("/")[2]
+    if who == "person":
+        assert "candidate applies" in route["reason"]
+    assert call(uid, "get_job_packet", job_id=account["grab"])["route"] == route
+
+
+def test_jobs_can_be_listed_by_who_applies(account):
+    uid = account["user_id"]
+    _set_url(uid, account["grab"], "https://www.linkedin.com/jobs/view/1")
+    person = call(uid, "list_jobs_for_application", who_applies="person")
+    assert [j["company"] for j in person["jobs"]] == ["Grab"] and person["total"] == 1
+    claude = call(uid, "list_jobs_for_application", who_applies="claude")
+    assert [j["company"] for j in claude["jobs"]] == ["Stripe"]
+    assert call(uid, "list_jobs_for_application", who_applies="robot")["ok"] is False
+
+
+def test_the_application_rules_leave_linkedin_indeed_and_ashby_to_the_person():
+    from app.prompts.mcp_application import (
+        APPLICATION_RULES,
+        MCP_APPLICATION_PROMPT_VERSION,
+        build_mcp_application_prompt,
+    )
+
+    assert MCP_APPLICATION_PROMPT_VERSION == "v3"
+    rule = next(r for r in APPLICATION_RULES if "who_applies" in r)
+    assert all(name in rule for name in ("LinkedIn", "Indeed", "Ashby"))
+    assert "who_applies is person" in build_mcp_application_prompt(3)
+
+
+# ───────────── cover letter files ─────────────
+
+def _pdf_text(path):
+    from pypdf import PdfReader
+
+    return " ".join(" ".join((page.extract_text() or "").split()) for page in PdfReader(path).pages)
+
+
+def _docx_text(path):
+    from docx import Document
+
+    return " ".join(" ".join(p.text.split()) for p in Document(path).paragraphs if p.text.strip())
+
+
+def test_the_approved_cover_letter_comes_as_pdf_and_docx(account, packet_dir):
+    uid = account["user_id"]
+    letter = "Dear Grab team,\n\nI scaled a payments API to 25k requests per second.\n\nKind regards,\nTest Candidate"
+    with session(uid) as db:
+        variant = db.scalar(select(ResumeVariant).where(ResumeVariant.job_id == account["grab"]))
+        variant.cover_letter = letter
+        db.commit()
+    out = call(uid, "get_job_packet", job_id=account["grab"])
+    assert out["ok"] and out["cover_letter"] == letter
+    letters = {f["format"]: f for f in out["files"] if f["role"] == "cover_letter"}
+    assert set(letters) == {"pdf", "docx"}
+    assert letters["pdf"]["filename"] == "cover-letter-test-candidate-grab.pdf"
+    assert letters["docx"]["filename"] == "cover-letter-test-candidate-grab.docx"
+    folder = Path(next(f for f in out["files"] if f["role"] == "resume")["path"]).parent
+    assert Path(letters["pdf"]["path"]).parent == folder  # beside the resume files
+    expected = " ".join(letter.split())
+    assert _pdf_text(letters["pdf"]["path"]) == expected
+    assert _docx_text(letters["docx"]["path"]) == expected
+    # Not asked for: only the resume files.
+    plain = call(uid, "get_job_packet", job_id=account["grab"], cover_letter_files=False)
+    assert {f["role"] for f in plain["files"]} == {"resume"}
+
+
+def test_no_cover_letter_files_when_the_letter_is_empty(account):
+    uid = account["user_id"]
+    with session(uid) as db:
+        variant = db.scalar(select(ResumeVariant).where(ResumeVariant.job_id == account["grab"]))
+        variant.cover_letter = "   "
+        db.commit()
+    out = call(uid, "get_job_packet", job_id=account["grab"])
+    assert out["ok"] and out["cover_letter"] == ""
+    assert [f["role"] for f in out["files"]] == ["resume", "resume"]
+
+
+def test_the_apply_screen_still_downloads_the_letter_as_text():
+    from app.services.exports import packet_filename
+
+    assert packet_filename("a-b", "cover_letter") == "cover-letter-a-b.txt"
+    assert packet_filename("a-b", "cover_letter_pdf") == "cover-letter-a-b.pdf"
+    assert packet_filename("a-b", "pdf", 3, draft=True) == "a-b-v3-draft.pdf"
+
+
+# ───────────── find_jobs ─────────────
+
+def test_find_jobs_by_company_or_title_at_any_stage(account):
+    uid = account["user_id"]
+    out = call(uid, "find_jobs", query="gojek")
+    assert out["ok"] and out["count"] == 2 and {j["job_id"] for j in out["jobs"]} == {account["applied"], account["dupe"]}
+    applied = next(j for j in out["jobs"] if j["job_id"] == account["applied"])
+    assert applied["applied"] is True and applied["application_id"] and applied["tailored_versions"] == 1
+    assert applied["latest_version"] == 2 and applied["reviewer_score"] == 88
+    assert set(applied) == {"job_id", "title", "company", "location", "status", "state", "fit_score",
+                            "tailored_versions", "latest_version", "reviewer_score", "approved", "applied",
+                            "application_id", "apply_url"}  # no description, no resume text
+    sea = call(uid, "find_jobs", query="SEA")["jobs"]
+    assert [j["company"] for j in sea] == ["Sea"] and sea[0]["approved"] is False and sea[0]["application_id"] is None
+    assert call(uid, "find_jobs", query="backend", stage="tailored")["jobs"][0]["company"] == "Sea"
+    assert call(uid, "find_jobs", query="backend", limit=2)["count"] == 2
+    assert call(uid, "find_jobs", job_id=account["grab"])["jobs"][0]["approved"] is True
+    assert call(uid, "find_jobs")["ok"] is False
+    assert call(uid, "find_jobs", query="x", limit=10**6)["ok"] is False
+
+
+def test_find_jobs_never_returns_another_accounts_job(account):
+    other = make_user(SessionLocal)
+    assert call(other, "find_jobs", query="Grab")["jobs"] == []
+    assert call(other, "find_jobs", job_id=account["grab"])["jobs"] == []
+    assert call(other, "get_job_documents", job_id=account["grab"])["ok"] is False
+
+
+# ───────────── get_job_documents ─────────────
+
+def test_documents_of_an_approved_job_are_the_packet(account, packet_dir):
+    out = call(account["user_id"], "get_job_documents", job_id=account["grab"])
+    assert out["ok"] and out["status"] == "APPROVED" and out["approved"] and out["may_submit"]
+    assert out["version"] == 2 and out["cover_letter"] == "Dear Grab," and "note" not in out
+    assert all("drafts" not in f["path"] and "-draft" not in f["filename"] for f in out["files"])
+
+
+def test_documents_of_an_unapproved_job_are_drafts_and_may_not_be_submitted(account, packet_dir):
+    uid = account["user_id"]
+    with session(uid) as db:
+        sea = db.scalar(select(Job).where(Job.company == "Sea"))
+        db.add(ResumeVariant(job_id=sea.id, version=3, markdown=RESUME, cover_letter="Dear Sea,", reviewer_score=None))
+        db.commit()
+        sea_id = sea.id
+    out = call(uid, "get_job_documents", job_id=sea_id)
+    assert out["ok"] and out["status"] == "TAILORED" and out["version"] == 3  # the latest version
+    assert out["approved"] is False and out["may_submit"] is False and out["not_ready_reason"] and out["note"]
+    assert out["cover_letter"] == "Dear Sea," and out["markdown"] == RESUME
+    drafts = (packet_dir / str(uid) / str(sea_id) / "drafts").resolve()
+    assert {f["role"] for f in out["files"]} == {"resume", "cover_letter"} and len(out["files"]) == 4
+    for item in out["files"]:
+        assert Path(item["path"]).parent == drafts and "-draft." in item["filename"]
+    assert sorted(p.name for p in drafts.parent.iterdir()) == ["drafts"]  # nothing beside the approved files
+    claim = call(uid, "begin_application_submission", job_id=sea_id)
+    assert claim["ok"] is False and claim["status"] == "NOT_READY"
+    assert call(uid, "get_job_packet", job_id=sea_id)["ok"] is False
+
+
+@pytest.mark.parametrize("score, decision, status", [(70, "PASS", "REVIEWED"), (40, "RETAILOR", "TAILORED")])
+def test_a_reviewed_version_is_reviewed_unless_sent_back(account, score, decision, status):
+    uid = account["user_id"]
+    with session(uid) as db:
+        sea = db.scalar(select(Job).where(Job.company == "Sea"))
+        variant = db.scalar(select(ResumeVariant).where(ResumeVariant.job_id == sea.id))
+        variant.reviewer_score, variant.reviewer_notes = score, {"decision": decision}
+        db.commit()
+        sea_id = sea.id
+    out = call(uid, "get_job_documents", job_id=sea_id, formats=["pdf"])
+    assert out["status"] == status and out["may_submit"] is False and len(out["files"]) == 2
+
+
+def test_no_documents_before_tailoring(account):
+    uid = account["user_id"]
+    with session(uid) as db:
+        job = Job(source="manual", source_ref=uuid.uuid4().hex, title="Engineer", company="Bare", status="shortlisted")
+        db.add(job)
+        db.commit()
+        job_id = job.id
+    assert "no tailored resume" in call(uid, "get_job_documents", job_id=job_id)["error"]
+
+
+def test_document_tools_are_audited_without_letter_text(account):
+    uid = account["user_id"]
+    call(uid, "get_job_packet", job_id=account["grab"])
+    call(uid, "get_job_documents", job_id=account["grab"])
+    call(uid, "find_jobs", query="Grab")
+    with session(uid) as db:
+        rows = db.scalars(select(ConversationAction).order_by(ConversationAction.id)).all()
+    assert [r.tool_name for r in rows] == ["get_job_packet", "get_job_documents", "find_jobs"]
+    stored = " ".join(f"{r.arguments_summary} {r.result_summary}" for r in rows)
+    assert "Dear Grab" not in stored and "Scaled the payments" not in stored
+    assert rows[1].result_summary == {"outcome": "APPROVED"} and rows[2].result_summary == {"count": 1}
+    assert rows[2].arguments_summary["query"] == "Grab"

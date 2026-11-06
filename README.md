@@ -2449,6 +2449,28 @@ Requests above these limits are rejected, not truncated.
 
 **3. Choose the mode (optional).** Running workers → Settings → Tailoring → *Who tailors and reviews* → **Claude Desktop**. In that mode, the background tailoring queue skips your jobs, so no model API is called for them. A task queued before you switched is cancelled rather than run. MCP saves never call a model API in either mode.
 
+### Connecting Claude Code
+
+The same server works in [Claude Code](https://code.claude.com). Create a token as in step 1 above, then register the
+server once (from any directory; `--scope user` makes it available in every project, leave it out to add it to the
+current project only):
+
+```bash
+claude mcp add job-hunt-os --scope user --env PYTHONPATH=/absolute/path/to/AI-Job-Hunt --env JOBHUNT_MCP_TOKEN=jhos_mcp_paste-your-token-here -- /absolute/path/to/AI-Job-Hunt/.venv/bin/python -m app.mcp
+```
+
+Everything after `--` is the command Claude Code starts over stdio, exactly as Claude Desktop does; add
+`--env DATABASE_URL=...` when the database is not the one in the repository's `.env`. To check it before opening a
+session, run the same command yourself:
+
+```bash
+PYTHONPATH=/absolute/path/to/AI-Job-Hunt JOBHUNT_MCP_TOKEN=jhos_mcp_paste-your-token-here /absolute/path/to/AI-Job-Hunt/.venv/bin/python -m app.mcp
+```
+
+A valid token starts the server and it waits silently for a client (stop it with Ctrl+C); a missing, unknown or
+revoked token prints why and exits. Then `claude mcp list` should show `job-hunt-os` as connected, and `/mcp` inside
+a session lists its tools and prompts. The prompts run as slash commands, e.g. `/mcp__job-hunt-os__follow_up`.
+
 ### Verifying the connection
 
 In a new Claude Desktop chat, the tools menu should list **job-hunt-os**. Ask:
@@ -2457,7 +2479,7 @@ In a new Claude Desktop chat, the tools menu should list **job-hunt-os**. Ask:
 Show me the available Job Hunt OS tools.
 ```
 
-You should see `list_jobs_for_tailoring`, `get_tailoring_context`, `save_tailored_resume`, `save_bulk_tailored_resumes`, `list_jobs_for_review`, `get_review_context`, `save_review`, `save_bulk_reviews`, `get_bulk_operation_status`, `list_jobs_for_application`, `get_job_packet`, `search_application_knowledge`, `request_human_answer` and `record_application_result`, plus the prompts `tailor_jobs`, `review_applications` and `apply_to_jobs`. Then ask:
+You should see `list_jobs_for_tailoring`, `get_tailoring_context`, `save_tailored_resume`, `save_bulk_tailored_resumes`, `list_jobs_for_review`, `get_review_context`, `save_review`, `save_bulk_reviews`, `get_bulk_operation_status`, `list_jobs_for_application`, `get_job_packet`, `find_jobs`, `get_job_documents`, `search_application_knowledge`, `request_human_answer`, `begin_application_submission`, `release_application_claim`, `record_application_result`, `list_followups_due`, `save_followup_draft`, `record_followup_sent` and `skip_followup`, plus the prompts `tailor_jobs`, `review_applications`, `apply_to_jobs` and `follow_up`. Then ask:
 
 ```text
 Show me the top 5 jobs waiting for tailoring.
@@ -2539,9 +2561,13 @@ Apply to my top 3 approved jobs.
 ```text
 Claude
 → list_jobs_for_application         approved, not yet applied, approved resume reviewed above 60; best reviewed
-                                    first, with the apply URL; paged with offset / next_offset
+                                    first, with the apply URL and the route (who applies); paged with offset /
+                                    next_offset
 → get_job_packet                    the approved resume version (not a newer draft), cover letter, screening
-                                    drafts, and the resume as PDF and DOCX files written to MCP_PACKET_DIR
+                                    drafts, and the resume and cover letter as PDF and DOCX files written to
+                                    MCP_PACKET_DIR
+→ route.who_applies is "person"     LinkedIn Easy Apply, Indeed Apply, Ashby: Claude hands you the URL and the files
+                                    and does not touch the form
 → per form question:
   search_application_knowledge      saved answers, verified evidence and profile facts, each with its source
   request_human_answer              when nothing answers it: saved to the Knowledge bank with the job and the
@@ -2553,8 +2579,10 @@ Claude
 
 | Tool | Returns / does |
 | --- | --- |
-| `list_jobs_for_application` | Approved jobs with no submission whose approved resume scored **above 60** in review (`reviewer_score_above` can raise the bar, never lower it). Jobs with no application URL, jobs already applied to under another posting of the same job (same apply URL, posting URL or company/title/city) and jobs stopped at an open blocker are left out; `include_blocked=true` shows the latter. |
-| `get_job_packet` | The approved resume, cover letter and screening drafts, plus `files`: `pdf` and `docx` with `path`, `filename`, `size_bytes` and `sha256` (`include_content=true` also returns them base64-encoded). Refused for a job that is not approved, is already applied to, or is at or below the reviewer floor. |
+| `list_jobs_for_application` | Approved jobs with no submission whose approved resume scored **above 60** in review (`reviewer_score_above` can raise the bar, never lower it). Jobs with no application URL, jobs already applied to under another posting of the same job (same apply URL, posting URL or company/title/city) and jobs stopped at an open blocker are left out; `include_blocked=true` shows the latter. Each job has a `route`: `ats`, `label`, `apply_domain`, `who_applies` and `reason`. `who_applies` is `claude` only where Job Hunt OS can complete the form (Greenhouse, Lever, Workday, an employer's own site, …) and `person` for LinkedIn Easy Apply, Indeed Apply and Ashby, which are always yours to submit. `who_applies=claude` or `person` filters the list. |
+| `get_job_packet` | The approved resume, cover letter, screening drafts and `route`, plus `files`, each tagged with its `role` (`resume` or `cover_letter`) and with `format` (`pdf`, `docx`), `path`, `filename`, `size_bytes` and `sha256` (`include_content=true` also returns them base64-encoded). The cover letter files (`cover-letter-<you>-<company>.pdf` / `.docx`) render the approved letter as it was approved; there are none when the letter is empty or `cover_letter_files=false`. The Apply screen still downloads the letter as `.txt`. Refused for a job that is not approved, is already applied to, or is at or below the reviewer floor. |
+| `find_jobs` | Find a job by `job_id` or by `query` (part of the company name or title, any case) at any stage, optionally only one `stage` (a status such as `tailored`, `approved`, `applied`, or a workflow state such as `REVIEWED`); `limit` 10 by default, at most `MCP_APPLICATION_PAGE_LIMIT`. Returns IDs, status, fit score, tailored versions, the latest version and its reviewer score, `approved`, `applied`, `application_id` and the apply URL — never a description or resume text. |
+| `get_job_documents` | A job's resume and cover letter at any stage after tailoring: the approved packet when there is one (`status` `APPROVED`), otherwise its latest tailored version (`REVIEWED`, or `TAILORED` — a version review sent back counts as tailored). Unapproved files go to `MCP_PACKET_DIR/<account>/<job>/drafts/` with `-draft` in their names, and `may_submit` is true only for a packet that is ready to apply to; `begin_application_submission` keeps refusing everything else. For reading and sharing, never for uploading. |
 | `search_application_knowledge` | A `status` and the sources behind it. `ANSWERED`: a verified saved answer to the same question (only filler words may differ), or a contact detail from your profile. Answers to merely similar questions ("years of Python" vs "years of Java") are listed in `similar_questions` and never used. `SUPPORTED`: only facts (verified evidence, work authorization) to compose an answer from. `NEEDS_CONFIRMATION`: a saved answer marked sensitive, which you confirm for each application, so its text is not returned and Claude asks you in the conversation. `PENDING_HUMAN`: already waiting for you. `UNKNOWN`: nothing supports an answer. Unverified evidence and unverified answers are never used. |
 | `request_human_answer` | Saves the question (once per distinct question) as an unanswered, unverified Knowledge bank entry with the form's options and the job that asked. The Knowledge bank shows *Asked by Company · Title — Options: …*. A question that already has a verified answer is not reopened. |
 | `begin_application_submission` | The pre-submit claim (§10a): `CLAIMED` with a `claim_token`, or why not to submit — `CLAIM_CONFLICT` (someone else is submitting this posting or another saved copy of it), `UNCERTAIN` (an earlier submission was never reported; you say what happened in the Apply kit), `DUPLICATE` or `NOT_READY`. |
@@ -2562,6 +2590,40 @@ Claude
 | `record_application_result` | `submitted` marks the job applied (the same path as the Apply screen: follow-up date, tracker event, confirmation ID). A job already applied to is never recorded again: a repeat returns `ALREADY_APPLIED` and changes nothing, and a duplicate posting of a job already applied to is refused. `blocked` records `captcha`, `login_required`, `account_required`, `needs_human_answer`, `missing_document`, `posting_closed`, `form_error` or `other`; a `needs_human_answer` blocker clears itself once you have answered and verified its questions, except sensitive ones, which stay open until the application is submitted. Submissions for one account are recorded one at a time, so two sessions cannot both submit duplicate postings. Pass the `claim_token`; a report without one (older clients) is still recorded, as unclaimed, unless another client holds the posting. |
 
 Job Hunt OS never submits anything itself, and these tools never create accounts, accept terms or change the approval. The `apply_to_jobs` prompt starts the workflow with the rules included.
+
+### Follow-up workflow
+
+After a submission, Job Hunt OS schedules a follow-up (Settings → *follow-up after N days*). Claude can draft it with you,
+one at a time; **Job Hunt OS never sends a message**, and its Gmail connection stays read-only.
+
+```text
+Help me with the follow-ups due this week.
+```
+
+```text
+Claude
+→ list_followups_due                due within within_days (default 3; 0 = due now or overdue): the saved draft, or
+                                    needs_draft when nothing was written yet; the job, recruiters, follow-ups already
+                                    sent, and employer_replied
+→ employer_replied is true          the employer answered (Application Inbox) or the application moved on: Claude
+                                    tells you and does not follow up
+→ save_followup_draft               the message it wrote, as the application's one draft (replaces an earlier one)
+→ you read it and say yes           nothing is sent before that
+→ you send it (or Claude sends it with a mail tool you connected)
+→ record_followup_sent              the text really sent, channel, recipient; the next follow-up is scheduled
+→ or skip_followup                  you decided not to follow up: the draft is cancelled and the date cleared
+```
+
+| Tool | Returns / does |
+| --- | --- |
+| `list_followups_due` | Drafts due in the window, plus submitted applications whose follow-up date is in the window with no draft yet (`needs_draft: true`), soonest first: `followup_id`, `application_id`, `job_id`, company, title, `applied_at`, `due_at`, `channel`, `draft`, `recruiters`, `previous_followups` (texts already sent) and `employer_replied`. Never calls a model. |
+| `save_followup_draft` | `application_id`, `text` (1–5000 characters), `channel` (`email`, `linkedin` for a message you send yourself, or `other`). Creates or replaces the application's one draft; refused for an application that was never submitted. Returns the `followup_id` and `employer_replied`. Never sends. |
+| `record_followup_sent` | `followup_id`, and optionally `sent_text` (default: the draft), `channel`, `sent_at` (default now) and `recipient`. Marks it sent with the final text and adds a *Follow-up sent* event to the timeline (channel and recipient only, never the message). Recording it again returns `ALREADY_SENT` and changes nothing. One more follow-up is then scheduled after your follow-up days — never more than two per application, and none once the employer replied. |
+| `skip_followup` | `followup_id` or `application_id`, and an optional `reason`: cancels the draft, clears the follow-up date and adds a *Follow-up skipped* note. |
+
+The Tracker does the same with **Mark sent** and **Skip** beside *Review & copy*, through the same service
+(`app/services/followups.py`), so both write the same rows. The `follow_up` prompt starts the workflow with the rules
+included. Audit rows for these tools keep IDs, counts and statuses only, never the message.
 
 ### 10a. Pre-submit claims and the application worker (Phase 5)
 

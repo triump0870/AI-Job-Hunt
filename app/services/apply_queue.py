@@ -202,23 +202,38 @@ def not_ready_reason(db: Session, job: Job, *, reviewer_score_above: float | Non
     return None
 
 
-def packet_files(db: Session, job: Job, resume: ResumeVariant, formats: list[str], *,
-                 include_content: bool = False) -> list[dict[str, Any]]:
-    """Render the approved resume and write it where a browser upload can pick it up.
+def packet_folder(job: Job, *, draft: bool = False) -> Path:
+    """MCP_PACKET_DIR/<account>/<job>/ for an approved packet; its drafts/ subfolder for a version nobody approved."""
+    folder = Path(get_settings().mcp_packet_dir).expanduser().resolve() / str(job.user_id) / str(job.id)
+    return folder / "drafts" if draft else folder
 
-    Files go to MCP_PACKET_DIR/<account>/<job>/ under the same names the Apply screen downloads.
+
+def packet_files(db: Session, job: Job, resume: ResumeVariant, formats: list[str], *,
+                 include_content: bool = False, cover_letter: str | None = None,
+                 draft: bool = False) -> list[dict[str, Any]]:
+    """Render the resume (and, given its text, the cover letter) and write them where a browser upload can pick
+    them up.
+
+    Files go to MCP_PACKET_DIR/<account>/<job>/ under the same names the Apply screen downloads, each tagged with its
+    `role` (resume or cover_letter). A `draft` (a version that is not the approved packet) goes to the drafts/
+    subfolder with "-draft" in its name, so it is never mistaken for, or overwrites, an approved file.
     """
     renderers = {"pdf": markdown_to_simple_pdf, "docx": markdown_to_docx}
     slug = packet_slug(get_profile(db).name, job.company)
-    folder = Path(get_settings().mcp_packet_dir).expanduser().resolve() / str(job.user_id) / str(job.id)
+    folder = packet_folder(job, draft=draft)
     folder.mkdir(parents=True, exist_ok=True)
+    parts = [("resume", kind, resume.markdown, packet_filename(slug, kind, resume.version, draft=draft))
+             for kind in formats]
+    if (cover_letter or "").strip():
+        parts += [("cover_letter", kind, cover_letter, packet_filename(slug, f"cover_letter_{kind}", draft=draft))
+                  for kind in formats]
     out = []
-    for kind in formats:
-        data = renderers[kind](resume.markdown)
-        path = folder / packet_filename(slug, kind, resume.version)
+    for role, kind, text, name in parts:
+        data = renderers[kind](text)
+        path = folder / name
         path.write_bytes(data)
-        item = {"format": kind, "filename": path.name, "path": str(path), "media_type": MEDIA_TYPES[kind],
-                "size_bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+        item = {"role": role, "format": kind, "filename": path.name, "path": str(path),
+                "media_type": MEDIA_TYPES[kind], "size_bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
         if include_content:
             item["content_base64"] = base64.b64encode(data).decode()
         out.append(item)

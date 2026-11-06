@@ -2,7 +2,8 @@
 
 Handlers only read and write through the application services. They take IDs, filters and structured results,
 never SQL, file paths, shell input or settings, and they never return API keys or environment values. The only
-paths they return are the packet files get_job_packet writes under MCP_PACKET_DIR.
+paths they return are the packet files get_job_packet and get_job_documents write under MCP_PACKET_DIR.
+No handler calls a model, and none sends a message: follow-ups are drafted by Claude and sent by the person.
 """
 from __future__ import annotations
 
@@ -11,16 +12,25 @@ from datetime import datetime
 from typing import Any
 
 from pydantic import ValidationError
-from sqlalchemy import desc, nulls_last, select
+from sqlalchemy import desc, func, nulls_last, or_, select
 from sqlalchemy.orm import Session
 
-from app.models import ConversationAction, Evidence, Job, JobRanking, ResumeVariant
+from app.models import (
+    Application,
+    ConversationAction,
+    Evidence,
+    FollowUp,
+    Job,
+    JobRanking,
+    ResumeVariant,
+)
 from app.prompts.common import prompt_profile
 from app.prompts.mcp_application import APPLICATION_RULES, MCP_APPLICATION_PROMPT_VERSION
+from app.prompts.mcp_followup import FOLLOWUP_RULES, MCP_FOLLOWUP_PROMPT_VERSION
 from app.prompts.mcp_review import MCP_REVIEW_PROMPT_VERSION, REVIEW_RULES
 from app.prompts.mcp_tailoring import HELD_BACK_NOTE, MCP_TAILORING_PROMPT_VERSION, TAILORING_RULES
 from app.prompts.tailoring import JOB_FIELDS, fit_analysis_input
-from app.services import apply_queue, approval, conversation_actions, knowledge
+from app.services import apply_queue, approval, ats_map, conversation_actions, followups, knowledge
 from app.services import resume_verification as rv
 from app.services.context_builder import ContextError
 from app.services.ranker import policy_for, relevant_evidence
@@ -479,18 +489,43 @@ def _blocker_out(blocker: dict[str, Any] | None) -> dict[str, Any] | None:
     return None if not blocker else {k: blocker.get(k) for k in ("reason", "detail", "question_ids", "recorded_at")}
 
 
+WHO_APPLIES = ("claude", "person")
+
+
+def route(job: Job) -> dict[str, Any]:
+    """Which ATS the job's application lives on and who may submit it (`ats_map`, deterministic). Claude may drive a
+    form only where Job Hunt OS can complete it (`AtsMatch.auto_submit`); LinkedIn Easy Apply, Indeed Apply and Ashby
+    are always the person's."""
+    match = ats_map.for_job(job)
+    if match is None:
+        return {"ats": None, "label": None, "apply_domain": None, "who_applies": "person",
+                "reason": "The job has no application web address"}
+    claude = match.auto_submit
+    reason = (f"{match.label} form on {match.apply_domain}: Claude may fill it and submit it after "
+              "begin_application_submission" if claude
+              else f"{match.note or match.label + ' applications cannot be automated'}: the candidate applies")
+    return {"ats": match.ats, "label": match.label, "apply_domain": match.apply_domain,
+            "who_applies": "claude" if claude else "person", "reason": reason}
+
+
 def list_jobs_for_application(db: Session, reviewer_score_above: float | None = None, company: str | None = None,
-                              include_blocked: bool = False, offset: int = 0, limit: int = 20) -> dict[str, Any]:
+                              include_blocked: bool = False, offset: int = 0, limit: int = 20,
+                              who_applies: str | None = None) -> dict[str, Any]:
     limit = _check_limit(limit, application_page_limit(), "MCP_APPLICATION_PAGE_LIMIT")
     if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
         raise ToolError("offset must be a non-negative integer")
+    if who_applies is not None and who_applies not in WHO_APPLIES:
+        raise ToolError("who_applies must be claude or person")
     threshold = _threshold(reviewer_score_above)
     ready = apply_queue.ready_to_apply(db, reviewer_score_above=threshold, include_blocked=bool(include_blocked),
                                        company=company)
+    ready = [{**r, "route": route(r["job"])} for r in ready]
+    if who_applies is not None:
+        ready = [r for r in ready if r["route"]["who_applies"] == who_applies]
     page = ready[offset:offset + limit]
     jobs = [{"job_id": r["job"].id, "title": r["job"].title, "company": r["job"].company,
              "location": r["job"].location, "apply_url": apply_queue.apply_url(r["job"]),
-             "posting_url": r["job"].url or r["job"].source_url or None,
+             "posting_url": r["job"].url or r["job"].source_url or None, "route": r["route"],
              "reviewer_score": r["resume"].reviewer_score, "fit_score": r["job"].fit_score,
              "resume_version": r["resume"].version, "approved_at": _iso(r["application"].approved_at),
              "blocker": _blocker_out(r["blocker"]), "claim": _claim_out(r.get("claim"))} for r in page]
@@ -499,13 +534,19 @@ def list_jobs_for_application(db: Session, reviewer_score_above: float | None = 
             "count": len(jobs), "next_offset": next_offset, "jobs": jobs}
 
 
-def get_job_packet(db: Session, job_id: int, formats: list[str] | None = None,
-                   include_content: bool = False) -> dict[str, Any]:
-    job = _job(db, job_id)
+def _formats(formats: list[str] | None) -> list[str]:
+    if formats is not None and not isinstance(formats, list):
+        raise ToolError(f"formats must be a list chosen from {', '.join(apply_queue.FILE_FORMATS)}")
     formats = list(dict.fromkeys(formats or apply_queue.FILE_FORMATS))
-    unknown = [f for f in formats if f not in apply_queue.FILE_FORMATS]
-    if unknown:
+    if any(f not in apply_queue.FILE_FORMATS for f in formats):
         raise ToolError(f"formats must be chosen from {', '.join(apply_queue.FILE_FORMATS)}")
+    return formats
+
+
+def get_job_packet(db: Session, job_id: int, formats: list[str] | None = None,
+                   include_content: bool = False, cover_letter_files: bool = True) -> dict[str, Any]:
+    job = _job(db, job_id)
+    formats = _formats(formats)
     reason = apply_queue.not_ready_reason(db, job)
     if reason:
         raise ToolError(f"Job {job.id} is not ready to apply to: {reason}")
@@ -514,16 +555,104 @@ def get_job_packet(db: Session, job_id: int, formats: list[str] | None = None,
     application = job.application
     resume = apply_queue.approved_resume(db, application)
     content = resume.content or {}
+    # The letter exactly as it was approved (approval.packet_content): rendered, never edited or re-hashed.
+    letter = approval.packet_content(resume)["cover_letter"]
     return {"ok": True, "prompt_version": MCP_APPLICATION_PROMPT_VERSION, "rules": list(APPLICATION_RULES),
             "job_id": job.id, "title": job.title, "company": job.company, "location": job.location,
-            "apply_url": apply_queue.apply_url(job),
+            "apply_url": apply_queue.apply_url(job), "route": route(job),
             "resume": {"resume_id": resume.id, "version": resume.version, "reviewer_score": resume.reviewer_score,
                        "approved_at": _iso(application.approved_at), "markdown": resume.markdown,
                        "summary": content.get("summary", "")},
-            "cover_letter": approval.packet_content(resume)["cover_letter"],
+            "cover_letter": letter,
             "screening_answer_drafts": content.get("screening_answer_drafts") or {},
-            "files": apply_queue.packet_files(db, job, resume, formats, include_content=bool(include_content)),
+            "files": apply_queue.packet_files(db, job, resume, formats, include_content=bool(include_content),
+                                              cover_letter=letter if cover_letter_files else None),
             "blocker": _blocker_out(apply_queue.open_blocker(db, application))}
+
+
+# ───────────── finding jobs and their documents ─────────────
+
+QUERY_LIMIT = 200
+
+
+def _approved_packet(db: Session, job: Job) -> ResumeVariant | None:
+    """The approved resume version when the job's packet is approved (or applied) and still the one approved."""
+    application = job.application
+    if application is None or application.status not in ("approved", "applied") or not application.approved_at:
+        return None
+    resume = apply_queue.approved_resume(db, application)
+    return resume if resume is not None and approval.verify(db, application).ok else None
+
+
+def find_jobs(db: Session, job_id: int | None = None, query: str | None = None, stage: str | None = None,
+              limit: int = 10) -> dict[str, Any]:
+    limit = _check_limit(limit, application_page_limit(), "MCP_APPLICATION_PAGE_LIMIT")
+    if job_id is None and not (isinstance(query, str) and query.strip()):
+        raise ToolError("Pass a job_id, or a query (part of the company name or job title)")
+    if query is not None and (not isinstance(query, str) or len(query) > QUERY_LIMIT):
+        raise ToolError(f"query must be text of at most {QUERY_LIMIT} characters")
+    if stage is not None and not isinstance(stage, str):
+        raise ToolError("stage must be a job status (e.g. tailored, approved, applied) or workflow state")
+    statement = select(Job)
+    if job_id is not None:
+        if not isinstance(job_id, int) or isinstance(job_id, bool):
+            raise ToolError("job_id must be an integer")
+        statement = statement.where(Job.id == job_id)
+    if query and query.strip():
+        pattern = f"%{query.strip()}%"
+        statement = statement.where(or_(Job.company.ilike(pattern), Job.title.ilike(pattern)))
+    if stage and stage.strip():
+        statement = statement.where(or_(func.lower(Job.status) == stage.strip().lower(),
+                                        Job.state == stage.strip().upper()))
+    jobs = db.scalars(statement.order_by(desc(Job.id)).limit(limit)).all()
+    out = []
+    for job in jobs:
+        versions = db.scalar(select(func.count(ResumeVariant.id)).where(ResumeVariant.job_id == job.id)) or 0
+        latest = latest_variant(db, job.id)
+        application = job.application
+        out.append({"job_id": job.id, "title": job.title, "company": job.company, "location": job.location,
+                    "status": job.status, "state": job.state, "fit_score": job.fit_score,
+                    "tailored_versions": versions, "latest_version": latest.version if latest else None,
+                    "reviewer_score": latest.reviewer_score if latest else None,
+                    "approved": _approved_packet(db, job) is not None,
+                    "applied": bool(application and application.applied_at),
+                    "application_id": application.id if application else None,
+                    "apply_url": apply_queue.apply_url(job)})
+    return {"ok": True, "count": len(out), "jobs": out}
+
+
+DRAFT_NOTE = ("These documents are not an approved packet: read or share them, but never upload them to an "
+              "application. The candidate approves the packet in Job Hunt OS first.")
+
+
+def get_job_documents(db: Session, job_id: int, formats: list[str] | None = None,
+                      include_content: bool = False) -> dict[str, Any]:
+    job = _job(db, job_id)
+    formats = _formats(formats)
+    approved = _approved_packet(db, job)
+    resume = approved or latest_variant(db, job.id)
+    if resume is None:
+        raise ToolError(f"Job {job.id} has no tailored resume yet")
+    if approved is not None:
+        status, letter = "APPROVED", approval.packet_content(resume)["cover_letter"]
+    else:
+        # A version the reviewer sent back (RETAILOR) is served as TAILORED: it was reviewed, but not passed.
+        decision = (resume.reviewer_notes or {}).get("decision")
+        status = "REVIEWED" if resume.reviewer_score is not None and decision != "RETAILOR" else "TAILORED"
+        letter = resume.cover_letter or ""
+    reason = apply_queue.not_ready_reason(db, job)
+    if reason is None and apply_queue.guarded_hold(db, job) is not None:
+        reason = apply_queue.ROUTE_HELD_REASON
+    out = {"ok": True, "status": status, "job_id": job.id, "title": job.title, "company": job.company,
+           "approved": approved is not None, "may_submit": reason is None, "version": resume.version,
+           "reviewer_score": resume.reviewer_score, "markdown": resume.markdown, "cover_letter": letter,
+           "files": apply_queue.packet_files(db, job, resume, formats, include_content=bool(include_content),
+                                             cover_letter=letter, draft=approved is None)}
+    if reason is not None:
+        out["not_ready_reason"] = reason
+    if approved is None:
+        out["note"] = DRAFT_NOTE
+    return out
 
 
 def search_application_knowledge(db: Session, question: str, limit: int = 5) -> dict[str, Any]:
@@ -620,3 +749,87 @@ def record_application_result(db: Session, job_id: int, outcome: str, confirmati
     return {"ok": True, "status": "SUBMITTED", "job_id": job.id, "job_status": job.status,
             "applied_at": _iso(application.applied_at), "confirmation_id": application.confirmation_id,
             "followup_due_at": _iso(application.followup_due_at), "claimed": result.claimed}
+
+
+# ───────────── follow-ups ─────────────
+
+FOLLOWUP_LIMIT = 50
+MAX_WITHIN_DAYS = 60
+
+
+def _int_id(value: Any, name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ToolError(f"{name} must be an integer")
+    return value
+
+
+def _application(db: Session, application_id: Any) -> Application:
+    app = db.get(Application, _int_id(application_id, "application_id"))
+    if app is None:
+        raise ToolError(f"Application {application_id} not found")
+    return app
+
+
+def _followup(db: Session, followup_id: Any) -> FollowUp:
+    followup = db.get(FollowUp, _int_id(followup_id, "followup_id"))
+    if followup is None:
+        raise ToolError(f"Follow-up {followup_id} not found")
+    return followup
+
+
+def _when(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError) as exc:
+        raise ToolError("sent_at must be an ISO date and time, e.g. 2026-11-06T09:30:00Z") from exc
+
+
+def list_followups_due(db: Session, within_days: int = 3, limit: int = 20) -> dict[str, Any]:
+    if not isinstance(within_days, int) or isinstance(within_days, bool) or not 0 <= within_days <= MAX_WITHIN_DAYS:
+        raise ToolError(f"within_days must be a whole number of days from 0 to {MAX_WITHIN_DAYS}")
+    limit = _check_limit(limit, FOLLOWUP_LIMIT, f"at most {FOLLOWUP_LIMIT}")
+    items = followups.due(db, within_days=within_days, limit=limit)
+    return {"ok": True, "prompt_version": MCP_FOLLOWUP_PROMPT_VERSION, "rules": list(FOLLOWUP_RULES),
+            "within_days": within_days, "count": len(items), "followups": items}
+
+
+def save_followup_draft(db: Session, application_id: int, text: str, channel: str = "email") -> dict[str, Any]:
+    app = _application(db, application_id)
+    try:
+        followup = followups.save_draft(db, app, text, channel, source="mcp")
+    except followups.FollowUpRefused as exc:
+        raise ToolError(str(exc)) from exc
+    return {"ok": True, "status": "SAVED", "followup_id": followup.id, "application_id": app.id,
+            "job_id": app.job_id, "channel": followup.channel, "due_at": _iso(followup.due_at),
+            "employer_replied": followups.employer_replied(db, app),
+            "note": "Saved as a draft; nothing was sent. Show it to the candidate before anything is sent."}
+
+
+def record_followup_sent(db: Session, followup_id: int, sent_text: str | None = None, channel: str | None = None,
+                         sent_at: str | None = None, recipient: str | None = None) -> dict[str, Any]:
+    followup = _followup(db, followup_id)
+    try:
+        outcome = followups.mark_sent(db, followup, sent_text=sent_text, channel=channel, sent_at=_when(sent_at),
+                                      recipient=recipient, source="mcp")
+    except followups.FollowUpRefused as exc:
+        raise ToolError(str(exc)) from exc
+    return {"ok": True, "status": outcome.status, "followup_id": followup.id,
+            "application_id": outcome.application.id, "job_id": outcome.application.job_id,
+            "channel": followup.channel, "sent_at": _iso(followup.sent_at),
+            "next_followup_due_at": _iso(outcome.next_due_at)}
+
+
+def skip_followup(db: Session, followup_id: int | None = None, application_id: int | None = None,
+                  reason: str | None = None) -> dict[str, Any]:
+    if followup_id is None and application_id is None:
+        raise ToolError("Pass a followup_id or an application_id")
+    followup = _followup(db, followup_id) if followup_id is not None else None
+    app = _application(db, application_id if application_id is not None else followup.application_id)
+    try:
+        outcome = followups.skip(db, app, followup=followup, reason=reason, source="mcp")
+    except followups.FollowUpRefused as exc:
+        raise ToolError(str(exc)) from exc
+    return {"ok": True, "status": outcome.status, "application_id": app.id, "job_id": app.job_id,
+            "followup_id": outcome.followup.id if outcome.followup else None}

@@ -427,6 +427,24 @@ Inbox Agent). The rules a change has to keep:
   status (`failed`, `connection_required`, `rate_limited`); a model failure leaves the message PENDING for retry and
   never loses it.
 
+## Follow-ups (Tracker and MCP)
+
+`app/services/followups.py` backs the MCP follow-up tools and the Tracker's Mark sent / Skip (README §10, Follow-up
+workflow). The rules a change has to keep:
+
+* **Job Hunt OS never sends a message.** The service records what a person did; there is no send path, and Gmail stays
+  read-only.
+* **One writer for a person's follow-up decisions.** Saving a person's (or Claude's) draft, Mark sent and Skip go through
+  `followups.save_draft` / `mark_sent` / `skip`, from MCP and from the web alike, so both write the same rows. The other
+  writers stay what they are: the scheduler's AI draft (`workflow.draft_followup`) and the Application Inbox's
+  cancellation (`analysis.suppress_followup`).
+* **No model in the follow-up tools.** `followups.due` only reads; the scheduler alone drafts with a model, and only for
+  what `followups.needs_draft` says (no open draft, fewer than `MAX_SENT` sent).
+* **Recording a send is idempotent** (`ALREADY_SENT`), schedules at most one more follow-up (never more than `MAX_SENT`
+  per application, none once `blocks_followup`), and its timeline event holds the channel and recipient, never the text.
+* **Audit rows hold IDs, counts and statuses only**: message text and reasons are reduced to their length
+  (`conversation_actions.summarize_arguments`).
+
 ## AI Orchestration
 
 `app/services/orchestration.py` (runtime) and `app/services/orchestration_topology.py` (the stage registry) back the

@@ -17,7 +17,9 @@ SOURCE_CLAUDE_DESKTOP = "CLAUDE_DESKTOP"
 KEPT_SCALARS = {"job_id", "job_ids", "minimum_fit_score", "posted_after", "location", "company", "limit",
                 "operation_id", "recommendation", "review_score", "confidence", "tailored_resume_version",
                 "reviewer_score_above", "include_blocked", "offset", "formats", "include_content", "outcome",
-                "blocker_reason", "question_ids", "answer_type", "category", "sensitive", "required"}
+                "blocker_reason", "question_ids", "answer_type", "category", "sensitive", "required",
+                "who_applies", "cover_letter_files", "query", "stage", "within_days", "application_id",
+                "followup_id", "channel"}
 
 
 def summarize_arguments(arguments: dict[str, Any]) -> dict[str, Any]:

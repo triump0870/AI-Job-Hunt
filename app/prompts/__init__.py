@@ -63,6 +63,7 @@ from app.prompts.job_description_recovery import (
                                        build_job_description_recovery_prompt,
 )
 from app.prompts.mcp_application import MCP_APPLICATION_PROMPT_VERSION
+from app.prompts.mcp_followup import MCP_FOLLOWUP_PROMPT_VERSION
 from app.prompts.mcp_review import MCP_REVIEW_PROMPT_VERSION
 from app.prompts.mcp_tailoring import MCP_TAILORING_PROMPT_VERSION
 from app.prompts.model_tests import (
@@ -103,6 +104,7 @@ PROMPT_VERSIONS = {
     "mcp_tailoring": MCP_TAILORING_PROMPT_VERSION,
     "mcp_review": MCP_REVIEW_PROMPT_VERSION,
     "mcp_application": MCP_APPLICATION_PROMPT_VERSION,
+    "mcp_followup": MCP_FOLLOWUP_PROMPT_VERSION,
     "model_health": MODEL_TEST_PROMPT_VERSION,
     "worker_test": MODEL_TEST_PROMPT_VERSION,
 }
@@ -132,7 +134,7 @@ OUTPUT_CONTRACTS = {
 RESERVED_PROMPTS: tuple[str, ...] = ()
 # Conversation instructions (Claude Desktop over MCP, the ADK agents): not model calls the backend makes. Their saved
 # results are validated by the backend (app.services.tailoring_results, review_results, job_hunt_agent.tools).
-CONVERSATION_PROMPTS = ("agents", "mcp_tailoring", "mcp_review", "mcp_application")
+CONVERSATION_PROMPTS = ("agents", "mcp_tailoring", "mcp_review", "mcp_application", "mcp_followup")
 
 __all__ = [
                                        "CONVERSATION_PROMPTS",
