@@ -170,7 +170,7 @@ def _header_int(headers: Any, names: Iterable[str]) -> int | None:
             continue
         try:
             return int(float(str(raw).strip()))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
     return None
 
@@ -203,7 +203,7 @@ def _count(headers: Any, name: str) -> int | None:
     raw = _header(headers, name)
     try:
         return int(float(str(raw).strip())) if raw is not None else None
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -263,13 +263,19 @@ def _reset_at(headers: Any, at: datetime, *, status: int | None = None) -> datet
     """A rate-limit reset, whether the provider sends seconds-from-now, an epoch timestamp or a duration ("2m59.56s")."""
     value = _header_int(headers, RESET_HEADERS)
     if value is None:
-        seconds = _duration_reset(headers, status) if headers is not None else None
-        return at + timedelta(seconds=seconds) if seconds is not None else None
-    if value > 10_000_000_000:  # milliseconds since the epoch
-        return datetime.fromtimestamp(value / 1000, UTC).replace(tzinfo=None)
-    if value > 1_000_000_000:  # seconds since the epoch
-        return datetime.fromtimestamp(value, UTC).replace(tzinfo=None)
-    return at + timedelta(seconds=max(0, value))
+        # Also where LiteLLM's forwarded headers arrive (`llm_provider-x-ratelimit-reset`), so an epoch comes this way
+        # too: OpenRouter sends milliseconds.
+        value = _duration_reset(headers, status) if headers is not None else None
+        if value is None:
+            return None
+    try:
+        if value > 10_000_000_000:  # milliseconds since the epoch
+            return datetime.fromtimestamp(value / 1000, UTC).replace(tzinfo=None)
+        if value > 1_000_000_000:  # seconds since the epoch
+            return datetime.fromtimestamp(value, UTC).replace(tzinfo=None)
+        return at + timedelta(seconds=max(0, value))
+    except (OverflowError, OSError, ValueError):  # not a date: a reset is a provider fact, never a guess
+        return None
 
 
 # ───────────── persistence ─────────────
