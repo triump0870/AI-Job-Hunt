@@ -314,6 +314,11 @@ class Settings(BaseSettings):
     domain_classifier_retry_seconds: int = 60
     domain_classifier_cache_days: int = 30
     domain_classifier_shadow_daily_limit: int = 0
+    # Model calls per account and day in mode on (0 = no limit). Jobs over it wait as PENDING, unhidden and unranked,
+    # and are queued as the day's count falls; a provider outage or a big import can no longer become a ranking surge.
+    domain_classifier_daily_limit: int = 2000
+    # A job waiting for the person's review longer than this goes on like any other UNCERTAIN job (0 = never).
+    domain_classifier_review_days: int = 7
     # Shared headless browser (app.infrastructure.browser). Optional: HTTP recovery works without it.
     playwright_enabled: bool = True
     playwright_browser: str = "chromium"

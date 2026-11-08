@@ -53,3 +53,15 @@ To roll back, set the mode to `off`: jobs still waiting are released unhidden by
   irrelevant label for a job the classifier is right to keep. Precision reads low for that reason; prefer hand labels.
 * A deleted job has no description left, so its row is title-only, and the gate does not let a bare technical title be
   rejected. Such rows can never show a hybrid false negative on a technical title.
+
+## Operating limits (mode `on`)
+
+* **Daily budget:** `DOMAIN_CLASSIFIER_DAILY_LIMIT` (default 2000, 0 = none) model calls per account per day. Jobs over it
+  wait as PENDING, unhidden and unranked, and `sweep` queues them as the rolling count falls.
+* **Review deadline:** a job in Needs review longer than `DOMAIN_CLASSIFIER_REVIEW_DAYS` (default 7, 0 = never) goes on like
+  any uncertain job, so an unanswered review cannot silently remove it. This is a deliberate refinement of the AGENTS.md
+  recall rule: review is a bounded delay, not an exclusion.
+* **Turning the mode off:** queued checks are skipped without a model call, and `sweep` hands every PENDING and REVIEW job to
+  the old filter, which keeps or hides it exactly as it does with the mode off.
+* **Evidence gate:** a NO_MATCH quote must be a phrase (two or more words, at least 8 characters, not only filler words), and
+  for a posting with a body at least one quote must come from the body, not the title.

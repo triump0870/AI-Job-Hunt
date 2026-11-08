@@ -165,7 +165,7 @@ def main() -> int:
         if args.export_labels:
             print(export_labels(db, args.user, args.export_labels))
             return 0
-        legacy_rules = dm.rules_for(db, args.user)
+        legacy_rules = dm.rules_for(db, args.user, wide=False)  # the old filter as it runs with the mode off
         cases = labelled_jobs(db, args.user)
         with db.begin_nested() as saved:
             feedback_learning.learn(db, args.user)

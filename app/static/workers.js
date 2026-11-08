@@ -458,6 +458,8 @@ const WK_GATE_TEXT = {
   TEXT_NAMES_OWN_SKILLS: ['Names your skills', 'The posting names at least two of your skills.'],
   SKILLS_MATCHED: ['Model found your skills', 'The model said no match, yet listed skills of yours that the posting asks for.'],
   EVIDENCE_NOT_IN_POSTING: ['Proof not in the posting', 'The phrases the model quoted are not in the text it was shown.'],
+  EVIDENCE_TOO_THIN: ['Proof too thin', 'The phrases the model quoted are too short or too generic to show different work.'],
+  EVIDENCE_ONLY_IN_TITLE: ['Proof only in the title', 'The posting has a description, but the model quoted only the title.'],
   NO_EVIDENCE: ['No proof given', 'The model quoted no phrases to back its answer.'],
   TITLE_ONLY_TECHNICAL: ['Technical title, no description', 'Only a technical title was known, which is too little to reject on.'],
 };

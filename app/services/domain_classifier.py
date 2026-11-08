@@ -77,6 +77,10 @@ UNAVAILABLE = "CLASSIFIER_UNAVAILABLE"
 FORWARD, REVIEW_JOB, HIDE = "FORWARD", "REVIEW", "HIDE"
 PERSON_REASON = "You marked it as not matching"
 RECHECK_LIMIT = 500
+BULK_CHOICE = 3  # more jobs than this in one "not a match" click is a cleanup, not a judgement on each of them
+MIN_QUOTE_CHARS = 8
+QUOTE_FILLER = frozenset({"the", "and", "for", "with", "this", "that", "from", "you", "our", "are", "will", "work",
+                          "role", "team", "job", "position"})
 # Where a posting's substance starts, in the languages the boards send.
 SUBSTANCE = re.compile(r"responsibilit|requirement|qualification|what you|you will|you'll|about the role|the role|"
                        r"your impact|aufgaben|anforderung|dein profil|ihr profil|missions|profil recherch", re.IGNORECASE)
@@ -112,7 +116,9 @@ def candidate(db: Session, user_id: int) -> dict[str, Any]:
             except Exception:  # noqa: BLE001  a half-parsed resume still leaves the roles and skills
                 years = None
     profile = db.scalar(select(CandidateProfile).where(CandidateProfile.user_id == user_id))
-    return {"roles": list(dict.fromkeys(roles)), "skills": own["skills"],
+    # The same skills the gate protects (every resume's), so the model can report any of them.
+    skills = list(dict.fromkeys([*own["skills"], *domain_match.resume_skills(db, user_id)]))
+    return {"roles": list(dict.fromkeys(roles)), "skills": skills,
             "headline": (profile.headline if profile else "") or "", "years_experience": years}
 
 
@@ -165,6 +171,14 @@ def _own_skill(name: str, skills: list[str]) -> bool:
                for skill in skills)
 
 
+def _thin(quote: str) -> bool:
+    """A quote that shows nothing: not a phrase (one word), too short, or only filler words ("and", "the team")."""
+    squashed = _squash(quote)
+    words = re.findall(r"[^\W\d_]{4,}", squashed)
+    return (len(squashed) < MIN_QUOTE_CHARS or len(squashed.split()) < 2
+            or not [w for w in words if w not in QUOTE_FILLER])
+
+
 def decide(answer: DomainClassificationResult, *, title: str, posting: str, rules: Rules,
            full_text: str | None = None) -> Decision:
     """Reject only on sufficient evidence, and code decides what is sufficient. A NO_MATCH stands only when every
@@ -182,6 +196,8 @@ def decide(answer: DomainClassificationResult, *, title: str, posting: str, rule
         code = "NO_EVIDENCE"
     elif not all(len(_squash(p)) >= 3 and _squash(p) in shown for p in evidence):
         code = "EVIDENCE_NOT_IN_POSTING"
+    elif any(_thin(p) for p in evidence):
+        code = "EVIDENCE_TOO_THIN"
     elif matched:
         code = "SKILLS_MATCHED"
     elif domain_match.own_title(domain_match._norm(title), rules):
@@ -190,6 +206,8 @@ def decide(answer: DomainClassificationResult, *, title: str, posting: str, rule
         code = "TEXT_NAMES_OWN_SKILLS"
     elif not posting.strip() and domain_match._technical(domain_match._norm(title)):
         code = "TITLE_ONLY_TECHNICAL"
+    elif posting.strip() and not any(_squash(p) in _squash(posting) for p in evidence):
+        code = "EVIDENCE_ONLY_IN_TITLE"  # a posting with a body: a title alone does not show the work is different
     if code:
         return Decision(UNCERTAIN, answer.reason, matched, list(evidence), code, found)
     return Decision(NO_MATCH, answer.reason, [], list(evidence), job_skills=found)
@@ -292,9 +310,25 @@ def enqueue(db: Session, job: Job, *, signals: tuple[str, ...] | list[str] = (),
     return task
 
 
+def budget_left(db: Session, user_id: int, now: datetime) -> int | None:
+    """Model calls this account may still queue today in mode on; None when there is no limit."""
+    limit = get_settings().domain_classifier_daily_limit
+    if limit <= 0:
+        return None
+    used = db.scalar(select(func.count(JobClassificationTask.id)).where(
+        JobClassificationTask.user_id == user_id, JobClassificationTask.mode == TASK_ON,
+        JobClassificationTask.route == ASK, JobClassificationTask.status != SKIPPED,
+        JobClassificationTask.created_at >= now - timedelta(days=1))) or 0
+    return max(0, limit - used)
+
+
 def _hold(db: Session, job: Job, signals: tuple[str, ...], reason: str, now: datetime) -> None:
+    """Held from every worker. Over the day's budget it queues no call: `sweep` queues it as the count falls, so the job
+    waits unhidden and unranked rather than being forwarded unread."""
     job.domain_match, job.domain_reason, job.domain_checked_at = PENDING, WAITING_REASON, now
-    enqueue(db, job, signals=signals, reason=reason, now=now)
+    room = budget_left(db, job.user_id, now)
+    if room is None or room > 0:
+        enqueue(db, job, signals=signals, reason=reason, now=now)
 
 
 def screen(db: Session, job: Job, rules: Rules, *, actor: str, now: datetime | None = None,
@@ -331,7 +365,8 @@ def _shadow_room(db: Session, user_id: int, now: datetime) -> bool:
         return False
     used = db.scalar(select(func.count(JobClassificationTask.id)).where(
         JobClassificationTask.user_id == user_id, JobClassificationTask.mode == TASK_SHADOW,
-        JobClassificationTask.route == ASK, JobClassificationTask.created_at >= now - timedelta(days=1))) or 0
+        JobClassificationTask.route == ASK, JobClassificationTask.status != SKIPPED,  # a skipped row reserved no call
+        JobClassificationTask.created_at >= now - timedelta(days=1))) or 0
     return used < limit
 
 
@@ -431,22 +466,56 @@ def recover_expired(db: Session, now: datetime | None = None) -> int:
     return len(rows)
 
 
+def settle_by_old_filter(db: Session, job: Job, now: datetime, why: str) -> None:
+    """The AI check will not read this job (it was turned off): the old filter decides, exactly as it does with the mode
+    off. A job it would hide is hidden; only one it keeps goes on."""
+    verdict = _legacy(db, job, domain_match.rules_for(db, job.user_id, wide=False), job.search_run_id)
+    if verdict.match:
+        domain_match.mark(job, verdict, now)
+        domain_match.forward(db, job, actor=ACTOR, now=now, reason=why)
+    else:
+        domain_match.hide(db, job, verdict, actor=ACTOR, now=now)
+
+
 def sweep(db: Session, limit: int = 200, now: datetime | None = None) -> int:
-    """A job left PENDING with no task (mode switched, a task lost), unless a person stopped its check. Commits."""
+    """Housekeeping for held jobs. Commits. In mode on: a job left PENDING with no task is queued (within the day's
+    budget, unless a person stopped its check), and a job waiting for review longer than DOMAIN_CLASSIFIER_REVIEW_DAYS goes
+    on. In any other mode nothing will read them: the old filter decides, PENDING and REVIEW alike."""
     now = now or utcnow()
     active = select(JobClassificationTask.job_id).where(
         JobClassificationTask.status.in_(ACTIVE_JOB_CLASSIFICATION_STATUSES))
     stopped = select(JobClassificationTask.job_id).where(JobClassificationTask.last_error == STOPPED_BY_USER)
     jobs = db.scalars(select(Job).where(Job.domain_match == PENDING, Job.user_id.is_not(None), Job.id.not_in(active),
                                         Job.id.not_in(stopped)).order_by(Job.id).limit(max(1, limit))).all()
+    on, room, count = mode() == ON, {}, len(jobs)
     for job in jobs:
-        if mode() == ON:
-            enqueue(db, job, reason="sweep", now=now)
-        else:  # the mode was turned off: nothing will read it, so it goes on unhidden
-            job.domain_match, job.domain_reason, job.domain_checked_at = MATCH, None, now
-            domain_match.forward(db, job, actor=ACTOR, now=now, reason="The AI check was turned off")
+        if not on:
+            settle_by_old_filter(db, job, now, "The AI check was turned off")
+            continue
+        if job.user_id not in room:
+            room[job.user_id] = budget_left(db, job.user_id, now)
+        if room[job.user_id] is not None and room[job.user_id] <= 0:
+            count -= 1  # over today's budget: it waits, held and unhidden
+            continue
+        if room[job.user_id] is not None:
+            room[job.user_id] -= 1
+        enqueue(db, job, reason="sweep", now=now)
+    days = get_settings().domain_classifier_review_days
+    waiting = select(Job).where(Job.domain_match == domain_match.REVIEW, Job.user_id.is_not(None))
+    if not on:
+        stale = db.scalars(waiting.order_by(Job.id).limit(max(1, limit))).all()
+    elif days > 0:
+        stale = db.scalars(waiting.where(Job.domain_checked_at < now - timedelta(days=days))
+                           .order_by(Job.id).limit(max(1, limit))).all()
+    else:
+        stale = []
+    for job in stale:
+        if on:
+            _release(db, job, "Review timed out: it goes on like any uncertain job", now)
+        else:
+            settle_by_old_filter(db, job, now, "The AI check was turned off")
     db.commit()
-    return len(jobs)
+    return count + len(stale)
 
 
 # ───────────── settling ─────────────
@@ -592,6 +661,13 @@ def _process(sessions: Any, c: ClassifyClaim) -> str:
             task.last_error = "The job was deleted" if job is None else "Decided while it waited"
             db.commit()
             return "skipped"
+        if mode() != (ON if task_mode == TASK_ON else SHADOW):  # turned off (or switched) while it waited
+            _clear_lease(task)
+            task.status, task.completed_at, task.last_error = SKIPPED, now, "The AI check was turned off"
+            if task_mode == TASK_ON and job.domain_match == PENDING:
+                settle_by_old_filter(db, job, now, "The AI check was turned off")
+            db.commit()
+            return "skipped"
         ready, why = ai_ready(db, user_id)
         if not ready:
             _open(db, task, job, why, now)
@@ -688,13 +764,14 @@ def resolve_review(db: Session, user_id: int, ids: list[int], matches: bool, *, 
         if job.domain_match != domain_match.REVIEW:
             skipped.append({"id": job.id, "reason": "This job is not waiting for your review"})
             continue
-        feedback_learning.record(db, job, "KEPT" if matches else "DISMISSED")
+        if matches or len(ids) <= BULK_CHOICE:  # a big "not a match" click is a cleanup: it hides, and teaches nothing
+            feedback_learning.record(db, job, "KEPT" if matches else "DISMISSED")
         if matches:
             domain_match.keep(db, job, actor=actor, now=now)
         else:
             domain_match.hide(db, job, Verdict(False, "PERSON", PERSON_REASON), actor=actor, now=now)
         done.append(job.id)
-    if done:
+    if done and (matches or len(ids) <= BULK_CHOICE):
         feedback_learning.after_feedback(db, user_id)
     return {"done": done, "skipped": skipped, "matches": matches}
 
@@ -748,9 +825,11 @@ def recheck(db: Session, user_id: int, *, actor: str, limit: int = RECHECK_LIMIT
     db.flush()
     rules, now = domain_match.rules_for(db, user_id), utcnow()
     untouched = (AI_REASON, PERSON_REASON, search_scope.LOCATION_REASON, search_scope.ONSITE_REASON)
-    jobs = db.scalars(select(Job).where(Job.user_id == user_id, Job.domain_match == NOT_MATCHING)
+    # Excluded in SQL, before the limit: newer jobs that stay as they are must not crowd out older ones that can change.
+    jobs = db.scalars(select(Job).where(Job.user_id == user_id, Job.domain_match == NOT_MATCHING,
+                                        *(or_(Job.domain_reason.is_(None), ~Job.domain_reason.startswith(p, autoescape=True))
+                                          for p in untouched))
                       .order_by(Job.id.desc()).limit(max(1, limit))).all()
-    jobs = [job for job in jobs if not (job.domain_reason or "").startswith(untouched)]
     queued = restored = still = 0
     for job in jobs:
         before = job.domain_reason

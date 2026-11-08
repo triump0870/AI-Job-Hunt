@@ -808,7 +808,7 @@ def apply_recovered(db: Session, job: Job, task: JobDescriptionFetchTask, outcom
         return "recovered"  # the text shows the search did not ask for it (a primary skill it never mentions)
     from app.services import domain_classifier, qualification
 
-    if not qualification.owns(db, job) and domain_classifier.recheck_recovered(db, job, now):
+    if domain_classifier.recheck_recovered(db, job, now):
         return "recovered"  # read by its title alone so far: the classifier reads the text before parsing and ranking
     job_description.queue_parse(db, job, reason="description_changed", now=now)
     # Ranking waits for the parse (job_description.waiting_reason); queueing is all this worker does.

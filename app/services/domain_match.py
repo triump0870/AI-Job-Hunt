@@ -232,7 +232,8 @@ def resume_skills(db: Session, user_id: int) -> list[str]:
     return list(dict.fromkeys(names))
 
 
-def rules_for(db: Session, user_id: int) -> Rules:
+def rules_for(db: Session, user_id: int, wide: bool | None = None) -> Rules:
+    """`wide` None follows DOMAIN_CLASSIFIER_MODE; False is always the old, narrower rule set (the evaluation baseline)."""
     prefs, own = preferences(db, user_id), derived(db, user_id)
     words = role_tokens(own["roles"])
     own_skills = set(own["skills"])
@@ -246,8 +247,7 @@ def rules_for(db: Session, user_id: int) -> Rules:
     from app.services import domain_classifier
 
     # The hybrid reads every resume's skills. Off mode keeps the old, narrower list byte for byte.
-    wide = domain_classifier.mode() == domain_classifier.ON
-    if wide:
+    if domain_classifier.mode() == domain_classifier.ON if wide is None else wide:
         own = {**own, "skills": list(dict.fromkeys([*own["skills"], *resume_skills(db, user_id)]))}
         skill = [t for t in skill if not any(contains(mine, t) for mine in own["skills"])]
     return Rules(enabled=bool(prefs["enabled"]) and get_settings().domain_filter_enabled, domain_excludes=domain,

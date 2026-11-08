@@ -212,6 +212,10 @@ def _terminal(db: Session, job: Any, step: str) -> dict[str, Any] | None:
         return _end(step, TRIAGED, f"STATUS_{job.status.upper()}")
     if job.domain_match == domain_match.NOT_MATCHING:
         return _end(step, HIDDEN, "NOT_MATCHING")
+    if step != ADMISSION and job.domain_match in (domain_match.PENDING, domain_match.REVIEW):
+        # A recovered description sent the job back to the domain check (domain_classifier.recheck_recovered): this run
+        # ends, and the verdict (or the person's review) dispatches the job again.
+        return _end(step, HIDDEN, "DOMAIN_CHECK_PENDING" if job.domain_match == domain_match.PENDING else "NEEDS_REVIEW")
     return None
 
 

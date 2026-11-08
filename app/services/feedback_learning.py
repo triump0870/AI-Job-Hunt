@@ -95,6 +95,8 @@ def learn(db: Session, user_id: int) -> list[dict[str, Any]]:
     """Recompute the account's learned exclusions from its events and save them. Rules the person disabled stay
     disabled. Does not commit. Returns the learned list."""
     minimum = max(1, get_settings().learn_min_dismissals)
+    # BULK_DELETED is a cleanup in every mode: it is not a negative (NEGATIVE_FEEDBACK), so counting it would read as a
+    # positive. Only mode on writes it; rows written there stay out of the old way of learning too, on purpose.
     events = db.scalars(select(JobFeedbackEvent).where(JobFeedbackEvent.user_id == user_id,
                                                        JobFeedbackEvent.action != "BULK_DELETED")).all()
     from app.services import domain_classifier

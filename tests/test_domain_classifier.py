@@ -828,3 +828,169 @@ def test_the_evaluation_suite_passes_its_gates():
     result = SUITES["domain_classifier"](suite_dataset("domain_classifier"), {})
     assert evaluate(result)["status"] == "PASS", result.failed_cases
     assert result.metrics["hybrid_false_negative_rate"] < result.metrics["legacy_false_negative_rate"]
+
+
+# ───────────── review follow-ups: rollback, budget, gate, review expiry ─────────────
+
+@pytest.mark.parametrize("quotes", [["and"], ["the team"], ["engineer"], ["Payroll"]])
+def test_a_quote_that_shows_nothing_is_no_evidence(quotes):
+    out = decide(answer("NO_MATCH", *quotes), posting=PAYROLL + " engineer and the team")
+    assert (out.classification, out.gate_code) == ("UNCERTAIN", "EVIDENCE_TOO_THIN")
+
+
+def test_a_title_alone_does_not_reject_a_posting_with_a_body():
+    out = decide(answer("NO_MATCH", "Payroll Specialist"))
+    assert (out.classification, out.gate_code) == ("UNCERTAIN", "EVIDENCE_ONLY_IN_TITLE")
+
+
+def test_the_candidate_the_model_reads_has_every_resumes_skills(user, on):
+    from app.models import Resume
+
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        profile = db.scalar(select(CandidateProfile).where(CandidateProfile.user_id == user))
+        db.add(Resume(user_id=user, candidate_profile_id=profile.id, name="Other", version=1, raw_text="x", raw_text_hash="x",
+                      is_active=False, structured_data={"skills": [{"name": "Kafka"}]}))
+        db.commit()
+        who = dc.candidate(db, user)
+        assert "kafka" in who["skills"] and "python" in who["skills"]
+        assert dc.fingerprint(who) != dc.fingerprint({**who, "skills": [s for s in who["skills"] if s != "kafka"]})
+        db.execute(delete(Resume).where(Resume.user_id == user))
+        db.commit()
+
+
+def test_turning_the_mode_off_stops_queued_checks_and_the_old_filter_decides(user, model, monkeypatch):
+    monkeypatch.setattr(get_settings(), "domain_classifier_mode", "on")
+    model.answer = answer("NO_MATCH", "Run monthly payroll")
+    ambiguous = add(user, "Payments Infrastructure Engineer", PAYROLL)
+    assert row_of(ambiguous).domain_match == dm.PENDING
+    monkeypatch.setattr(get_settings(), "domain_classifier_mode", "off")
+    assert run_pass() == ["skipped"] and model.calls == 0
+    assert tasks_of(ambiguous)[-1].status == "SKIPPED"
+    assert row_of(ambiguous).domain_match == dm.MATCH  # the old filter keeps it: the AI check did not hide it
+
+
+def test_the_old_filter_still_hides_what_it_would_hide_when_the_mode_is_turned_off(user, model, monkeypatch):
+    monkeypatch.setattr(get_settings(), "domain_classifier_mode", "on")
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        held = add(user, "Payments Infrastructure Engineer", PAYROLL)
+        current = db.get(Job, held)
+        current.title = "Marketing Manager"  # what the old filter hides, held for the AI check by a stale PENDING
+        db.commit()
+    monkeypatch.setattr(get_settings(), "domain_classifier_mode", "off")
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        db.execute(delete(JobClassificationTask).where(JobClassificationTask.job_id == held))
+        db.commit()
+        assert dc.sweep(db) == 1
+    assert row_of(held).domain_match == dm.NOT_MATCHING
+
+
+def test_a_review_waiting_when_the_mode_is_turned_off_is_settled_not_stuck(user, model, monkeypatch):
+    monkeypatch.setattr(get_settings(), "domain_classifier_mode", "on")
+    model.answer = answer("UNCERTAIN", reason="Could be either.")
+    job_id = add(user, "Payments Operations Lead", PAYROLL)
+    assert run_pass() == ["review"]
+    monkeypatch.setattr(get_settings(), "domain_classifier_mode", "off")
+    with SessionLocal() as db:
+        dc.sweep(db)
+    assert row_of(job_id).domain_match in (dm.MATCH, dm.NOT_MATCHING)
+
+
+def test_a_review_nobody_answers_goes_on_after_the_deadline(user, on, model, monkeypatch):
+    model.answer = answer("UNCERTAIN", reason="Could be either.")
+    job_id = add(user, "Payments Operations Lead", PAYROLL)
+    assert run_pass() == ["review"]
+    with SessionLocal() as db:
+        assert dc.sweep(db) == 0  # fresh: it keeps waiting
+    assert row_of(job_id).domain_match == dm.REVIEW
+    with SessionLocal() as db:
+        assert dc.sweep(db, now=dc.utcnow() + timedelta(days=8)) == 1
+    current = row_of(job_id)
+    assert current.domain_match == dm.MATCH and "Review timed out" in current.domain_reason and spent(job_id)
+    monkeypatch.setattr(get_settings(), "domain_classifier_review_days", 0)
+    other = add(user, "Payments Operations Manager", PAYROLL)
+    assert run_pass() == ["review"]
+    with SessionLocal() as db:
+        dc.sweep(db, now=dc.utcnow() + timedelta(days=30))
+    assert row_of(other).domain_match == dm.REVIEW  # 0: it waits for the person
+
+
+def test_the_daily_budget_holds_jobs_unhidden_until_there_is_room(user, on, model, monkeypatch):
+    monkeypatch.setattr(get_settings(), "domain_classifier_daily_limit", 1)
+    first = add(user, "Payments Infrastructure Engineer", PAYROLL)
+    second = add(user, "Payments Platform Engineer", PAYROLL)
+    assert tasks_of(first) and not tasks_of(second)
+    assert row_of(second).domain_match == dm.PENDING and not spent(second)
+    run_pass()
+    with SessionLocal() as db:
+        assert dc.sweep(db) == 0  # still no room today
+    assert not tasks_of(second)
+    monkeypatch.setattr(get_settings(), "domain_classifier_daily_limit", 5)
+    with SessionLocal() as db:
+        assert dc.sweep(db) == 1
+    assert tasks_of(second) and run_pass() == ["match"]
+
+
+def test_skipped_shadow_rows_do_not_use_up_the_shadow_budget(user, model, monkeypatch):
+    monkeypatch.setattr(get_settings(), "domain_classifier_mode", "shadow")
+    monkeypatch.setattr(get_settings(), "domain_classifier_shadow_daily_limit", 1)
+    for n in range(4):
+        add(user, f"Backend Platform Engineer, Reliability {n}")
+    with SessionLocal() as db:
+        rows = db.scalars(select(JobClassificationTask).where(JobClassificationTask.user_id == user)).all()
+        assert sum(r.status == "PENDING" for r in rows) == 1 and sum(r.status == "SKIPPED" for r in rows) == 3
+        assert dc._shadow_room(db, user, dc.utcnow()) is False
+        for r in rows:
+            if r.status == "PENDING":
+                db.delete(r)  # the one real call ages out
+        db.commit()
+        assert dc._shadow_room(db, user, dc.utcnow()) is True
+
+
+def test_recheck_looks_past_newer_jobs_it_leaves_alone(user, model, monkeypatch):
+    learned = {"term": "payments", "kind": "title", "status": "active", "evidence": 9, "positive": 0, "examples": []}
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        db.add(AppSetting(user_id=user, preferences={"domain": {"learned": [learned]}}))
+        db.commit()
+    older = add(user, "Payments Infrastructure Engineer")
+    newer = add(user, "Payments Backend Engineer", company="Elsewhere")
+    monkeypatch.setattr(get_settings(), "domain_classifier_mode", "on")
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        db.get(Job, newer).domain_reason = f"{search_scope.LOCATION_REASON}: Pune (searched Berlin)"
+        db.commit()
+        out = dc.recheck(db, user, actor="test", limit=1)  # the newest hidden job is not eligible: the limit reaches past it
+        db.commit()
+    assert out["checked"] == 1 and out["queued"] == 1 and row_of(older).domain_match == dm.PENDING
+
+
+def test_a_big_not_a_match_click_hides_but_teaches_nothing(user, on, model):
+    client = TestClient(web_app)
+    model.answer = answer("UNCERTAIN", reason="Could be either.")
+    ids = [add(user, f"Payments Operations Lead {n}", PAYROLL) for n in range(5)]
+    run_pass()
+    out = client.post("/api/discovery/review", json={"ids": ids, "matches": False}).json()
+    assert sorted(out["done"]) == sorted(ids)
+    assert all(row_of(i).domain_match == dm.NOT_MATCHING for i in ids)
+    with SessionLocal() as db:
+        assert db.scalar(select(JobFeedbackEvent.id).where(JobFeedbackEvent.user_id == user).limit(1)) is None
+
+
+def test_switching_from_shadow_to_on_does_not_strand_a_job(user, model, monkeypatch):
+    monkeypatch.setattr(get_settings(), "domain_classifier_mode", "shadow")
+    monkeypatch.setattr(get_settings(), "domain_classifier_shadow_daily_limit", 5)
+    job_id = add(user, "Payments Infrastructure Engineer", PAYROLL)
+    with SessionLocal() as db:  # a job the AI check is about to hold, while a shadow task is still active on it
+        db.info["user_id"] = user
+        current = db.get(Job, job_id)
+        current.domain_match = dm.PENDING
+        db.commit()
+    monkeypatch.setattr(get_settings(), "domain_classifier_mode", "on")
+    run_pass()  # the shadow task ends (mode switched): it moves nothing, and frees the job for an ON task
+    with SessionLocal() as db:
+        dc.sweep(db)
+    run_pass()
+    assert row_of(job_id).domain_match != dm.PENDING
