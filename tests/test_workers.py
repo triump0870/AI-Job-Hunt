@@ -816,11 +816,11 @@ def test_approval_nudge_leaves_held_and_stopped_packets_alone(user_id, signed_in
 
 # ───────────── the model each task uses ─────────────
 
-def llm_row(db, uid, job, *, at, requested="big-model", answered=None, **fields):
+def llm_row(db, uid, job, *, at, requested="big-model", answered=None, worker_type="JD_PARSER", **fields):
     from app.models import LLMRequestLog
 
-    db.add(LLMRequestLog(request_id=f"wk-{uuid.uuid4()}", user_id=uid, workflow_type="job", workflow_entity_id=job.id,
-                         worker_type="JD_PARSER", stage="OTHER", provider="litellm", requested_model=requested,
+    db.add(LLMRequestLog(request_id=str(uuid.uuid4()), user_id=uid, workflow_type="job", workflow_entity_id=job.id,
+                         worker_type=worker_type, stage="OTHER", provider="litellm", requested_model=requested,
                          model=answered or requested, status="SUCCEEDED", created_at=at, **fields))
 
 
@@ -856,6 +856,137 @@ def test_tasks_show_their_model_route_and_what_changed(user_id, signed_in, monke
     change = rows[escalated.id]["model_change"]
     assert change["kind"] == "ESCALATED" and change["to"] == "large" and change["reason"] == "low confidence"
     assert rows[old.id]["model"]["source"] == "next"  # a request from before this task started is not its own
+
+
+def test_qualification_tasks_show_the_model_of_the_step_they_are_at(user_id, signed_in, monkeypatch):
+    """The graph never calls a model, so a run shows the worker it hands its current step to, and that worker's change."""
+    from app.models import JobQualificationTask
+    from app.services.llm import LLMClient
+
+    def route_for(self, worker):
+        rest = {"failed_over_from": "ranker-main"} if worker == "RANKER" else {"failed_over_from": None}
+        model = {"JD_PARSER": "parser-model", "RANKER": "ranker-backup", "JD_RECOVERY": "recovery-model"}[worker]
+        return {"route": "LITELLM", "model": model, "primary": model, "mode": None, "configured": None,
+                "backups": [], **rest}
+
+    monkeypatch.setattr(LLMClient, "route_for", route_for)
+
+    def run(db, job, **fields):
+        db.add(JobQualificationTask(**{"user_id": user_id, "job_id": job.id, "mode": "ON", "status": "PENDING",
+                                       "created_at": started, **fields}))
+
+    started = utcnow() - timedelta(minutes=5)
+    with SessionLocal() as db:
+        fresh, parsed, recovering, parsing, ranking, done, hidden = (add_job(db, user_id) for _ in range(7))
+        parsed.structured_description_status = job_description.PARSED
+        parsed.structured_description_hash = job_description.description_hash(parsed.description)
+        run(db, fresh)  # never started: the parser is next
+        run(db, parsed, step="CHECK_JD")  # nothing left to parse: the ranker is next
+        run(db, recovering, step="RECOVER_JD_IF_NEEDED", waiting_for="JD_RECOVERY")
+        run(db, parsing, step="PARSE_JD", waiting_for="JD_PARSE")
+        run(db, ranking, step="RANK", waiting_for="RANKING")
+        finished = utcnow()
+        run(db, done, status="COMPLETED", step="QUALIFY_ARCHIVE", outcome="QUALIFIED", completed_at=finished)
+        run(db, hidden, status="COMPLETED", step="DOMAIN_AND_SEARCH_SCOPE_ADMISSION", outcome="HIDDEN",
+            completed_at=finished)
+        # the parser's own request, failed over, while the run waits for it; an earlier step's says nothing about ranking
+        llm_row(db, user_id, parsing, at=utcnow(), requested="parser-backup", routing_cause="FAILOVER",
+                failed_over_from="parser-model")
+        llm_row(db, user_id, ranking, at=utcnow() - timedelta(minutes=1), requested="parser-model")
+        llm_row(db, user_id, done, at=utcnow() - timedelta(minutes=2), requested="parser-model")
+        llm_row(db, user_id, done, at=utcnow() - timedelta(minutes=1), requested="small", answered="large",
+                escalated=True, escalation_reason="LOW_CONFIDENCE", worker_type="RANKER")
+        db.commit()
+        ids = {name: job.id for name, job in (("fresh", fresh), ("parsed", parsed), ("recovering", recovering),
+                                              ("parsing", parsing), ("ranking", ranking), ("done", done),
+                                              ("hidden", hidden))}
+    found = signed_in(user_id).get("/api/workers/qualification").json()["rows"]
+    rows = {r["job_id"]: r for r in found}
+    model = {name: rows[job_id]["model"] for name, job_id in ids.items()}
+    change = {name: rows[job_id]["model_change"] for name, job_id in ids.items()}
+
+    assert (model["fresh"]["model"], model["fresh"]["source"], model["fresh"]["worker"]) == \
+        ("parser-model", "next", "JD Parser")
+    assert change["fresh"] is None
+    assert (model["parsed"]["model"], model["parsed"]["worker"]) == ("ranker-backup", "Ranker")
+    assert (model["recovering"]["model"], model["recovering"]["worker"]) == ("recovery-model", "JD Recovery")
+    # waiting for the parser's worker, the row still reports what that worker's request did
+    assert (model["parsing"]["model"], model["parsing"]["source"]) == ("parser-backup", "used")
+    assert change["parsing"]["kind"] == "FAILOVER" and change["parsing"]["from"] == "parser-model"
+    # at ranking, the parser's request is not this step's: the Ranker's plan and its resting model are
+    assert (model["ranking"]["model"], model["ranking"]["source"]) == ("ranker-backup", "next")
+    assert change["ranking"]["kind"] == "RESTING" and change["ranking"]["from"] == "ranker-main"
+    # finished: the run's own last request across its steps
+    assert (model["done"]["model"], model["done"]["source"], model["done"]["worker"]) == ("large", "used", "Ranker")
+    assert change["done"]["kind"] == "ESCALATED"
+    assert model["hidden"] == {"model": None, "source": "none"} and change["hidden"] is None
+
+
+def test_preparation_tasks_follow_the_tailor_task_and_stop_at_a_person(user_id, signed_in, monkeypatch):
+    """One tailor task tailors and then reviews, so a run waiting on it follows its stage; at approval no model is next."""
+    from app.models import AppSetting, JobPreparationTask
+    from app.services.llm import LLMClient
+
+    monkeypatch.setattr(LLMClient, "route_for", lambda self, worker: {
+        "route": "LITELLM", "model": {"TAILOR": "tailor-model", "REVIEWER": "review-model"}[worker],
+        "primary": "x", "mode": None, "configured": None, "failed_over_from": None, "backups": []})
+
+    def run(db, job, **fields):
+        db.add(JobPreparationTask(**{"user_id": user_id, "job_id": job.id, "mode": "ON", "status": "PENDING",
+                                     "created_at": started, **fields}))
+
+    started = utcnow() - timedelta(minutes=5)
+    with SessionLocal() as db:
+        fresh, tailoring, reviewing, approval, unused, done = (add_job(db, user_id) for _ in range(6))
+        run(db, fresh)
+        run(db, tailoring, step="TAILOR", waiting_for="TAILORING")
+        db.add(TailorTask(user_id=user_id, job_id=tailoring.id, status="running", stage="tailoring"))
+        run(db, reviewing, step="TAILOR", waiting_for="TAILORING")
+        db.add(TailorTask(user_id=user_id, job_id=reviewing.id, status="running", stage="reviewing"))
+        run(db, approval, step="AWAIT_APPROVAL", waiting_for="APPROVAL")
+        run(db, unused, step="AWAIT_APPROVAL", waiting_for="APPROVAL")
+        run(db, done, status="COMPLETED", step="AWAIT_APPROVAL", outcome="APPROVED", completed_at=utcnow())
+        llm_row(db, user_id, tailoring, at=utcnow(), requested="tailor-backup", routing_cause="FAILOVER",
+                failed_over_from="tailor-model", worker_type="TAILOR")
+        llm_row(db, user_id, approval, at=utcnow() - timedelta(minutes=2), requested="tailor-model",
+                worker_type="TAILOR")
+        llm_row(db, user_id, approval, at=utcnow() - timedelta(minutes=1), requested="old-review",
+                worker_type="REVIEWER")
+        llm_row(db, user_id, done, at=utcnow() - timedelta(minutes=1), requested="review-model",
+                worker_type="REVIEWER")
+        db.commit()
+        ids = {"fresh": fresh.id, "tailoring": tailoring.id, "reviewing": reviewing.id, "approval": approval.id,
+               "unused": unused.id, "done": done.id}
+    client = signed_in(user_id)
+
+    def read():
+        rows = {r["job_id"]: r for r in client.get("/api/workers/preparation").json()["rows"]}
+        return {k: rows[i]["model"] for k, i in ids.items()}, {k: rows[i]["model_change"] for k, i in ids.items()}
+
+    model, change = read()
+    assert (model["fresh"]["model"], model["fresh"]["source"], model["fresh"]["worker"]) == \
+        ("tailor-model", "next", "Tailor")
+    assert (model["tailoring"]["model"], model["tailoring"]["source"]) == ("tailor-backup", "used")
+    assert change["tailoring"]["kind"] == "FAILOVER" and change["tailoring"]["from"] == "tailor-model"
+    # the job's tailor task has moved on to review, whatever step the graph last recorded
+    assert (model["reviewing"]["model"], model["reviewing"]["worker"]) == ("review-model", "Reviewer")
+    # waiting for a person: what it last used, never a next model, and today's configuration is no change
+    assert (model["approval"]["model"], model["approval"]["source"]) == ("old-review", "used")
+    assert change["approval"] is None
+    assert model["unused"] == {"model": None, "source": "none"}
+    assert (model["done"]["model"], model["done"]["worker"]) == ("review-model", "Reviewer")
+
+    # Claude Desktop tailors and reviews for this account: nothing goes through the gateway next
+    with SessionLocal() as db:
+        setting = db.scalar(select(AppSetting).where(AppSetting.user_id == user_id))
+        if setting is None:
+            setting = AppSetting(user_id=user_id)
+            db.add(setting)
+        setting.preferences = {**(setting.preferences or {}), "execution_mode": "claude_desktop"}
+        db.commit()
+    model, _ = read()
+    assert model["fresh"] == {"model": None, "source": "none"}
+    assert model["tailoring"]["model"] == "tailor-backup"  # a request it really made is still a fact
 
 
 def test_a_waiting_task_says_when_a_backup_will_answer(monkeypatch):

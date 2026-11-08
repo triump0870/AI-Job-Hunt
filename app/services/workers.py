@@ -106,6 +106,11 @@ class WorkerKind:
     stopped_status: str = "SKIPPED"  # what Kill leaves (with lifecycle.STOPPED_BY_USER as the error)
     # Where its model calls are recorded: the llm_request_logs workflow_type, and the row key holding the entity id.
     llm_link: tuple[str, str] = ("job", "job_id")
+    # A conductor (a graph that never calls a model itself, so its orchestration node names no workers): the workers it
+    # hands its steps to, and `step_worker(db, user_id, rows)`, which says whose step each active row is at ({task id:
+    # worker type}). Its rows show that worker's model, and the requests those workers made for the job.
+    conducts: tuple[str, ...] = ()
+    step_worker: Callable[[Session, int, list[dict[str, Any]]], dict[int, str]] | None = None
 
     @property
     def active(self) -> tuple[str, str]:
@@ -148,6 +153,18 @@ def _reviewing(m: Any) -> Any:
 def _qualification_scope(m: Any) -> Any:
     """Shadow runs only compare (Monitoring); Running workers lists the runs that drive jobs."""
     return m.mode == "ON"
+
+
+def _qualification_step_workers(db: Session, user_id: int, rows_: list[dict[str, Any]]) -> dict[int, str]:
+    from app.services import qualification
+
+    return qualification.step_workers(db, user_id, rows_)
+
+
+def _preparation_step_workers(db: Session, user_id: int, rows_: list[dict[str, Any]]) -> dict[int, str]:
+    from app.services import preparation
+
+    return preparation.step_workers(db, user_id, rows_)
 
 
 def _index_scope(m: Any) -> Any:
@@ -238,13 +255,14 @@ KINDS: dict[str, WorkerKind] = {k.kind: k for k in (
                "parsing, hard filters, evidence and ranking, in that order (LangGraph). It never calls a model itself: "
                "it hands each step to its worker and waits.", JobQualificationTask, "qualification", "PENDING",
                "PROCESSING", ("COMPLETED", "FAILED", "SKIPPED"), lambda: get_settings().qualification_max_attempts,
-               "qualification", scope=_qualification_scope),
+               "qualification", scope=_qualification_scope, conducts=("JD_RECOVERY", "JD_PARSER", "RANKER"),
+               step_worker=_qualification_step_workers),
     WorkerKind("preparation", "Preparation", "Takes each qualified job through resume selection, the Ranker's "
                "analysis, evidence, tailoring, the evidence checks, the review decision and a bounded revision loop, "
                "then waits for your approval (LangGraph). It never calls a model itself: tailoring and review run in "
                "the Tailoring worker.", JobPreparationTask, "preparation", "PENDING", "PROCESSING",
                ("COMPLETED", "FAILED", "SKIPPED"), lambda: get_settings().preparation_max_attempts, "preparation",
-               scope=_qualification_scope),
+               scope=_qualification_scope, conducts=("TAILOR", "REVIEWER"), step_worker=_preparation_step_workers),
     WorkerKind("application", "Application", "Reads an approved job's application form, finds a verified source for "
                "every answer and (in assist mode) fills it in a private browser page, then stops at ready to submit "
                "for you (LangGraph). It never submits: you do, from the Apply kit. A login, code or CAPTCHA waits for "
@@ -343,7 +361,7 @@ def row(spec: WorkerKind, task: Any, label: dict[str, Any] | None, now: datetime
             "result_code": getattr(task, "result_code", None),
             # A graph run between steps has started (it waits for recovery, a parse or a ranking): it can be stopped.
             "can_kill": status in ("RUNNING", "RETRYING") or (active and _started_graph_run(spec, task)),
-            "waiting_for": getattr(task, "waiting_for", None),
+            "waiting_for": getattr(task, "waiting_for", None), "step": getattr(task, "step", None),
             "can_run_now": status in ("QUEUED", "RETRYING") or status in STATUS_FILTERS["failed"],
             "retried_by": None,  # set by rows() when a newer task of the same job exists
             "can_remove": active and status != "RUNNING" and spec.kind in ("ranking", "tailoring"),
@@ -731,7 +749,12 @@ def attach_models(db: Session, user_id: int, spec: WorkerKind | str, rows_: list
     fallback, escalation). A running or retrying task shows its own latest request when there is one; otherwise, like
     a waiting task, the model its next request goes to. Bounded (one query), metadata only, and it never raises.
     `status_of` reads a row's RUNNING / QUEUED / RETRYING when the rows are not Running workers rows (the ranking
-    tracker, the tailoring task list); anything else is finished."""
+    tracker, the tailoring task list); anything else is finished.
+
+    A conductor's row reads the requests of the workers it hands steps to: while active, those of the worker at its
+    current step, even while it waits for that worker (its own status is then only ever queued); once finished, the
+    last request made for the job during the run. The step's worker also decides the plan, and `worker` names it. An
+    active run with no worker has no model next (it waits for a person), so it reads like a finished one."""
     spec = kind_of(spec) if isinstance(spec, str) else spec
     status_of = status_of or (lambda r: r.get("status"))
     workflow_type, key = spec.llm_link
@@ -743,10 +766,19 @@ def attach_models(db: Session, user_id: int, spec: WorkerKind | str, rows_: list
         from app.services.llm import LLMClient
         from app.services.orchestration_topology import NODES
 
-        workers = next((n.workers for n in NODES if n.id == spec.node_id), ())
+        workers = spec.conducts or next((n.workers for n in NODES if n.id == spec.node_id), ())
         if not workers:
             return
-        plan = LLMClient.for_user(db, user_id).route_for(workers[0])
+        client = LLMClient.for_user(db, user_id)
+        plans: dict[str, dict[str, Any]] = {}
+
+        def plan_of(worker: str | None) -> dict[str, Any]:
+            # A conductor's plan is its current worker's; anything else keeps its node's first worker.
+            name = worker if spec.conducts and worker else workers[0]
+            if name not in plans:
+                plans[name] = client.route_for(name)
+            return plans[name]
+
         since = min((r["created_at"] for r in rows_ if r.get("created_at")), default=None)
         if since is None:
             return
@@ -759,8 +791,11 @@ def attach_models(db: Session, user_id: int, spec: WorkerKind | str, rows_: list
         for log in logs:  # newest first
             by_entity.setdefault(log.workflow_entity_id, []).append(log)
         browser_use = spec.kind == "application" and _browser_use_configured()
+        at_step = spec.step_worker(db, user_id, [r for r in rows_ if status_of(r) in STATUS_FILTERS["active"]]) \
+            if spec.step_worker else {}
         for r in rows_:
             active = status_of(r) in STATUS_FILTERS["active"]
+            step_worker = at_step.get(r.get("task_id"))
             if spec.kind == "application" and active and not (
                     r.get("backend") == "browser_use_webui" or (r.get("backend") is None and browser_use)):
                 # Only the browser-use backend asks a model anything (the Browser Navigator); a form adapter never
@@ -772,21 +807,35 @@ def attach_models(db: Session, user_id: int, spec: WorkerKind | str, rows_: list
             finished = r.get("finished_at") or r.get("completed_at")
             end = datetime.fromisoformat(finished) + timedelta(seconds=5) if finished and not active else None
             last = next((log for log in by_entity.get(r[key], [])
-                         if (start is None or log.created_at >= start) and (end is None or log.created_at <= end)),
+                         if (start is None or log.created_at >= start) and (end is None or log.created_at <= end)
+                         and (step_worker is None or log.worker_type == step_worker)),
                         None)
-            if not active:
+            if not active or (spec.step_worker is not None and step_worker is None):
+                plan = plan_of(last.worker_type if last is not None else None)
                 r["model"] = _used(last, plan) if last is not None else {"model": None, "source": "none"}
                 r["model_change"] = _change(plan, last, finished=True) if last is not None else None
+                if spec.conducts and last is not None:
+                    r["model"]["worker"] = _worker_label(last.worker_type)
                 continue
-            used = last is not None and status_of(r) in ("RUNNING", "RETRYING")
+            plan = plan_of(step_worker)
+            used = last is not None and (bool(spec.conducts) or status_of(r) in ("RUNNING", "RETRYING"))
             r["model"] = _used(last, plan) if used else {
                 "model": plan.get("model"), "route": plan["route"], "route_label": _route_label(plan["route"]),
                 "via": _via(plan), "source": "next", "backups": plan.get("backups") or []}
             r["model_change"] = _change(plan, last if used else None)
+            if step_worker:
+                r["model"]["worker"] = _worker_label(step_worker)
     except Exception:
         import logging
 
         logging.getLogger("jobhunt.workers").warning("could not read task models", exc_info=True)
+
+
+def _worker_label(worker_type: str | None) -> str | None:
+    from app.services.ai_workers import WORKERS
+
+    found = WORKERS.get(worker_type or "")
+    return found.label if found else worker_type
 
 
 def _browser_use_configured() -> bool:
