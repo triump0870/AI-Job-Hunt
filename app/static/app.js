@@ -920,9 +920,9 @@ function filterBar(j, opts) {
 
 function listingCheckButton() {
   const run = S.listingRun;
-  return `<span title="Re-reads a batch of your postings, least recently checked first, and deletes the ones whose page says they are gone or closed. Approved and applied jobs are kept, and a page that cannot be read deletes nothing.">${btn(run ? `Checking ${Math.min(run.checked, run.due)} of ${run.due}…` : label('listingCheck', 'Check listings', 'Starting…'), 'listing-check', {}, 'sm ghost', !!run || isBusy('listingCheck'))}</span>`;
+  return `<span title="Re-reads all your postings not read in the last hour, least recently checked first, and deletes the ones whose page says they are gone or closed. Approved and applied jobs are kept, and a page that cannot be read deletes nothing.">${btn(run ? `Checking ${Math.min(run.checked, run.due)} of ${run.due}…` : label('listingCheck', 'Check listings', 'Starting…'), 'listing-check', {}, 'sm ghost', !!run || isBusy('listingCheck'))}</span>`;
 }
-const LISTING_POLL_MS = 3000, LISTING_POLL_IDLE = 5, LISTING_POLL_MAX = 200;  // ten minutes at most: the check goes on regardless
+const LISTING_POLL_MS = 3000, LISTING_POLL_IDLE = 5, LISTING_POLL_MAX = 1200;  // an hour at most: the check goes on regardless
 async function pollListingCheck(tries = 0) {
   const run = S.listingRun;
   if (!run) return;
@@ -938,6 +938,7 @@ async function pollListingCheck(tries = 0) {
   if (!finished && !lost) { render(); setTimeout(() => pollListingCheck(tries + 1), LISTING_POLL_MS); return; }
   S.listingRun = null;
   toast(!finished ? 'The listing check goes on in the background · refresh later to see the result'
+    : run.checked < run.due ? `Listing check stopped at ${run.checked} of ${run.due}${run.removed ? ` · ${run.removed} removed` : ''} · sites are rate limiting, so press it again later for the rest`
     : run.removed ? `Listing check done · ${run.removed} dead posting${run.removed === 1 ? '' : 's'} removed` : 'Listing check done · no dead postings found');
   load();
 }

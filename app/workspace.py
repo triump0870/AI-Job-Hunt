@@ -1106,7 +1106,7 @@ def bulk_parse(payload: BulkIdsIn, request: Request, background: BackgroundTasks
 
 @router.post("/api/jobs/listing-check", status_code=202)
 def listing_check_start(background: BackgroundTasks, db: Session = Depends(get_user_db)):
-    """Queue a check of one batch of this account's postings. Returns at once; poll the status route below."""
+    """Queue a check of every posting of this account that is due. Returns at once; poll the status route below."""
     from app.db import SessionLocal
     from app.services import job_removal
 

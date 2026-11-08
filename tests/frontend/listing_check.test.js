@@ -63,6 +63,15 @@ describe('Discovery · Check listings', () => {
     expect(toastText()).toContain('2 dead postings removed');
   });
 
+  it('says a run stopped short, rather than done, when it ends with postings unread', async () => {
+    ui.S.listingRun = { due: 640, since: 't', checked: 40, removed: 3, idle: 4 };
+    fetchMock.mockResolvedValue(json({ checked: 40, removed: 3, running: false }));
+    await ui.pollListingCheck();
+    expect(ui.S.listingRun).toBeNull();
+    expect(toastText()).toContain('stopped at 40 of 640');
+    expect(toastText()).not.toContain('done');
+  });
+
   it('keeps following a run that is still going', async () => {
     ui.S.listingRun = { due: 3, since: 't', checked: 0, removed: 0 };
     fetchMock.mockResolvedValue(json({ checked: 1, removed: 0, running: true }));

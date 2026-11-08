@@ -5,6 +5,7 @@ be ranked and tailored with its own resume.
 Everything runs as a dedicated account, so the shared test account's profile is never changed."""
 import asyncio
 import uuid
+from datetime import timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -21,6 +22,7 @@ from app.models import (
     JobDescriptionParseTask,
     JobFeedbackEvent,
     JobRankingTask,
+    ProviderCooldown,
     RemovedPosting,
     Resume,
     ResumeVersion,
@@ -28,9 +30,10 @@ from app.models import (
     SearchRun,
     WorkflowTransition,
 )
-from app.services import domain_match, feedback_learning, job_removal, ranker, sources
+from app.services import backoff, domain_match, feedback_learning, job_removal, ranker, sources
 from app.services import resume_verification as rv
 from app.services.domain_match import DEFAULT_DOMAIN_EXCLUDES, DEFAULT_SKILL_EXCLUDES, Rules, assess
+from app.services.external_api import RateLimitedCooldown
 from app.services.lifecycle import WorkflowState as S
 from app.settings import get_settings
 from tests.conftest import make_user
@@ -457,6 +460,48 @@ def test_check_listings_button_reads_this_accounts_postings_and_deletes_the_gone
         assert db.get(Job, theirs).listing_checked_at is None, "another account's postings are not touched"
     status = client.get("/api/jobs/listing-check/status", params={"since": started.json()["since"]}).json()
     assert status == {"checked": 2, "removed": 1, "running": False}
+
+
+def test_check_listings_reads_every_due_posting_not_just_one_batch(user, server, client, monkeypatch):
+    monkeypatch.setattr(get_settings(), "listing_check_batch_size", 1)
+    jobs = [add(user, "AI Engineer", url=server.url("posting.html")) for _ in range(3)]
+    assert client.post("/api/jobs/listing-check").json()["due"] == 3
+    assert all(job_of(job_id).listing_checked_at is not None for job_id in jobs)
+
+
+def test_a_rate_limit_cooldown_stops_the_check_and_leaves_the_rest_due(user, server, monkeypatch):
+    jobs = [add(user, "AI Engineer", url=server.url("posting.html")) for _ in range(4)]
+    calls = []
+
+    async def cooling(snapshot, browser=None):
+        calls.append(snapshot.job_id)
+        raise RateLimitedCooldown("WEB", 60)
+
+    monkeypatch.setattr(job_removal, "read_posting", cooling)
+    now = job_removal.utcnow()
+    with SessionLocal() as db:
+        due = job_removal.manual_due(db, user, now)
+    summary = asyncio.run(job_removal._check_due(SessionLocal, due, now, concurrency=1))
+    assert summary["held"] == 4 and len(calls) == 1, "one held fetch stops the run"
+    assert all(job_of(job_id).listing_checked_at is None for job_id in jobs), "not read, so not marked checked"
+
+
+def test_a_real_web_cooldown_reaches_the_check_and_sends_nothing(user, server):
+    jobs = [add(user, "AI Engineer", url=server.url("posting.html")) for _ in range(3)]
+    now = job_removal.utcnow()
+    backoff.record_limit(user, "WEB", retry_after=now + timedelta(minutes=10))
+    backoff.reset_cache()
+    try:
+        with SessionLocal() as db:
+            due = job_removal.manual_due(db, user, now)
+        summary = asyncio.run(job_removal._check_due(SessionLocal, due, now, concurrency=1))
+    finally:
+        with SessionLocal() as db:
+            db.execute(delete(ProviderCooldown).where(ProviderCooldown.user_id == user))
+            db.commit()
+        backoff.reset_cache()
+    assert summary["held"] == 3
+    assert all(job_of(job_id).listing_checked_at is None for job_id in jobs)
 
 
 def test_check_listings_moves_on_from_postings_it_just_read(user, server, client):
