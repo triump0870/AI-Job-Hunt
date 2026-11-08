@@ -245,8 +245,8 @@ function wkModel(r) {
   const m = r.model;
   if (m?.source === 'none') return '<div class="wk-model nocall"><small>No model call</small></div>';
   if (!m?.model) return '<div class="wk-model empty" aria-hidden="true"></div>';
-  const verb = m.source === 'used' ? (WK_ACTIVE.includes(r.status) ? 'in use' : 'used') : 'next request';
-  return `<div class="wk-model" title="${attr(`${m.source === 'used' ? 'In use' : 'Next request'}: ${m.model} via ${m.route_label}${m.via ? ` (${m.via})` : ''}${m.backups?.length ? ` · backups ${m.backups.join(', ')}` : ''}`)}">
+  const verb = m.source === 'used' ? (WK_ACTIVE.includes(r.status) && r.waiting_for !== 'APPROVAL' ? 'in use' : 'used') : 'next request';
+  return `<div class="wk-model" title="${attr(`${m.worker ? `${m.worker} · ` : ''}${m.source === 'used' ? 'In use' : 'Next request'}: ${m.model} via ${m.route_label}${m.via ? ` (${m.via})` : ''}${m.backups?.length ? ` · backups ${m.backups.join(', ')}` : ''}`)}">
     <span class="wk-route ${m.route === 'LITELLM' ? 'gw' : 'direct'}">${esc(m.route_label)}</span><span class="mono ellipsis">${esc(m.model)}</span>
     <small>${verb}${m.via ? ` · ${esc(m.via)}` : ''}</small></div>`;
 }

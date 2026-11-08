@@ -191,6 +191,30 @@ def _busy() -> Any:
         exists().where(JobRankingTask.job_id == q.job_id, JobRankingTask.status.in_(ACTIVE_RANKING_TASK_STATUSES)))
 
 
+def step_workers(db: Session, user_id: int, rows: list[dict[str, Any]]) -> dict[int, str]:
+    """Which model worker each active run is at ({task id: worker type}), for Running workers' Model & route. Read only:
+    the worker it waits for, else the worker its next step hands to. The graph itself never calls a model.
+
+    A run before the parse step goes to the parser when its description still needs parsing, as `parse_jd` decides.
+    Recovery shows only while the run waits for it: its model is a fallback on ambiguous pages."""
+    from app.agents import qualification as graph
+    from app.services import job_description
+
+    waits = {"JD_RECOVERY": "JD_RECOVERY", "JD_PARSE": "JD_PARSER", "RANKING": "RANKER"}
+    before_parse = (None, graph.VALIDATE_JOB, graph.ADMISSION, graph.CHECK_JD, graph.RECOVER_JD)
+    open_ = [r for r in rows if waits.get(r.get("waiting_for")) is None and r.get("step") in before_parse]
+    jobs = {j.id: j for j in db.execute(select(
+        Job.id, Job.description, Job.structured_description_status, Job.structured_description_hash).where(
+        Job.user_id == user_id, Job.id.in_({r["job_id"] for r in open_}))).all()} if open_ else {}
+    parsing = get_settings().jd_parse_enabled
+    out = {}
+    for r in rows:
+        job = jobs.get(r["job_id"])
+        out[r["task_id"]] = waits.get(r.get("waiting_for")) or (
+            "JD_PARSER" if parsing and job is not None and job_description.needs_parse(job) else "RANKER")
+    return out
+
+
 def claim(db: Session, *, worker_id: str, limit: int, task_mode: str = ON, now: datetime | None = None,
           lease_seconds: int | None = None) -> list[QualificationClaim]:
     """Lease up to `limit` due PENDING tasks of `task_mode`. Run-now first; paused accounts are held unless a task was

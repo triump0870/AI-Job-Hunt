@@ -172,6 +172,33 @@ def _busy() -> Any:
     return exists().where(TailorTask.job_id == q.job_id, TailorTask.status.in_(ACTIVE_TAILOR))
 
 
+def step_workers(db: Session, user_id: int, rows: list[dict[str, Any]]) -> dict[int, str]:
+    """Which model worker each active run is at ({task id: worker type}), for Running workers' Model & route. Read only.
+
+    The job's active tailor task says first: one task tailors and then reviews, so a run waiting on it follows its
+    stage. Otherwise the run's own step does. A run left out has no model next: it waits for a person's approval, or
+    Claude Desktop does this account's tailoring and review (neither goes through the gateway)."""
+    from app.agents import preparation as graph
+
+    if graph._desktop_mode(db, user_id):
+        return {}
+    ids = {r["job_id"] for r in rows}
+    tasks = db.execute(select(TailorTask.job_id, TailorTask.stage, TailorTask.mode).where(
+        TailorTask.user_id == user_id, TailorTask.job_id.in_(ids), TailorTask.status.in_(ACTIVE_TAILOR))).all() \
+        if ids else []
+    reviewing = {t.job_id: t.stage == "reviewing" or t.mode in ("skip", "review") for t in tasks}
+    out = {}
+    for r in rows:
+        if r.get("waiting_for") == APPROVAL or r.get("step") == graph.AWAIT_APPROVAL:
+            continue
+        at_review = reviewing.get(r["job_id"])
+        if at_review is None:
+            at_review = r.get("waiting_for") == "REVIEWING" or r.get("step") in (graph.VALIDATE_FACTS, graph.REVIEW,
+                                                                                graph.DECIDE)
+        out[r["task_id"]] = "REVIEWER" if at_review else "TAILOR"
+    return out
+
+
 def _waiting_for_person() -> Any:
     """Waiting at AWAIT_APPROVAL with nothing decided: not claimable (a person's action, or Run now, wakes it)."""
     q = JobPreparationTask
