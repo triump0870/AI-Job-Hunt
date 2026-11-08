@@ -31,6 +31,28 @@ def test_a_job_added_from_a_url_without_text_does_not_borrow_its_title(monkeypat
     assert detail["description"] == "" and detail["needs_description"] is True
 
 
+def test_a_title_can_be_corrected_without_queueing_a_ranking(monkeypatch):
+    job = empty_job(monkeypatch)
+    with SessionLocal() as db:
+        before = db.get(Job, job["id"])
+        state, dedupe = before.state, before.dedupe_key
+    saved = client.put(f"/api/jobs/{job['id']}/title", json={"title": "  Senior   AI Engineer\n"})
+    assert saved.status_code == 200
+    assert saved.json()["job"]["title"] == "Senior AI Engineer"
+    with SessionLocal() as db:
+        stored = db.get(Job, job["id"])
+        assert stored.title == "Senior AI Engineer"
+        assert stored.state is state and stored.dedupe_key == dedupe
+
+
+def test_a_title_cannot_be_blank_a_placeholder_or_too_long(monkeypatch):
+    job = empty_job(monkeypatch)
+    for title in ("   ", "Untitled", "x" * 301):
+        assert client.put(f"/api/jobs/{job['id']}/title", json={"title": title}).status_code == 422
+    assert client.get(f"/api/jobs/{job['id']}").json()["title"] == "Product Manager"
+    assert client.put("/api/jobs/999999999/title", json={"title": "AI Engineer"}).status_code == 404
+
+
 def test_a_pasted_description_is_saved_and_queued_for_ranking(monkeypatch):
     job = empty_job(monkeypatch)
     too_short = client.put(f"/api/jobs/{job['id']}/description", json={"description": "PM role"})
