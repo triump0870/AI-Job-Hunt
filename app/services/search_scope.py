@@ -85,18 +85,30 @@ def assess(job: Any, roles: list[str], locations: list[str], skills: list[str], 
     if skills and description.strip() and not any(contains(f"{title}\n{description}", s) for s in skills):
         return Verdict(False, SKILL, f"{SKILL_REASON} {', '.join(skills)}"[:300])
 
+    return _place_miss(job, locations, distance, remote_only) or Verdict(True, domain_match.MATCH)
+
+
+def _place_miss(job: Any, locations: list[str], distance: int, remote_only: bool) -> Verdict | None:
+    """A posting that is on-site for a remote-only search, or in a place the search did not cover. A fact, not a guess."""
     if remote_only and is_onsite(job):
         return Verdict(False, LOCATION, ONSITE_REASON)
-
     where = getattr(job, "location", "") or ""
     places = [p for p in locations if p and p.strip()]
     if places and where.strip() and not any(_place_accepts(p, where, distance) for p in places):
         return Verdict(False, LOCATION, f"{LOCATION_REASON}: {where} (searched {'; '.join(places)})"[:300])
-    return Verdict(True, domain_match.MATCH)
+    return None
 
 
 def verdict_for(db: Session, job: Job, search_run_id: int | None = None) -> Verdict | None:
     """The job against its own search run's scope; None when the run recorded none (older runs, plain imports)."""
+    scope = _scope_of(db, job, search_run_id)
+    if scope is None:
+        return None
+    roles, places, skills, distance, remote_only = scope
+    return assess(job, roles, places, skills, distance=distance, remote_only=remote_only)
+
+
+def _scope_of(db: Session, job: Job, search_run_id: int | None) -> tuple[list[str], list[str], list[str], int, bool] | None:
     run_id = search_run_id or job.search_run_id
     run = db.get(SearchRun, run_id) if run_id else None
     if run is None or not run.roles:
@@ -106,8 +118,30 @@ def verdict_for(db: Session, job: Job, search_run_id: int | None = None) -> Verd
     # Runs covering several places record each one; a one-place run (and Hunter runs) only has run.location.
     places = [p for p in params.get("locations") or [] if isinstance(p, str)] or [run.location or ""]
     distance = params.get("distance")
-    return assess(job, list(run.roles), places, skills, distance=50 if distance is None else int(distance),
-                  remote_only=bool(params.get("is_remote")))
+    return list(run.roles), places, skills, 50 if distance is None else int(distance), bool(params.get("is_remote"))
+
+
+def hybrid(db: Session, job: Job, search_run_id: int | None = None,
+           rules: domain_match.Rules | None = None) -> tuple[Verdict | None, tuple[str, ...]]:
+    """DOMAIN_CLASSIFIER_MODE=on: a place miss still hides (a fact); a role or skill miss is only a doubt for the
+    classifier, because boards and searches name the same work in many ways ("Artificial Intelligence Engineer" on a
+    search for "AI Engineer", "LLMs" for `llm`). Returns (the hiding verdict or None, the doubts)."""
+    scope = _scope_of(db, job, search_run_id)
+    if scope is None:
+        return None, ()
+    roles, places, skills, distance, remote_only = scope
+    miss = assess(job, roles, [], skills)  # roles and skills only: no places, not remote-only
+    place = _place_miss(job, places, distance, remote_only)
+    if miss.match:
+        return place, ()
+    title, text = getattr(job, "title", "") or "", getattr(job, "description", "") or ""
+    # A literal miss is no doubt at all when the job names the same role or skill another way, or another of the person's.
+    if miss.code == ROLE:
+        named = any(domain_match.names_role(title, role) for role in roles) or \
+            (rules is not None and domain_match.own_title(title, rules))
+    else:
+        named = bool(domain_match.skills_found(f"{title}\n{text}", [*skills, *(rules.skills if rules else [])]))
+    return place, (() if named else (miss.code,))
 
 
 def hidden_by_scope(job: Job) -> bool:
@@ -118,7 +152,12 @@ def screen(db: Session, job: Job, search_run_id: int | None = None, *, actor: st
     """Hide a job that its own search did not ask for. True when it may carry on."""
     if job.domain_match == domain_match.KEPT:
         return True
-    verdict = verdict_for(db, job, search_run_id)
+    from app.services import domain_classifier
+
+    if domain_classifier.mode() == domain_classifier.ON:
+        verdict = hybrid(db, job, search_run_id)[0]
+    else:
+        verdict = verdict_for(db, job, search_run_id)
     if verdict is None or verdict.match:
         return True
     domain_match.hide(db, job, verdict, actor=actor)

@@ -701,8 +701,8 @@ def needs_parse(job: Job) -> bool:
 
 def queue_parse(db: Session, job: Job, *, reason: str = "new", now: datetime | None = None) -> JobDescriptionParseTask | None:
     """Queue one parse for this job. A job never has two active tasks, and the same text is never queued twice."""
-    if not (job.description or "").strip():
-        return None
+    if not (job.description or "").strip() or job.domain_match in ("PENDING", "REVIEW"):
+        return None  # nothing to read, or the domain check (or the person's review) has not let it through yet
     digest = description_hash(job.description or "")
     # A task this session created but has not flushed yet counts too: sessions do not autoflush, so without this
     # the same job could be queued twice in one transaction and break the caller's commit.
@@ -738,7 +738,7 @@ def sweep(db: Session, limit: int | None = None) -> dict[str, int]:
                .where(Job.description.is_not(None), Job.description != "",
                       Job.structured_description_status.in_((RAW, NORMALIZED)), Job.id.not_in(active),
                       Job.id.not_in(recovering), Job.id.not_in(stopped),
-                      Job.domain_match.is_distinct_from("NOT_MATCHING")))
+                      or_(Job.domain_match.is_(None), Job.domain_match.not_in(("NOT_MATCHING", "PENDING", "REVIEW")))))
     from app.services import qualification
 
     if qualification.routes(db):
@@ -976,7 +976,7 @@ PARSE_AFTER_RECOVERY = "The job description is being recovered before it is pars
 
 def _parse_wait(db: Session, job: Job) -> str | None:
     """PARSE_RUNNING, PARSE_NOT_QUEUED (needs a parse that nobody has queued) or None (ranking may go ahead)."""
-    if not get_settings().jd_parse_enabled or not needs_parse(job) or job.domain_match == "NOT_MATCHING":
+    if not get_settings().jd_parse_enabled or not needs_parse(job) or job.domain_match in ("NOT_MATCHING", "PENDING", "REVIEW"):
         return None
     queued = next((task for task in db.new
                    if isinstance(task, JobDescriptionParseTask) and task.job_id == job.id), None)

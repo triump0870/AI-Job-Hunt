@@ -3,7 +3,7 @@
    tokens (brand + orange, validated for colour-vision deficiency); every chart has hover details and a table view. */
 'use strict';
 
-const MON_STAGES = { RANKER: 'Ranker', TAILOR: 'Tailor', REVIEWER: 'Reviewer', RESUME_PARSER: 'Resume parser', JD_PARSER: 'JD parser', JD_RECOVERY: 'JD recovery', APPLICATION: 'Application', FOLLOW_UP: 'Follow-up', INBOX: 'Inbox', COMPANY_INSIGHTS: 'Company insights', INTERVIEW_INSIGHTS: 'Interview insights', ADVISOR: 'Advisor', OTHER: 'Other' };
+const MON_STAGES = { RANKER: 'Ranker', TAILOR: 'Tailor', REVIEWER: 'Reviewer', RESUME_PARSER: 'Resume parser', JD_PARSER: 'JD parser', JD_RECOVERY: 'JD recovery', DOMAIN_CLASSIFIER: 'Domain check', APPLICATION: 'Application', FOLLOW_UP: 'Follow-up', INBOX: 'Inbox', COMPANY_INSIGHTS: 'Company insights', INTERVIEW_INSIGHTS: 'Interview insights', ADVISOR: 'Advisor', OTHER: 'Other' };
 const MON_ERRORS = { TIMEOUT: 'Timeouts', RATE_LIMIT: 'Rate limits', INVALID_JSON: 'Invalid JSON', SCHEMA_VALIDATION: 'Schema validation', PROVIDER_ERROR: 'Provider errors', CONTEXT_OVERFLOW: 'Context overflow', CONFIGURATION: 'Configuration', OTHER: 'Other' };
 const MON_RANGES = [['today', 'Today'], ['7d', '7 days'], ['30d', '30 days']];
 const MON_SERIES = { input: '#5b4ae8', output: '#eb6834' };

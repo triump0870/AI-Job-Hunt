@@ -9,23 +9,37 @@ Rules come from the account: its target roles, headline and resume (roles and sk
 searches, its own exclude and include lists (seeded with common off-domain areas), and terms learned from the jobs
 it dismissed (app.services.feedback_learning). A term the candidate's own profile uses is never excluded, and an
 include term always wins. When unsure, the job is kept: only a clear term match hides a job.
+
+With DOMAIN_CLASSIFIER_MODE=on this module keeps only the unambiguous decisions (`triage`). Everything else goes to the
+domain classifier (app.services.domain_classifier), and the job waits as PENDING, held from every worker. `assess` stays
+as it is: it is what the mode `off` runs, and the baseline every comparison measures against.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from functools import lru_cache
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from app.models import Job, JobDescriptionFetchTask, JobDescriptionParseTask, JobRankingTask
+from app.models import (
+    Job,
+    JobClassificationTask,
+    JobDescriptionFetchTask,
+    JobDescriptionParseTask,
+    JobRankingTask,
+)
 from app.services.lifecycle import WorkflowState as S
 from app.services.lifecycle import can_transition
 from app.settings import get_settings
 
-MATCH, NOT_MATCHING, KEPT = "MATCH", "NOT_MATCHING", "KEPT"
+MATCH, NOT_MATCHING, KEPT, PENDING, REVIEW = "MATCH", "NOT_MATCHING", "KEPT", "PENDING", "REVIEW"
+HELD = (NOT_MATCHING, PENDING, REVIEW)  # no recovery, parse or ranking may start for these
+WAITING = (PENDING, REVIEW)  # held, but not decided against: for the classifier, or for the person (Discovery → Review)
+HARD, POSITIVE, ASK = "HARD", "POSITIVE", "ASK"  # what triage decides
 # Off-domain areas: excluded unless the candidate's own target roles name them.
 DEFAULT_DOMAIN_EXCLUDES = ("sales", "account executive", "account manager", "business development", "bdr", "sdr",
                            "digital marketing", "marketing", "seo", "sem", "social media", "content writer",
@@ -42,6 +56,35 @@ GENERIC_ROLE_WORDS = frozenset({
     "architect", "consultant", "analyst", "scientist", "i", "ii", "iii", "iv", "of", "and", "the", "for", "with",
     "to", "in", "at", "a", "an", "remote", "hybrid", "team", "member", "expert", "professional", "executive"})
 DESCRIPTION_WINDOW = 3000
+# A title with one of these describes technical work, so a word beside it ("Marketing", "Customer Service") does not by
+# itself say the job is off-domain: triage asks the classifier instead of hiding it. German and French postings too.
+TECHNICAL_ROLE_WORDS = ("engineer", "engineers", "engineering", "developer", "developers", "programmer", "architect",
+                        "scientist", "researcher", "devops", "sre", "swe", "sde", "technical lead", "tech lead",
+                        "ingenieur", "ingenieurin", "entwickler", "entwicklerin", "ingénieur", "développeur")
+# Titles that name the same role. Applied to both sides before comparing, in this order: "SDE 3" and "Senior Software
+# Engineer", "FDE" and "Forward Deployed Engineer", "Artificial Intelligence Engineer" and "AI Engineer". Only ever
+# protects a job or forwards it, never hides one.
+ROLE_EQUIVALENTS = tuple((re.compile(pattern), name) for pattern, name in (
+    (r"\bsr\b\.?", "senior"),
+    (r"\b(?:engg|engr)\b\.?", "engineer"),
+    (r"\bartificial intelligence\b", "ai"),
+    (r"\bmachine learning\b", "ml"),
+    (r"\bforward[ -]deploy(?:ed|ment)(?: software)?[ -]engineers?\b", "forward deployed engineer"),
+    (r"\bfdes?\b", "forward deployed engineer"),
+    (r"\b(?:sde|swe|software development engineer|software developer|software engineer)[ -]*(?:3|iii)\b",
+     "senior software engineer"),
+    (r"\b(?:sde|swe|software development engineer|software developer|software engineer)[ -]*(?:4|iv)\b",
+     "staff software engineer"),
+    (r"\b(?:sde|swe|software development engineer|software developer)(?:[ -]*(?:1|2|i|ii))?\b", "software engineer"),
+))
+# Skills that are also everyday words or people skills: a posting naming them says nothing about the kind of work.
+UNINFORMATIVE_SKILLS = frozenset({"go", "r", "c", "hiring", "mentorship", "mentoring", "okrs", "leadership", "cursor",
+                                  "engineering leadership", "engineering management", "architecture reviews",
+                                  "client integration", "enterprise deployments"})
+# Other names of a skill that a whole-word match cannot see. Only protects a job or forwards it, never hides one.
+SKILL_SYNONYMS = {"genai": ("generative ai", "gen ai"), "generative ai": ("genai", "gen ai"),
+                  "llm": ("large language model",), "ai": ("artificial intelligence", "ki"),
+                  "ml": ("machine learning",), "machine learning": ("ml",)}
 
 
 def utcnow() -> datetime:
@@ -59,6 +102,38 @@ def term_pattern(term: str) -> re.Pattern[str]:
 
 def contains(text: str, term: str) -> bool:
     return bool(term) and term_pattern(term).search(_norm(text)) is not None
+
+
+@lru_cache(maxsize=512)
+def _skill_pattern(skill: str) -> re.Pattern[str]:
+    from app.services.resume_parsing import SKILL_ALIASES
+
+    name = _norm(skill)
+    forms = {name, *SKILL_SYNONYMS.get(name, ()), *SKILL_ALIASES.get(name, ())}
+    body = "|".join(sorted((re.escape(_norm(form)) for form in forms if form), key=len, reverse=True))
+    return re.compile(rf"(?<![\w+#.])(?:{body})(?:s|es)?(?![\w+#])")
+
+
+def names_skill(text: str, skill: str) -> bool:
+    """Like `contains`, but "LLMs" names `llm`, "Generative AI" names `genai` and "k8s" names `kubernetes`."""
+    return bool(skill and skill.strip()) and _skill_pattern(skill).search(_norm(text)) is not None
+
+
+def canonical_title(title: str) -> str:
+    text = _norm(title)
+    for pattern, name in ROLE_EQUIVALENTS:
+        text = pattern.sub(name, text)
+    return text
+
+
+def names_role(title: str, role: str) -> bool:
+    """The title names this role, under any of its equivalent names."""
+    return contains(canonical_title(title), canonical_title(role))
+
+
+def skills_found(text: str, skills: list[str]) -> list[str]:
+    """Which of the candidate's skills this text names, leaving out those that are also everyday words."""
+    return [s for s in skills if _norm(s) not in UNINFORMATIVE_SKILLS and names_skill(text, s)]
 
 
 def role_tokens(roles: list[str]) -> set[str]:
@@ -88,6 +163,17 @@ class Verdict:
     match: bool
     code: str  # MATCH | DOMAIN | SKILL | DESCRIPTION | LEARNED
     reason: str = ""
+
+
+@dataclass(frozen=True)
+class Triage:
+    """What the rules can settle alone. HARD hides, POSITIVE forwards, ASK goes to the classifier. `signals` are the
+    doubts behind an ASK: they never hide a job, and each one rules the positive shortcut out."""
+
+    route: str
+    code: str = ""
+    reason: str = ""
+    signals: tuple[str, ...] = ()
 
 
 # ───────────── rules ─────────────
@@ -133,6 +219,19 @@ def derived(db: Session, user_id: int) -> dict[str, list[str]]:
     return {"roles": clean(roles), "skills": clean(skills)}
 
 
+def resume_skills(db: Session, user_id: int) -> list[str]:
+    """Every skill in the structured data of all the account's resumes, not just the active one's first ten: a job may
+    well be matched to another resume. Skills a person rejected are left out."""
+    from app.models import Resume
+
+    names: list[str] = []
+    for data in db.scalars(select(Resume.structured_data).where(Resume.user_id == user_id)).all():
+        for skill in (data or {}).get("skills") or []:
+            if isinstance(skill, dict) and skill.get("name") and str(skill.get("status") or "").upper() != "REJECTED":
+                names.append(_norm(str(skill["name"])))
+    return list(dict.fromkeys(names))
+
+
 def rules_for(db: Session, user_id: int) -> Rules:
     prefs, own = preferences(db, user_id), derived(db, user_id)
     words = role_tokens(own["roles"])
@@ -144,6 +243,13 @@ def rules_for(db: Session, user_id: int) -> Rules:
     skill = [t for t in map(_norm, prefs["skill_excludes"])
              if t and t not in words and not any(contains(own, t) for own in own_skills)]
     learned = [e for e in prefs["learned"] if e.get("status") == "active"] if prefs["learn_from_feedback"] else []
+    from app.services import domain_classifier
+
+    # The hybrid reads every resume's skills. Off mode keeps the old, narrower list byte for byte.
+    wide = domain_classifier.mode() == domain_classifier.ON
+    if wide:
+        own = {**own, "skills": list(dict.fromkeys([*own["skills"], *resume_skills(db, user_id)]))}
+        skill = [t for t in skill if not any(contains(mine, t) for mine in own["skills"])]
     return Rules(enabled=bool(prefs["enabled"]) and get_settings().domain_filter_enabled, domain_excludes=domain,
                  skill_excludes=skill, includes=[t for t in map(_norm, prefs["include_terms"]) if t],
                  roles=own["roles"], skills=own["skills"],
@@ -184,6 +290,65 @@ def assess(job: Any, rules: Rules) -> Verdict:
     return Verdict(True, MATCH)
 
 
+def _technical(title: str) -> bool:
+    return any(contains(title, word) for word in TECHNICAL_ROLE_WORDS)
+
+
+def own_title(title: str, rules: Rules) -> bool:
+    """The title names one of the candidate's target roles or skills: it is never hidden on a model's word alone."""
+    return any(names_role(title, role) for role in rules.roles) or bool(skills_found(title, rules.skills))
+
+
+def triage(job: Any, rules: Rules, scope_signals: tuple[str, ...] = ()) -> Triage:
+    """Only the unambiguous decides here (AGENTS.md: Discovery quality):
+
+    HARD      a term the person chose (their own exclude list, "Always exclude"); a default area in a title that names
+              no technical work ("Founding Account Executive"); a skill in a title with none of the candidate's role
+              words or skills ("Senior Java Developer"); a company with enough explicit dismissals and no keeps.
+    POSITIVE  an include term; or a target role with a domain word, one of the candidate's skills in the title or text,
+              and no doubt. Spares the model call.
+    ASK       everything else. Learned title words, foreign skills beside the candidate's own role words and search
+              scope misses are signals: they send a job to the model, and never hide it.
+    """
+    title = _norm(getattr(job, "title", "") or "")
+    if not rules.enabled or not title:
+        return Triage(POSITIVE, MATCH)
+    if any(contains(title, term) for term in rules.includes):
+        return Triage(POSITIVE, MATCH, "Matches one of your include terms")
+    signals = list(scope_signals)
+    technical = _technical(title)
+    for term in rules.domain_excludes:
+        if contains(title, term):
+            if term not in DEFAULT_DOMAIN_EXCLUDES or not technical:  # the person's own term, or plainly not technical
+                return Triage(HARD, "DOMAIN", f"Outside your domain: {term}")
+            signals.append(f"DOMAIN:{term}")
+    has_own_skill = bool(skills_found(title, rules.skills))
+    has_role_word = any(contains(canonical_title(title), word) for word in rules.role_words)
+    for term in rules.skill_excludes:
+        if contains(title, term) and not has_own_skill:
+            if not has_role_word:
+                return Triage(HARD, "SKILL", f"Different skill set: {term}")
+            signals.append(f"SKILL:{term}")
+    company = _norm(getattr(job, "company", "") or "")
+    for entry in rules.learned_companies:
+        if company and _norm(entry.get("term", "")) == company:
+            # Only what cleaned learning counted (feedback_learning.counted_events): never a bulk cleanup.
+            if entry.get("clean") and not entry.get("positive"):
+                return Triage(HARD, "LEARNED", f"You dismissed {entry.get('evidence', 0)} jobs at this company")
+            signals.append(f"LEARNED_COMPANY:{company}")
+    signals += [f"LEARNED:{e['term']}" for e in rules.learned_titles if contains(title, e.get("term", ""))]
+    body = _norm((getattr(job, "description", "") or "")[:DESCRIPTION_WINDOW])
+    if not has_own_skill and not has_role_word and rules.skills:
+        foreign = [term for term in rules.skill_excludes if contains(body, term)]
+        if len(foreign) >= 2 and not skills_found(body, rules.skills):
+            signals.append(f"DESCRIPTION:{','.join(foreign[:3])}")
+    if not signals:
+        role = next((r for r in rules.roles if names_role(title, r) and role_tokens([r])), None)
+        if role and (has_own_skill or skills_found(body, rules.skills)):
+            return Triage(POSITIVE, MATCH, f"The title names your role: {role}")
+    return Triage(ASK, signals=tuple(dict.fromkeys(signals)))
+
+
 # ───────────── acting on it ─────────────
 
 def _cancel_pending_work(db: Session, job: Job, now: datetime) -> None:
@@ -199,6 +364,10 @@ def _cancel_pending_work(db: Session, job: Job, now: datetime) -> None:
                                                        JobRankingTask.status == "PENDING")).all():
         task.status, task.completed_at, task.last_error = "SKIPPED", now, reason
         task.locked_by = task.lock_token = task.lock_expires_at = None
+    for task in db.scalars(select(JobClassificationTask).where(JobClassificationTask.job_id == job.id,
+                                                              JobClassificationTask.mode == "ON",
+                                                              JobClassificationTask.status == "PENDING")).all():
+        task.status, task.completed_at, task.last_error = "SKIPPED", now, reason
 
 
 def mark(job: Job, verdict: Verdict, now: datetime | None = None) -> None:
@@ -221,16 +390,26 @@ def hide(db: Session, job: Job, verdict: Verdict, *, actor: str, now: datetime |
         transition(db, job, S.SKIPPED, actor=actor, reason=verdict.reason, now=now)
 
 
+def not_held() -> Any:
+    """SQL: the job may be worked on (not hidden, and not waiting for the domain classifier)."""
+    return or_(Job.domain_match.is_(None), Job.domain_match.not_in(HELD))
+
+
 def screen(db: Session, job: Job, rules_cache: dict[int, Rules] | None = None, *, actor: str = "discovery",
-           now: datetime | None = None) -> bool:
-    """Assess a job not assessed yet, hiding it when it does not match. True when it may carry on."""
+           now: datetime | None = None, search_run_id: int | None = None) -> bool:
+    """Assess a job not assessed yet, hiding it when it does not match. True when it may carry on. A job sent to the
+    domain classifier (mode on) may not carry on yet: `job.domain_match` is then PENDING."""
     if job.domain_match in (MATCH, KEPT):
         return True
-    if job.domain_match == NOT_MATCHING:
+    if job.domain_match in HELD:
         return False
     cache = rules_cache if rules_cache is not None else {}
     if job.user_id not in cache:
         cache[job.user_id] = rules_for(db, job.user_id)
+    from app.services import domain_classifier
+
+    if domain_classifier.mode() == domain_classifier.ON:
+        return domain_classifier.screen(db, job, cache[job.user_id], actor=actor, now=now, search_run_id=search_run_id)
     verdict = assess(job, cache[job.user_id])
     if verdict.match:
         mark(job, verdict, now)
@@ -242,13 +421,19 @@ def screen(db: Session, job: Job, rules_cache: dict[int, Rules] | None = None, *
 def keep(db: Session, job: Job, *, actor: str, now: datetime | None = None) -> str | None:
     """The person keeps a hidden job: it is never assessed again and goes through recovery, parsing and ranking
     like any new job. Returns why ranking could not queue it, or None."""
+    now = now or utcnow()
+    job.domain_match, job.domain_reason, job.domain_checked_at = KEPT, "Kept by you", now
+    return forward(db, job, actor=actor, now=now, reason="Kept although it looked outside your domain")
+
+
+def forward(db: Session, job: Job, *, actor: str, now: datetime, reason: str) -> str | None:
+    """A job the person kept or the classifier let through goes on like any new job: back out of SKIPPED, a resume, then
+    recovery, parsing and ranking. Returns why ranking could not queue it, or None."""
     from app.services import jd_recovery, job_description, ranker
     from app.services.work_queue import transition
 
-    now = now or utcnow()
-    job.domain_match, job.domain_reason, job.domain_checked_at = KEPT, "Kept by you", now
     if job.state is S.SKIPPED and can_transition(job.state, S.NORMALIZED, previous_state=job.previous_state):
-        transition(db, job, S.NORMALIZED, actor=actor, reason="Kept although it looked outside your domain", now=now)
+        transition(db, job, S.NORMALIZED, actor=actor, reason=reason, now=now)
     from app.services import discovery
 
     discovery.choose_resume(db, job)  # hidden jobs were never matched to a resume
@@ -267,8 +452,10 @@ def keep(db: Session, job: Job, *, actor: str, now: datetime | None = None) -> s
 def reapply(db: Session, user_id: int, *, actor: str) -> dict[str, int]:
     """Assess the account's unranked jobs again after its lists changed. Kept jobs are never touched; a job that now
     matches is put back in the queue. Does not commit."""
-    from app.services import search_scope
+    from app.services import domain_classifier, search_scope
 
+    if domain_classifier.mode() == domain_classifier.ON:
+        return domain_classifier.reapply(db, user_id, actor=actor)
     rules = rules_for(db, user_id)
     hidden = restored = 0
     jobs = db.scalars(select(Job).where(Job.user_id == user_id, Job.domain_match.is_distinct_from(KEPT),

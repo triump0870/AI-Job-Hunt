@@ -152,6 +152,8 @@ def enqueue(db: Session, job: Job, *, reason: str = "auto", force: bool = False,
     existing = _pending_in_session(db, job) or active_task(db, job.id)
     if existing is not None:
         return existing
+    if job.domain_match in ("PENDING", "REVIEW"):
+        return None  # nothing is fetched before the domain check (or the person's review) lets the job through
     url = (job.url or job.source_url or "").strip()
     if not force:
         previous = latest_task(db, job.id)
@@ -223,7 +225,7 @@ def sweep(db: Session, limit: int | None = None, *, now: datetime | None = None)
             continue
         if job.state is not S.SKIPPED and not domain_match.screen(db, job, rules, now=now):
             continue  # outside the account's domain: nothing is spent on it
-        if job.domain_match == domain_match.NOT_MATCHING:
+        if job.domain_match in domain_match.HELD:
             continue
         if job.state is S.SKIPPED and (job.previous_state is not S.NORMALIZED or ranker.removed_by_user(db, job)):
             continue  # skipped for another reason than a missing description
@@ -804,12 +806,14 @@ def apply_recovered(db: Session, job: Job, task: JobDescriptionFetchTask, outcom
 
     if not search_scope.screen(db, job, actor="jd_recovery"):
         return "recovered"  # the text shows the search did not ask for it (a primary skill it never mentions)
+    from app.services import domain_classifier, qualification
+
+    if not qualification.owns(db, job) and domain_classifier.recheck_recovered(db, job, now):
+        return "recovered"  # read by its title alone so far: the classifier reads the text before parsing and ranking
     job_description.queue_parse(db, job, reason="description_changed", now=now)
     # Ranking waits for the parse (job_description.waiting_reason); queueing is all this worker does.
     if ranker.removed_by_user(db, job):
         return "recovered"  # the person took this job out of ranking; a description does not put it back
-    from app.services import qualification
-
     if qualification.owns(db, job):
         return "recovered"  # the qualification graph waits for this recovery and takes the job on itself
     try:

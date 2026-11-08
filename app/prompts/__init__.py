@@ -36,6 +36,7 @@ from app.prompts.contracts import (
                                        InboxClassificationResult,
                                        InterviewPrepResult,
                                        JobDescriptionParserOutput,
+                                       DomainClassificationResult,
                                        JobDescriptionRecoveryResult,
                                        OptimizationReport,
                                        RankingResult,
@@ -58,6 +59,7 @@ from app.prompts.job_description_parser import (
                                        JOB_DESCRIPTION_PARSER_PROMPT_VERSION,
                                        build_job_description_parser_prompt,
 )
+from app.prompts.domain_classifier import DOMAIN_CLASSIFIER_PROMPT_VERSION, build_domain_classifier_prompt
 from app.prompts.job_description_recovery import (
                                        JOB_DESCRIPTION_RECOVERY_PROMPT_VERSION,
                                        build_job_description_recovery_prompt,
@@ -89,6 +91,7 @@ PROMPT_VERSIONS = {
     "resume_parser": RESUME_PARSER_PROMPT_VERSION,
     "job_description_parser": JOB_DESCRIPTION_PARSER_PROMPT_VERSION,
     "job_description_recovery": JOB_DESCRIPTION_RECOVERY_PROMPT_VERSION,
+    "domain_classifier": DOMAIN_CLASSIFIER_PROMPT_VERSION,
     "evidence_extraction": EVIDENCE_EXTRACTION_PROMPT_VERSION,
     "application_question": APPLICATION_QUESTION_PROMPT_VERSION,
     "application_form": APPLICATION_FORM_PROMPT_VERSION,
@@ -117,6 +120,7 @@ OUTPUT_CONTRACTS = {
     "resume_parser": ResumeParserOutput,
     "job_description_parser": JobDescriptionParserOutput,
     "job_description_recovery": JobDescriptionRecoveryResult,
+    "domain_classifier": DomainClassificationResult,
     "evidence_extraction": EvidenceExtractionResult,
     "application_question": ApplicationAnswerResult,
     "application_form": ApplicationFormPrepResult,
@@ -149,6 +153,7 @@ __all__ = [
                                        "build_browser_navigation_prompt",
                                        "build_company_insights_prompt",
                                        "build_cover_letter_prompt",
+                                       "build_domain_classifier_prompt",
                                        "build_evidence_extraction_prompt",
                                        "build_followup_prompt",
                                        "build_inbox_classification_prompt",

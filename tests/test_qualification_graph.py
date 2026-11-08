@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import func, select, update
@@ -167,6 +168,51 @@ def test_an_old_job_is_admitted_by_the_graph_before_anything_is_spent(sessions, 
     assert model.calls == [] and parses.parses == [] and server.hits == [] and browser.calls == []
     task = qs.qualification_tasks(sessions, job_id)[-1]
     assert (task.outcome, task.step) == ("HIDDEN", graph.ADMISSION)
+
+
+def _classify(sessions, monkeypatch, classification, *evidence):
+    """One pass of the domain check with a stubbed model: what the scheduler job does between graph passes."""
+    from app.prompts.contracts import DomainClassificationResult
+    from app.services import domain_classifier as dc
+    from app.services import llm
+
+    answer = DomainClassificationResult(classification=classification, reason="Stub.", irrelevance_evidence=list(evidence))
+    monkeypatch.setattr(llm.LLMClient, "generate_prompt",
+                        lambda self, prompt, call=None: SimpleNamespace(validated=answer, model="stub", data={}))
+    with sessions() as db:
+        claims = dc.claim(db, worker_id="test", limit=10)
+    return [dc.process(sessions, c) for c in claims]
+
+
+def test_the_graph_waits_for_the_domain_check_and_then_goes_on(sessions, model, parses, monkeypatch):
+    from app.settings import get_settings
+
+    monkeypatch.setattr(get_settings(), "domain_classifier_mode", "on")
+    user_id = add_owner(sessions)
+    job_id = qs.old_job(sessions, user_id, title="Payments Infrastructure Engineer")
+    qs.drive(sessions)
+    assert qs.facts(sessions, job_id)["domain_match"] == "PENDING"
+    _no_work(sessions, job_id)  # waiting: no recovery, parse or ranking, and the graph itself called no model
+    assert model.calls == [] and parses.parses == []
+    assert qs.qualification_tasks(sessions, job_id)[-1].status == "PENDING"
+    assert _classify(sessions, monkeypatch, "MATCH") == ["match"]
+    qs.drive(sessions)
+    fact = qs.facts(sessions, job_id)
+    assert fact["domain_match"] == "MATCH" and fact["state"] != "DISCOVERED" and parses.parses
+
+
+def test_the_domain_check_can_hide_a_job_the_graph_waits_on(sessions, model, parses, monkeypatch):
+    from app.settings import get_settings
+
+    monkeypatch.setattr(get_settings(), "domain_classifier_mode", "on")
+    user_id = add_owner(sessions)
+    job_id = qs.old_job(sessions, user_id, title="Payments Operations Lead", description="Run monthly payroll for staff.")
+    qs.drive(sessions)
+    assert _classify(sessions, monkeypatch, "NO_MATCH", "Run monthly payroll") == ["no_match"]
+    qs.drive(sessions)
+    assert qs.facts(sessions, job_id)["domain_match"] == "NOT_MATCHING" and parses.parses == []
+    assert qs.qualification_tasks(sessions, job_id)[-1].status == "COMPLETED"  # the run ended: nothing more waits
+    _no_work(sessions, job_id)
 
 
 def test_a_job_outside_its_searchs_scope_is_hidden_by_the_graph_too(sessions, model, parses):

@@ -3383,6 +3383,27 @@ changing the lists, **Apply to existing jobs** re-checks the jobs not ranked yet
 ranking sweep. `GET /api/jobs/search?domain=not_matching`, `POST /api/jobs/{id}/domain-keep`,
 `POST /api/jobs/bulk-domain-keep`, `GET/PUT /api/settings/domain`, `POST /api/jobs/domain/reapply`.
 
+
+### Hybrid domain classification (`app/services/domain_classifier.py`, off by default)
+
+Word rules alone reject relevant jobs: one learned word (`data`, `machine`, `native`) can hide a role the candidate wants.
+With `DOMAIN_CLASSIFIER_MODE=on`, rules hide only what is unambiguous, and a fast model (the **Domain Classifier** worker, FAST
+tier) reads the rest before anything expensive runs. It answers `MATCH`, `UNCERTAIN` or `NO_MATCH` with a `reason` and
+`matched_skills`. `MATCH` goes on to the detailed match. Code keeps a `NO_MATCH` only when the phrases the model quotes are in
+the posting and nothing of the candidate's is in the job; no model confidence number is used anywhere. A failed check never
+hides a job.
+
+Different names of one role count as the same role ("AI Engineer" and "Artificial Intelligence Engineer", "FDE" and "Forward
+Deployed Engineer", "SDE 3" and "Senior Software Engineer", "SDE 4" and "Staff Software Engineer"), and skills are read from
+your preferences, saved searches and every resume's structured data. A job that stays ambiguous waits in **Discovery → Needs
+review**, where you choose which ones match and remove the rest. Nothing is spent on it until you do.
+
+Each job has one request, queued and bounded (Running workers → Domain check), with retries and a per-account cache. Why each
+job was kept or hidden is on its row in `job_classification_tasks` and on the job's screen. Tokens, cost and latency are in
+Monitoring under the stage `DOMAIN_CLASSIFIER`. `shadow` only records verdicts for comparison with the old filter.
+[`docs/architecture/domain-classification.md`](docs/architecture/domain-classification.md) has the rollout steps and the bar a real
+evaluation must meet before switching on.
+
 ### Learning from your choices (`app/services/feedback_learning.py`)
 
 Dismissing, rejecting or deleting a job records a feedback event (kept after the job is deleted); shortlisting,

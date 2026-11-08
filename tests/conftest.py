@@ -7,6 +7,8 @@ no Apify token and no login.
 import os
 
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite:///./test_suite.db")
+os.environ["DOMAIN_CLASSIFIER_MODE"] = "off"  # a developer's .env must not change what these tests read
+os.environ["DOMAIN_CLASSIFIER_SHADOW_DAILY_LIMIT"] = "0"
 os.environ["LLM_PROVIDER"] = "mock"
 os.environ["SCHEDULER_ENABLED"] = "false"  # tests start schedulers explicitly
 os.environ["TAILOR_WORKER_ENABLED"] = "false"  # tests run tailoring tasks with tailor_tasks.run_pending

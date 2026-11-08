@@ -131,7 +131,7 @@ describe('Running workers', () => {
   it('has a tab per worker with its queue size, kept in the URL', async () => {
     await open();
     const tabs = [...view().querySelectorAll('[data-act="wk-tab"]')].map(b => b.textContent.trim());
-    expect(tabs).toEqual(['JD parsing 3', 'JD recovery', 'Ranking 1', 'Job insights', 'Tailoring', 'Reviewing 1', 'Indexing', 'Resume parsing', '⚙ Settings']);
+    expect(tabs).toEqual(['Domain check', 'JD parsing 3', 'JD recovery', 'Ranking 1', 'Job insights', 'Tailoring', 'Reviewing 1', 'Indexing', 'Resume parsing', '⚙ Settings']);
     ui.A['wk-tab']({ dataset: { id: 'recovery' } });
     expect(location.hash).toBe('#workers/recovery');
     await flush();

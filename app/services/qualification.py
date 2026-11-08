@@ -33,10 +33,12 @@ from sqlalchemy.orm import Session, aliased
 from app.models import (
     ACTIVE_JD_FETCH_STATUSES,
     ACTIVE_JD_PARSE_STATUSES,
+    ACTIVE_JOB_CLASSIFICATION_STATUSES,
     ACTIVE_QUALIFICATION_TASK_STATUSES,
     ACTIVE_RANKING_TASK_STATUSES,
     AgentThread,
     Job,
+    JobClassificationTask,
     JobDescriptionFetchTask,
     JobDescriptionParseTask,
     JobQualificationTask,
@@ -181,9 +183,11 @@ class QualificationClaim:
 
 
 def _busy() -> Any:
-    """The job has recovery, parsing or ranking work in progress: its run waits for it."""
+    """The job has a domain check, recovery, parsing or ranking in progress: its run waits for it."""
     q = JobQualificationTask
     return or_(
+        exists().where(JobClassificationTask.job_id == q.job_id, JobClassificationTask.mode == "ON",
+                       JobClassificationTask.status.in_(ACTIVE_JOB_CLASSIFICATION_STATUSES)),
         exists().where(JobDescriptionFetchTask.job_id == q.job_id,
                        JobDescriptionFetchTask.status.in_(ACTIVE_JD_FETCH_STATUSES)),
         exists().where(JobDescriptionParseTask.job_id == q.job_id,

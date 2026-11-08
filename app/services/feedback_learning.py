@@ -6,6 +6,10 @@
              least 80% of its events negative, and never a term the candidate's own roles, skills or include list use
     learned exclusions → app.services.domain_match hides similar new jobs (reason "Similar to jobs you dismissed")
 
+With DOMAIN_CLASSIFIER_MODE=on, learning counts only what says something about taste (`counted_events`): a mass cleanup
+is not a dislike, and a job the person also shortlisted or applied to is not a negative. Learned title words then only
+send a job to the classifier (domain_match.triage); only "Always exclude" hides on a word.
+
 A learned rule turns itself off when the person later keeps enough jobs with that term (20% positive), and the
 person can disable, delete or promote any rule in Settings. Events are kept after the job is deleted. A posting
 deleted because it no longer exists is never an event: that says nothing about the person's taste.
@@ -14,7 +18,7 @@ from __future__ import annotations
 
 import copy
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import UTC, datetime
 from typing import Any
 
@@ -29,6 +33,9 @@ NEGATIVE_SHARE = 0.8
 DISABLE_POSITIVE_SHARE = 0.2
 MIN_DISTINCT_JOBS = 2
 MAX_NGRAM = 3
+# Deletes per account and day from which they are a cleanup, not a judgement on each job (the history before
+# BULK_DELETED existed has only DELETED rows).
+CLEANUP_DELETES_PER_DAY = 20
 # Words that are never a learned term on their own: seniority, generic job words, glue.
 STOPWORDS = domain_match.GENERIC_ROLE_WORDS | frozenset({
     "full", "time", "part", "contract", "permanent", "temporary", "job", "role", "position", "opening", "urgent",
@@ -65,6 +72,17 @@ def record(db: Session, job: Job, action: str) -> JobFeedbackEvent | None:
         return None
 
 
+def counted_events(events: list[JobFeedbackEvent]) -> list[JobFeedbackEvent]:
+    """The events that say something about the person's taste. Drops deletions from a day of mass cleanup, and the
+    negatives of a job they also shortlisted, kept, approved or applied to."""
+    deletes: Counter = Counter(e.created_at.date() for e in events if e.action == "DELETED" and e.created_at)
+    liked = {e.job_id for e in events if e.job_id and e.action not in NEGATIVE_FEEDBACK and e.action != "BULK_DELETED"}
+    return [e for e in events
+            if not (e.action in NEGATIVE_FEEDBACK and e.job_id in liked)
+            and not (e.action == "DELETED" and e.created_at
+                     and deletes[e.created_at.date()] >= CLEANUP_DELETES_PER_DAY)]
+
+
 def _protected(db: Session, user_id: int) -> tuple[set[str], set[str]]:
     """Terms that may never be learned: the candidate's own role words, skills and include terms."""
     prefs, own = domain_match.preferences(db, user_id), domain_match.derived(db, user_id)
@@ -77,7 +95,13 @@ def learn(db: Session, user_id: int) -> list[dict[str, Any]]:
     """Recompute the account's learned exclusions from its events and save them. Rules the person disabled stay
     disabled. Does not commit. Returns the learned list."""
     minimum = max(1, get_settings().learn_min_dismissals)
-    events = db.scalars(select(JobFeedbackEvent).where(JobFeedbackEvent.user_id == user_id)).all()
+    events = db.scalars(select(JobFeedbackEvent).where(JobFeedbackEvent.user_id == user_id,
+                                                       JobFeedbackEvent.action != "BULK_DELETED")).all()
+    from app.services import domain_classifier
+
+    clean = domain_classifier.mode() == domain_classifier.ON
+    if clean:
+        events = counted_events(list(events))
     stats: dict[tuple[str, str], dict[str, Any]] = defaultdict(lambda: {"neg": set(), "pos": set(), "examples": []})
     for event in events:
         negative = event.action in NEGATIVE_FEEDBACK
@@ -112,6 +136,7 @@ def learn(db: Session, user_id: int) -> list[dict[str, Any]]:
                                  "examples": entry["examples"], "status": status,
                                  "user_disabled": bool(old.get("user_disabled")),
                                  "forgotten": bool(old.get("forgotten")),
+                                 **({"clean": True} if clean else {}),
                                  "first_seen": old.get("first_seen") or utcnow().isoformat(),
                                  "updated_at": utcnow().isoformat()}
     # Keep the shortest phrase: "sdr" makes "sdr intern" redundant.

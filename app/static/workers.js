@@ -10,9 +10,9 @@
    ranking cadence and any provider cooldown. Every number and row comes from /api/workers/* (app.services.workers). */
 'use strict';
 
-const WK_KINDS = [['parsing', 'JD parsing'], ['recovery', 'JD recovery'], ['ranking', 'Ranking'], ['qualification', 'Qualification'], ['insights', 'Job insights'], ['tailoring', 'Tailoring'], ['reviewing', 'Reviewing'], ['application', 'Application'], ['indexing', 'Indexing'], ['resume_parsing', 'Resume parsing']];
+const WK_KINDS = [['classification', 'Domain check'], ['parsing', 'JD parsing'], ['recovery', 'JD recovery'], ['ranking', 'Ranking'], ['qualification', 'Qualification'], ['insights', 'Job insights'], ['tailoring', 'Tailoring'], ['reviewing', 'Reviewing'], ['application', 'Application'], ['indexing', 'Indexing'], ['resume_parsing', 'Resume parsing']];
 // Tabs drawn from the generic task list (/api/workers/{kind}); ranking and tailoring keep their own views.
-const WK_GENERIC = ['parsing', 'recovery', 'qualification', 'insights', 'reviewing', 'application', 'indexing', 'resume_parsing'];
+const WK_GENERIC = ['classification', 'parsing', 'recovery', 'qualification', 'insights', 'reviewing', 'application', 'indexing', 'resume_parsing'];
 // Tabs whose Performance card comes from /api/workers/{kind}/performance (parsing and recovery bring their own metrics).
 const WK_PERF = ['ranking', 'insights', 'tailoring', 'reviewing'];
 // The worker tabs, then the account's worker settings (processing limits and rate-limit backoff).
@@ -295,7 +295,7 @@ function wkLimits(tab) {
 }
 // Rank / run everything that is waiting, now, in bulk (not for tailoring, which has no wait).
 function wkRunQueuedButton(tab, spec) {
-  if (!['parsing', 'recovery', 'ranking', 'qualification', 'insights', 'indexing', 'resume_parsing'].includes(tab)) return '';
+  if (!['classification', 'parsing', 'recovery', 'ranking', 'qualification', 'insights', 'indexing', 'resume_parsing'].includes(tab)) return '';
   const c = spec.counts || {}, n = (c.queued || 0) + (c.retrying || 0), key = 'wkRunQueued' + tab;
   const verb = tab === 'ranking' ? 'Rank' : 'Run';
   return `<span title="${attr(n ? `${verb} the ${n} queued or waiting task${n === 1 ? '' : 's'} now: no retry wait${tab === 'ranking' ? ', no cadence' : ''}. A provider cooldown still applies.` : 'Nothing is queued')}">${btn(label(key, `${verb} ${n || ''} queued now`.replace('  ', ' '), 'Starting…'), 'wk-run-queued', { kind: tab, n }, 'sm', !n || isBusy(key))}</span>`;
@@ -451,6 +451,22 @@ function wkPerformanceInsights(tab, x) {
     <div class="wk-grid">${wkCard('Models used', `Calls per model, from LLM usage${stage ? ` (${stage} stage)` : ''}`, wkRanked(models, 'var(--brand)', 'No model calls in this range.'))}
       ${wkCard('Why tasks failed', categories.length ? categories.map(([k, n]) => `${wkHumanize(k)} ${n}`).join(' · ') : 'Most common errors in the selected range', wkRanked(errors, WK_COLORS.failed, 'No failed tasks in this range.'))}
       ${decisions || outcomes}</div>`;
+}
+function wkClassificationInsights(data) {
+  const x = data.metrics || {}, c = x.classifications || {}, cmp = data.comparison || {};
+  const tiles = `<div class="wk-tiles">
+    ${wkTile('Mode', esc(data.mode || 'off'), data.mode === 'on' ? 'its verdicts move jobs' : data.mode === 'shadow' ? 'recorded only: no job changes' : 'the rules alone decide')}
+    ${wkTile('Jobs', wkNum(x.jobs), `${wkNum((x.routes || {}).HARD)} rule hid · ${wkNum((x.routes || {}).POSITIVE)} rule kept`)}
+    ${wkTile('Sent to the model', wkPct(x.ask_rate), `${wkNum(x.asked)} jobs · ${wkNum(x.cache_hits)} from the cache`)}
+    ${wkTile('Verdicts', `${wkNum(c.MATCH)} · ${wkNum(c.UNCERTAIN)} · ${wkNum(c.NO_MATCH)}`, 'match · uncertain · no match')}
+    ${wkTile('Model calls', wkNum(x.model_calls), x.tokens_per_call == null ? 'no tokens reported' : `${x.tokens_per_call.toLocaleString()} tokens per call`)}
+    ${wkTile('Model latency', monMs(x.latency_p50_ms), `p95 ${monMs(x.latency_p95_ms)}`)}
+    ${wkTile('Cost', x.cost == null ? '—' : monUSD(x.cost), x.cost == null ? 'not reported' : `reported on ${wkNum(x.calls_with_cost)} calls`)}</div>`;
+  const gates = Object.entries(x.gate_codes || {}).map(([code, n]) => `<div class="small">${esc(code)} · ${wkNum(n)}</div>`).join('');
+  const comparison = cmp.compared ? `<div class="small">${wkNum(cmp.compared)} compared · the old filter hid ${wkNum(cmp.old_hides_new_keeps)} this keeps · it kept ${wkNum(cmp.old_keeps_new_hides)} this hides</div>` : '';
+  return `${wkCard('Performance', 'The domain check in the selected range', tiles, wkRangeSeg())}
+    ${gates ? wkCard('Why a verdict changed', 'Code turned the model\'s NO_MATCH into UNCERTAIN, or the check could not run', gates) : ''}
+    ${comparison ? wkCard('Against the old filter', 'Shadow mode: nothing here moved a job', comparison) : ''}`;
 }
 function wkParsingInsights(data) {
   const x = data.metrics, llm = x.llm || {}, job = x.scheduler;
@@ -610,7 +626,7 @@ function wkSettings() {
       <div class="wk-scol server"><div class="wk-scol-head"><span class="wk-scol-icon" aria-hidden="true">↗</span><div><b>Waits after 429s in a row</b><small>Worked out from the values on the left.</small></div></div><div class="wk-pad">${ladder}<p class="settings-help mt12">A provider's own <code>Retry-After</code> wins when it asks for longer. Model calls and Apify calls back off separately; the first normal answer resets it. Kill all and Reset backoff clear a wait that is running now.</p></div></div></div>`
     : '<div class="wk-paused-note">Off: every queued task calls the provider again straight away, even while it is refusing them.</div>'}</section>`;
   const auto = id => !!fv('workers', wkAKey(id, 'auto'), D.wkSettings.account[id].values.auto);
-  const nav = [['parsing', 'JD parsing'], ['recovery', 'JD recovery'], ['ranking', 'Ranking'], ['qualification', 'Qualification'], ['insights', 'Job insights'], ['tailoring', 'Tailoring'], ['application', 'Application'], ['indexing', 'Indexing'], ['resume_parsing', 'Resume parsing'], ['approvals', 'Approvals'], ['backoff', 'Rate limits']]
+  const nav = [['classification', 'Domain check'], ['parsing', 'JD parsing'], ['recovery', 'JD recovery'], ['ranking', 'Ranking'], ['qualification', 'Qualification'], ['insights', 'Job insights'], ['tailoring', 'Tailoring'], ['application', 'Application'], ['indexing', 'Indexing'], ['resume_parsing', 'Resume parsing'], ['approvals', 'Approvals'], ['backoff', 'Rate limits']]
     .filter(([id]) => id === 'backoff' || id === 'approvals' || D.wkSettings.account[id])
     .map(([id, t]) => `<a href="#wk-set-${id}" data-act="wk-set-jump" data-id="${id}"><span class="wk-set-icon sm" aria-hidden="true">${WK_SET_ICONS[id]}</span><span class="grow">${t}</span>${id === 'backoff' ? (backoffOn ? '<i class="wk-state on">On</i>' : '<i class="wk-state">Off</i>') : id === 'approvals' ? (fv(form, 'application_mode', b.application_mode) === 'automatic' ? '<i class="wk-state on">Auto</i>' : '<i class="wk-state">Manual</i>') : auto(id) ? '<i class="wk-state on">Auto</i>' : '<i class="wk-state paused">Paused</i>'}</a>`).join('');
   return `<form id="settings-editor" class="wk-settings" data-form="workers" novalidate><fieldset ${isBusy('settings-workers') ? 'disabled' : ''}>
@@ -618,7 +634,7 @@ function wkSettings() {
         <div class="wk-legend-box mt12"><div><span aria-hidden="true">👤</span> <b>Your account</b> only your tasks</div><div><span aria-hidden="true">${D.wkSettings.server_editable ? '⚙' : '🔒'}</span> <b>Server</b> ${D.wkSettings.server_editable ? 'every account (admin)' : 'set by your admin'}</div><div><span class="wk-dot" aria-hidden="true"></span> <b>Custom</b> differs from the default</div></div>
 </nav>
       <div class="stack" style="min-width:0"><div id="settings-error" class="settings-error" role="alert" ${SETTING_ERRORS.workers ? '' : 'hidden'}>${esc(SETTING_ERRORS.workers || '')}</div>
-        ${wkSettingsCard('parsing', 'JD parsing')}${wkSettingsCard('recovery', 'JD recovery')}${wkSettingsCard('ranking', 'Ranking', ranking)}${wkSettingsCard('qualification', 'Qualification')}${wkSettingsCard('insights', 'Job insights')}${wkSettingsCard('tailoring', 'Tailoring', tailoringExtra)}${wkSettingsCard('application', 'Application')}${wkSettingsCard('indexing', 'Indexing')}${wkSettingsCard('resume_parsing', 'Resume parsing')}${wkApprovalsCard(b)}${backoff}
+        ${wkSettingsCard('classification', 'Domain check')}${wkSettingsCard('parsing', 'JD parsing')}${wkSettingsCard('recovery', 'JD recovery')}${wkSettingsCard('ranking', 'Ranking', ranking)}${wkSettingsCard('qualification', 'Qualification')}${wkSettingsCard('insights', 'Job insights')}${wkSettingsCard('tailoring', 'Tailoring', tailoringExtra)}${wkSettingsCard('application', 'Application')}${wkSettingsCard('indexing', 'Indexing')}${wkSettingsCard('resume_parsing', 'Resume parsing')}${wkApprovalsCard(b)}${backoff}
         <div class="wk-set-footer">${settingsFooter('workers')}</div></div></div></fieldset></form>`;
 }
 
@@ -752,7 +768,7 @@ function renderWorkers() {
   } else {
     filterCounts = data?.status_counts || null;
     // The filters narrow the task list, not the metrics, so they sit right above the list.
-    const insights = { parsing: wkParsingInsights, recovery: wkRecoveryInsights }[w.tab]
+    const insights = { classification: wkClassificationInsights, parsing: wkParsingInsights, recovery: wkRecoveryInsights }[w.tab]
       || (WK_PERF.includes(w.tab) ? () => wkPerformanceInsights(w.tab, (D.wkPerf || {})[w.tab]) : null);
     body = !data ? loading() : `${insights ? insights(data) : ''}${wkHistoryPanel(w.tab)}${wkFilterBar(w.tab, filterCounts)}${wkBulkBar(w.tab)}${wkTable(w.tab, data)}`;
   }

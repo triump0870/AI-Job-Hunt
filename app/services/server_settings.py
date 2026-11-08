@@ -49,6 +49,13 @@ class Editable:
 
 
 EDITABLE: dict[str, Editable] = {e.name: e for e in (
+    Editable("domain_classifier_interval_minutes", "classification", "Run every (minutes)",
+             "How often the domain classifier looks for work. 0 turns it off for every account.", 0, 1440,
+             "domain_classifier"),
+    Editable("domain_classifier_batch_size", "classification", "Tasks per run",
+             "How many jobs one run claims. Each is its own small model call.", 1, 500),
+    Editable("domain_classifier_concurrency", "classification", "Side by side",
+             "How many jobs are read at once.", 1, 32),
     Editable("jd_parse_interval_minutes", "parsing", "Run every (minutes)",
              "How often the JD parsing job looks for work. 0 turns it off for every account.", 0, 1440, "jd_parsing"),
     Editable("jd_parse_batch_size", "parsing", "Tasks per run", "How many parse tasks one run claims.", 1, 200),
