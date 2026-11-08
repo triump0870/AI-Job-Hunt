@@ -519,6 +519,76 @@ def _visible_provider(host: str) -> str:
     return f"WEB:{host}"  # a cooldown of its own: other sites and external calls are not held up
 
 
+_visible_gate: tuple[asyncio.AbstractEventLoop, asyncio.Lock] | None = None
+_visible_last: float | None = None
+
+
+def _gate() -> asyncio.Lock:
+    """One visit to a listed host at a time, runner and window together. A lock belongs to its event loop."""
+    global _visible_gate
+    loop = asyncio.get_running_loop()
+    if _visible_gate is None or _visible_gate[0] is not loop:
+        _visible_gate = (loop, asyncio.Lock())
+    return _visible_gate[1]
+
+
+async def _visible_turn() -> None:
+    """Wait out PLAYWRIGHT_VISIBLE_MIN_INTERVAL_SECONDS since the last visit, whichever browser made it."""
+    if _visible_last is not None:
+        remaining = get_settings().playwright_visible_min_interval_seconds - (time.monotonic() - _visible_last)
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+
+
+def _runner_failed(result: PageResult) -> bool:
+    """The runner did not get to read the page, or found nothing on it. A page that answered is never asked again in
+    another browser: a refusal, a challenge or a login wall stays what it is, and a removed posting is removed."""
+    return result.kind in ("unavailable", "empty") or (result.kind == "transient" and result.code != "RATE_LIMITED")
+
+
+async def _runner_stage(snapshot: Snapshot, start_url: str) -> PageResult:
+    from app.infrastructure.application_browser import browser_use_sidecar as sidecar
+
+    try:
+        with tracing.trace(job_id=snapshot.job_id, user_id=snapshot.user_id):
+            page = await sidecar.read_page(start_url, user_id=snapshot.user_id, job_id=snapshot.job_id,
+                                           allow_private=get_settings().jd_fetch_allow_private_hosts)
+    except sidecar.SidecarUnavailable as exc:
+        return PageResult("unavailable", "RUNNER_UNAVAILABLE", detail=str(exc)[:300])
+    except sidecar.SidecarRefused as exc:
+        return PageResult("transient", "BROWSER_ERROR", detail=f"runner: {exc.code}")
+    return await asyncio.to_thread(
+        _read_page, snapshot, page.html, status=page.status, final_url=page.final_url, title_hint=page.title,
+        method=PLAYWRIGHT, redirects=0, extractor=jd_extractors.extractor_for(page.final_url))
+
+
+async def _visible_read(snapshot: Snapshot, browser: Any, start_url: str) -> tuple[PageResult, dict[str, Any]]:
+    """A listed host: the browser-use runner first, the visible window when the runner failed. One at a time and spaced
+    apart, so a fallback is not a second visit straight after the first. Returns the result and what each one did."""
+    from app.infrastructure.application_browser import browser_use_sidecar as sidecar
+
+    global _visible_last
+    notes: dict[str, Any] = {"visible": True, "backend": "visible_window"}
+    window = browser is not None and browser.is_available()
+    async with _gate():
+        if sidecar.configured():
+            await _visible_turn()
+            try:
+                result = await _runner_stage(snapshot, start_url)
+            finally:
+                _visible_last = time.monotonic()
+            notes.update(backend="browser_use_runner", runner=_stage_note(result))
+            if not _runner_failed(result) or not window:
+                return result, notes
+        await _visible_turn()
+        try:
+            rendered = await _browser_stage(snapshot, browser, start_url, visible=True)
+        finally:
+            _visible_last = time.monotonic()
+        notes["backend"] = "visible_window"
+        return rendered, notes
+
+
 async def _browser_stage(snapshot: Snapshot, browser: Any, start_url: str, *, visible: bool = False) -> PageResult:
     from app.infrastructure.browser.service import (
         BLOCKED_URL,
@@ -668,18 +738,20 @@ async def recover(sessions: Callable[[], Session], snapshot: Snapshot, *, browse
         outcome.diagnostics["playwright"] = {"attempted": False, "kind": "skipped",
                                              "reason": "The browser fallback is turned off for your account"}
     elif best is None and try_browser:
-        if browser is None or not browser.is_available():
+        from app.infrastructure.application_browser import browser_use_sidecar as sidecar
+
+        if (browser is None or not browser.is_available()) and not (visible_host and sidecar.configured()):
             outcome.diagnostics["playwright"] = {"attempted": False, "kind": "unavailable",
                                                  "code": "PLAYWRIGHT_UNAVAILABLE",
                                                  "detail": (browser.diagnostics().get("reason")
                                                             if browser is not None else "no browser service")}
         else:
             outcome.playwright_used = True
-            rendered = await _browser_stage(snapshot, browser, http.final_url or snapshot.url,
-                                            visible=visible_host is not None)
-            outcome.diagnostics["playwright"] = {"attempted": True, **_stage_note(rendered)}
+            start_url = http.final_url or snapshot.url
+            rendered, notes = (await _visible_read(snapshot, browser, start_url) if visible_host
+                               else (await _browser_stage(snapshot, browser, start_url), {}))
+            outcome.diagnostics["playwright"] = {"attempted": True, **_stage_note(rendered), **notes}
             if visible_host:
-                outcome.diagnostics["playwright"]["visible"] = True
                 if rendered.code in VISIBLE_REFUSALS:
                     await asyncio.to_thread(backoff.record_limit, snapshot.user_id, _visible_provider(visible_host),
                                             policy=VISIBLE_REST)

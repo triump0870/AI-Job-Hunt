@@ -473,7 +473,28 @@ SHELL = "<html><body><div id='root'></div></body></html>"  # what such a site an
 
 @pytest.fixture
 def visible_host(monkeypatch):
-    monkeypatch.setattr(get_settings(), "playwright_visible_hosts", " Example.org, 127.0.0.1 ")
+    settings = get_settings()
+    monkeypatch.setattr(settings, "playwright_visible_hosts", " Example.org, 127.0.0.1 ")
+    monkeypatch.setattr(settings, "playwright_visible_min_interval_seconds", 0)
+    monkeypatch.setattr(settings, "browser_use_webui_enabled", False)  # the runner has tests of its own, below
+
+
+class FakeRunner:
+    """Stands in for browser_use_sidecar.read_page: returns a page, or raises what the real one raises."""
+
+    def __init__(self, monkeypatch, *, page_=None, error=None):
+        from app.infrastructure.application_browser import browser_use_sidecar as bus
+
+        self.page, self.error, self.calls, self.bus = page_, error, [], bus
+        monkeypatch.setattr(bus, "configured", lambda: True)
+        monkeypatch.setattr(bus, "read_page", self.read_page)
+
+    async def read_page(self, url, *, user_id, job_id, allow_private=False, headless=False):
+        self.calls.append(url)
+        if self.error is not None:
+            raise self.error
+        status, html = self.page
+        return self.bus.RunnerPage(url=url, final_url=url, status=status, title="", html=html)
 
 
 def shell_job(owner: int, server: PostingServer, key: str = "shell") -> int:
@@ -552,6 +573,80 @@ def test_a_person_asking_to_run_now_goes_ahead_during_the_pause(owner, server, v
         db.commit()
     assert run_recovery(browser) == ["recovered"]
     assert browser.visible_calls == [True] and cooldown(owner) is None
+
+
+def test_the_runner_reads_a_listed_site_first_and_no_window_opens(owner, server, visible_host, monkeypatch):
+    runner = FakeRunner(monkeypatch, page_=(200, page("posting")))
+    browser = FakeBrowser({"shell": (200, page("posting"))})
+    job_id = shell_job(owner, server)
+    assert run_recovery(browser) == ["recovered"]
+    task = task_of(job_id)
+    assert runner.calls == [server.url("custom/shell")] and browser.calls == []
+    assert task.fetch_method == "PLAYWRIGHT"
+    notes = task.diagnostics["attempt_1"]["playwright"]
+    assert notes["backend"] == "browser_use_runner" and notes["runner"]["kind"] == "found"
+
+
+def test_the_runner_needs_no_browser_service(owner, server, visible_host, monkeypatch):
+    FakeRunner(monkeypatch, page_=(200, page("posting")))
+    shell_job(owner, server)
+    assert run_recovery(None) == ["recovered"]
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "refused", "empty"])
+def test_when_the_runner_fails_the_visible_window_reads_the_page(owner, server, visible_host, monkeypatch, failure):
+    from app.infrastructure.application_browser import browser_use_sidecar as bus
+
+    runner = FakeRunner(monkeypatch, page_=(200, SHELL), error={
+        "unavailable": bus.SidecarUnavailable("not installed"), "refused": bus.SidecarRefused("BROWSER_ERROR", "no"),
+        "empty": None}[failure])
+    browser = FakeBrowser({"shell": (200, page("posting"))})
+    job_id = shell_job(owner, server)
+    assert run_recovery(browser) == ["recovered"]
+    notes = task_of(job_id).diagnostics["attempt_1"]["playwright"]
+    assert len(runner.calls) == 1 and browser.visible_calls == [True]
+    assert notes["backend"] == "visible_window" and notes["runner"]["kind"] != "found" and notes["kind"] == "found"
+
+
+def test_the_fallback_waits_its_turn_after_the_runner(owner, server, visible_host, monkeypatch):
+    import time
+
+    monkeypatch.setattr(get_settings(), "playwright_visible_min_interval_seconds", 0.3)
+    monkeypatch.setattr(jd_recovery, "_visible_last", None)
+    FakeRunner(monkeypatch, page_=(200, SHELL))
+    shell_job(owner, server)
+    clock = time.monotonic()
+    assert run_recovery(FakeBrowser({"shell": (200, page("posting"))})) == ["recovered"]
+    assert time.monotonic() - clock >= 0.3
+
+
+@pytest.mark.parametrize("rendered,code", [
+    ((403, "<title>Access Denied</title><h1>Access denied</h1>"), "ACCESS_DENIED"),
+    ((200, page("captcha")), "CAPTCHA_OR_ANTI_BOT")])
+def test_a_refusal_to_the_runner_never_moves_on_to_the_window(owner, server, visible_host, monkeypatch, rendered, code):
+    FakeRunner(monkeypatch, page_=rendered)
+    browser = FakeBrowser({"shell": (200, page("posting"))})  # a window *could* get through: it must not be tried
+    job_id = shell_job(owner, server)
+    assert run_recovery(browser) == ["blocked"]
+    task = task_of(job_id)
+    assert (task.status, task.result_code) == ("BLOCKED", code) and browser.calls == []
+    assert cooldown(owner) is not None
+
+
+def test_a_rate_limit_to_the_runner_never_moves_on_to_the_window(owner, server, visible_host, monkeypatch):
+    FakeRunner(monkeypatch, page_=(429, "<h1>Too many requests</h1>"))
+    browser = FakeBrowser({"shell": (200, page("posting"))})
+    shell_job(owner, server)
+    assert run_recovery(browser) == ["retrying"]
+    assert browser.calls == [] and cooldown(owner) is not None
+
+
+def test_a_site_not_listed_never_reaches_the_runner(owner, server, monkeypatch):
+    runner = FakeRunner(monkeypatch, page_=(200, page("posting")))
+    browser = FakeBrowser({"shell": (200, page("posting"))})
+    shell_job(owner, server)
+    assert run_recovery(browser) == ["recovered"]
+    assert runner.calls == [] and browser.visible_calls == [False]
 
 
 def test_the_daily_listing_check_never_opens_a_window(owner, server, visible_host):

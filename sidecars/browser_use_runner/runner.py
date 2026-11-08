@@ -57,6 +57,9 @@ PROTOCOL = 1
 MAX_ELEMENTS = 200
 MAX_TEXT = 6000
 MAX_HTML = 400_000
+MAX_PAGE_HTML = 3_000_000  # page_html: a whole posting page, as JD recovery reads it (its own limit is the same)
+SETTLE_MAX_SECONDS, SETTLE_POLL_SECONDS = 8.0, 0.5
+BODY_LENGTH_JS = "() => (document.body && document.body.innerText || '').length"
 SUBMIT_WORDS = ("submit", "apply", "send", "finish", "complete", "confirm")
 
 # Read-only page scripts (constants; nothing a caller sends is ever evaluated).
@@ -467,6 +470,22 @@ class Runner:
 
     # ───────────── reading ─────────────
 
+    async def page_html(self, args: dict[str, Any]) -> dict[str, Any]:
+        """The rendered page as it is, once its text stops growing (bounded), for JD recovery. Touches no element."""
+        page = await self._page()
+        previous, waited = -1, 0.0
+        while waited < SETTLE_MAX_SECONDS:
+            try:
+                length = await page.evaluate(BODY_LENGTH_JS)
+            except Exception:  # noqa: BLE001  navigating again (a client-side redirect): let it land
+                length = -2
+            if length == previous and length > 0:
+                break
+            previous = length
+            await asyncio.sleep(SETTLE_POLL_SECONDS)
+            waited += SETTLE_POLL_SECONDS
+        return {"url": page.url, "title": await page.title(), "html": (await page.content())[:MAX_PAGE_HTML]}
+
     async def _elements(self, page: Any) -> dict[int, Any]:
         """The page's interactive elements (browser-use's DOM indexing), read without `BrowserContext.get_state`: that
         also takes a screenshot, which first waits for the page's `load` event with Playwright's 30 s default. A
@@ -846,7 +865,7 @@ class Runner:
         return {"closed": True}
 
 
-COMMANDS = ("health", "open", "goto", "observe", "read", "fill", "select", "check", "upload", "click", "choose",
+COMMANDS = ("health", "open", "goto", "page_html", "observe", "read", "fill", "select", "check", "upload", "click", "choose",
             "point", "unpoint", "scroll",
             "login_fill", "login_submit", "submit", "evidence", "challenge", "set_takeover", "storage_state", "close")
 

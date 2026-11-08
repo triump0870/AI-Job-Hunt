@@ -3275,9 +3275,18 @@ PLAYWRIGHT_VISIBLE_HOSTS=naukri.com
 PLAYWRIGHT_VISIBLE_MIN_INTERVAL_SECONDS=10
 ```
 
-A plain Chromium window, with no sign-in or profile of yours, opens for each posting and closes when it has been read.
-Windows open one at a time and may take focus while the queue runs. Other sites and the daily listing check stay
-headless. Jobs already `BLOCKED` are not retried by themselves: use Retry in Running workers.
+Recovery tries two browsers for these hosts, after HTTP:
+
+1. **The browser-use runner**, when it is configured (`BROWSER_USE_WEBUI_ENABLED`, `BROWSER_USE_PYTHON`). A runner of its
+   own per posting: it only loads and reads the page, sends nothing but GET and stays on the posting's host. It shares
+   nothing with an application run. The Web UI does not need to be running, and no model is involved.
+2. **The shared browser's visible window**, when the runner could not run or found no description.
+
+A page that answered is not asked again in the second browser: a refusal, a challenge, a login wall or a removed posting
+is the result. Either way a plain Chromium window, with no sign-in or profile of yours, opens for each posting and closes
+when it has been read. Visits go one at a time and may take focus while the queue runs. Other sites and the daily listing
+check stay headless. Jobs already `BLOCKED` are not retried by themselves: use Retry in Running workers. A task's
+diagnostics say which browser read it (`backend`).
 
 It is off by default because it is your decision: it reads a site that refuses automated browsers, from your own
 address, so check the site's terms first. If the site refuses a visit or shows a challenge, that job stays `BLOCKED` and
