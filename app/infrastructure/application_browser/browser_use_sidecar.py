@@ -359,8 +359,8 @@ async def read_page(url: str, *, user_id: int, job_id: int | None, allow_private
             loaded = await session.call("goto", url=url)
             page = await session.call("page_html")
             final_url = str(page.get("url") or loaded.get("final_url") or url)
-            # The runner's guard does not see an HTTP redirect (Playwright does not route one), so a page that ended on
-            # another host is caught here: its content is not used. The redirect's own request has already been made.
+            # The runner's guards stop a redirect to another host before it is sent. This is the last check on the page
+            # itself: if one ended on another host anyway (a script navigating, say), its content is not used.
             if (urlparse(final_url).hostname or "").lower().strip(".") != host:
                 raise SidecarRefused("URL_NOT_ALLOWED", "The page redirected to another host")
             return RunnerPage(url=url, final_url=final_url, status=loaded.get("status"),
