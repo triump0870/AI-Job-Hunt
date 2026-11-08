@@ -9,7 +9,7 @@ This file gives coding agents and human contributors the repository-wide rules f
 - Allow **consent-based guarded automation** for supported application routes; minimize intervention for routine tasks, but pause for unknown facts, sensitive answers, legal attestations, login challenges, and ambiguous submission outcomes.
 - Let models **interpret, classify, retrieve, draft, and propose actions**. Deterministic Python validates permissions, evidence, policy, transitions, and side effects.
 - Prefer existing abstractions and incremental migrations over parallel pipelines, duplicate state machines, or broad rewrites.
-- Never use automation to circumvent CAPTCHA, access restrictions, anti-bot challenges, website restrictions, or authorization requirements.
+- Ordinary visible or headful browser rendering, navigation, and reading are permitted when the site allows access; a visible window alone is not circumvention. Respect authentication, website terms and restrictions, access denials, CAPTCHA and anti-bot challenges, and rate limits. Never evade or bypass these protections; hand control to a person or stop when blocked.
 
 ## 2. Where changes belong
 
@@ -126,9 +126,12 @@ The semantic classifier must **not** invent candidate preferences. Read the acco
 
 ## 9. Browser, recovery and human takeover
 
-- JD recovery uses shared `BrowserService`; application execution uses its dedicated application-browser infrastructure. Do not mix cookies, storage, credentials, or page contexts between them.
-- HTTP recovery precedes browser rendering. Validate redirects and host/IP targets with `url_safety`; never use browser fallback to defeat an explicit challenge, login wall or 429.
-- Browser-use runner stays isolated. No generic model agent with direct browser privileges, no stealth plugins, fingerprint spoofing, CAPTCHA solvers, arbitrary script evaluation or password exfiltration.
+- Prefer the existing tested visible-browser path when it can lawfully read the posting. Do not replace working browser infrastructure merely to route the same rendering through another runner or Web UI. A browser-use Web UI is optional; do not require `BROWSER_USE_WEBUI_URL`, `BROWSER_USE_WEBUI_PATH`, or a separate running UI for normal recovery.
+- JD recovery normally uses shared `BrowserService`; application execution normally uses its dedicated application-browser infrastructure. An explicitly approved, scoped browser-use runner may be used for recovery or navigation, but isolate each purpose's contexts, cookies, storage, credentials and session ownership. Never reuse application authentication for discovery or JD recovery without explicit authorization.
+- HTTP recovery precedes browser rendering when suitable. Validate redirects, hosts and IP targets with `url_safety`. Visible rendering is not itself a bypass; do not fall back to a browser to defeat an explicit access denial, challenge, login wall or 429.
+- A sandboxed, LLM-powered browser agent is allowed to interpret pages and propose bounded navigation and permitted form interactions through an audited action interface. The model must not receive unrestricted browser, filesystem, network, credential or script-evaluation privileges. The deterministic controller validates allowed hosts, actions, account ownership, form evidence and permission before execution.
+- Keep submit authority separate from browsing: no generic browser agent may click final Submit. Application submission must use the existing consented `GUARDED_AUTO` signed-submit path, packet verification, submission claims and confirmation evidence. Read-only recovery and navigation runners cannot submit.
+- No stealth plugins, fingerprint spoofing, CAPTCHA solvers, challenge evasion, arbitrary script evaluation, credential exfiltration or attempts to evade rate limits or site restrictions. Pause for human action or stop when such protection is encountered.
 - Human takeover should clearly state the blocker and let the person resume in-place when possible. Re-observe and revalidate fields before any resumed submit. Never replay a stale action sequence.
 - An unknown required answer pauses as NEEDS_INPUT; optional fields may remain empty. A personally completed field may count as `PERSON` only after the documented human review/continue behavior.
 - For site-specific unsupported controls, implement a small adapter and fixture rather than adding broad, unrestricted click/evaluate privileges.
