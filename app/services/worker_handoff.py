@@ -38,7 +38,7 @@ from app.models import (
     ResumeVariant,
     TailorTask,
 )
-from app.services import auto_tailor, job_description, ranker
+from app.services import auto_tailor, domain_match, job_description, ranker
 from app.services.lifecycle import STOPPED_BY_USER
 from app.services.lifecycle import WorkflowState as S
 from app.services.user_settings import settings_for
@@ -72,7 +72,7 @@ def _recovered_unparsed(db: Session, user_id: int) -> list[int]:
     stopped = exists().where(JobDescriptionParseTask.job_id == Job.id, JobDescriptionParseTask.last_error == STOPPED_BY_USER)
     jobs = db.scalars(select(Job).where(_owned(user_id), Job.id.in_(recovered), Job.description.is_not(None),
                                         Job.description != "", ~stopped,
-                                        Job.domain_match.is_distinct_from("NOT_MATCHING"))
+                                        domain_match.not_held())
                       .order_by(Job.id).limit(LIMIT * 3)).all()
     active = set(db.scalars(select(JobDescriptionParseTask.job_id).where(
         JobDescriptionParseTask.user_id == user_id, JobDescriptionParseTask.status.in_(ACTIVE_JD_PARSE_STATUSES))).all())
@@ -104,7 +104,7 @@ def _parsed_unranked(db: Session, user_id: int) -> list[int]:
     waiting_states = (*ranker.PRE_RANK_STATES, S.RANK_PENDING)
     jobs = db.scalars(select(Job).where(_owned(user_id), Job.id.in_(finished), Job.state.in_(waiting_states),
                                         Job.fit_score.is_(None), ~stopped,
-                                        Job.domain_match.is_distinct_from("NOT_MATCHING"))
+                                        domain_match.not_held())
                       .order_by(Job.id).limit(LIMIT * 3)).all()
     now = ranker.utcnow()
     parked = set(db.scalars(select(JobRankingTask.job_id).where(

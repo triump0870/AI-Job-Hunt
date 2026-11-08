@@ -40,6 +40,7 @@ from app.models import (
     ApplicationExecutionTask,
     AppSetting,
     Job,
+    JobClassificationTask,
     JobDescriptionFetchTask,
     JobDescriptionParseTask,
     JobInsightTask,
@@ -244,6 +245,11 @@ KINDS: dict[str, WorkerKind] = {k.kind: k for k in (
     WorkerKind("parsing", "JD parsing", "Parses each posting into structured requirements (JD parser model).",
                JobDescriptionParseTask, "jd_parsing", "PENDING", "PROCESSING", ("COMPLETED", "FAILED", "SKIPPED"),
                lambda: get_settings().jd_parse_max_attempts, "jd_parser", stopped_status="FAILED"),
+    WorkerKind("classification", "Domain check", "Reads each job the rules could not settle with a fast model, before "
+               "anything expensive is spent on it. A job is hidden only when code confirms the model's evidence; a "
+               "failed check never hides one.", JobClassificationTask, "domain_classifier", "PENDING", "PROCESSING",
+               ("COMPLETED", "FAILED", "SKIPPED"), lambda: get_settings().domain_classifier_max_attempts,
+               "domain_classifier"),
     WorkerKind("recovery", "JD recovery", "Reads a description from the posting URL when the board sent none: HTTP, "
                "then the browser, a model only on ambiguous pages.", JobDescriptionFetchTask, "jd_recovery",
                "PENDING", "PROCESSING", ("COMPLETED", "FAILED", "BLOCKED", "SKIPPED"),
@@ -1055,6 +1061,11 @@ def _requeue_finished(db: Session, spec: WorkerKind, task: Any, user_id: int) ->
 
         if job_description.queue_parse(db, job, reason="user_request") is None:
             raise WorkerError("This job has no description to parse")
+        db.commit()
+    elif spec.kind == "classification":
+        from app.services import domain_classifier
+
+        domain_classifier.requeue(db, job, previous=task)
         db.commit()
     elif spec.kind == "recovery":
         from app.services import jd_recovery

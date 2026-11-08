@@ -301,6 +301,24 @@ class Settings(BaseSettings):
     domain_filter_enabled: bool = True
     # A title term or company learned from the person's dismissals needs this many dismissed jobs behind it.
     learn_min_dismissals: int = 3
+    # Hybrid domain classification (app.services.domain_classifier). DOMAIN_CLASSIFIER_MODE: off (default; the
+    # deterministic filter alone, exactly as before), shadow (the old filter still decides; verdicts are only recorded
+    # for comparison, and model calls need a daily limit above 0) or on (only unambiguous rules hide a job without the
+    # model; see scripts/domain_classifier_eval.py before turning this on).
+    domain_classifier_mode: str = "off"
+    domain_classifier_interval_minutes: int = 2
+    domain_classifier_batch_size: int = 40
+    domain_classifier_concurrency: int = 4
+    domain_classifier_lease_seconds: int = 300
+    domain_classifier_max_attempts: int = 3
+    domain_classifier_retry_seconds: int = 60
+    domain_classifier_cache_days: int = 30
+    domain_classifier_shadow_daily_limit: int = 0
+    # Model calls per account and day in mode on (0 = no limit). Jobs over it wait as PENDING, unhidden and unranked,
+    # and are queued as the day's count falls; a provider outage or a big import can no longer become a ranking surge.
+    domain_classifier_daily_limit: int = 2000
+    # A job waiting for the person's review longer than this goes on like any other UNCERTAIN job (0 = never).
+    domain_classifier_review_days: int = 7
     # Shared headless browser (app.infrastructure.browser). Optional: HTTP recovery works without it.
     playwright_enabled: bool = True
     playwright_browser: str = "chromium"

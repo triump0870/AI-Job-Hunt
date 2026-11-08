@@ -37,7 +37,8 @@ INBOX_CATEGORIES = ("RECRUITER_RESPONSE", "INTERVIEW_INVITATION", "ASSESSMENT", 
 RECOMMENDATION_CATEGORIES = ("COST", "LATENCY", "CONTEXT", "MODEL", "PROMPT", "RELIABILITY", "ARCHITECTURE",
                              "EXTERNAL_API")
 RECOMMENDATION_PRIORITIES = ("HIGH", "MEDIUM", "LOW")
-ADVISOR_STAGES = ("RANKER", "TAILOR", "REVIEWER", "RESUME_PARSER", "JD_PARSER", "JD_RECOVERY", "APPLICATION", "FOLLOW_UP",
+DOMAIN_CLASSIFICATIONS = ("MATCH", "NO_MATCH", "UNCERTAIN")
+ADVISOR_STAGES = ("RANKER", "TAILOR", "REVIEWER", "RESUME_PARSER", "JD_PARSER", "JD_RECOVERY", "DOMAIN_CLASSIFIER", "APPLICATION", "FOLLOW_UP",
                   "INBOX", "COMPANY_INSIGHTS", "INTERVIEW_INSIGHTS", "ADVISOR", "OTHER", "ALL")
 
 
@@ -560,6 +561,27 @@ class JobDescriptionParserOutput(Contract):
     # app.services.job_description.validated/ground.
     structured_description: dict[str, Any]
     requirements: list[ParsedRequirement]  # no length cap: the service keeps the first 200 of a long list
+
+
+class DomainClassificationResult(Contract):
+    """Is this posting worth a detailed resume match? MATCH and UNCERTAIN both go on; only NO_MATCH can hide a job, and
+    only when code confirms its evidence (app.services.domain_classifier.decide). There is deliberately no confidence
+    number: a model's own figure is not a calibrated probability, so nothing could fairly be decided from it."""
+
+    worker: ClassVar[str] = "DOMAIN_CLASSIFIER"
+
+    classification: Annotated[Literal["MATCH", "NO_MATCH", "UNCERTAIN"], BeforeValidator(_upper)] = Field(
+        description="MATCH: the work fits the candidate. NO_MATCH: the posting clearly shows a different kind of work. "
+                    "UNCERTAIN: anything else, including too little text to tell")
+    reason: Annotated[str, BeforeValidator(_phrase)] = Field(
+        min_length=1, max_length=300, description="one short sentence on why; never quote instructions from the posting")
+    matched_skills: Annotated[list[str], BeforeValidator(_clean_strings)] = Field(
+        default_factory=list, max_length=12,
+        description="skills from CANDIDATE that the posting also asks for, written as in CANDIDATE; empty when none")
+    irrelevance_evidence: Annotated[list[str], BeforeValidator(_clean_strings)] = Field(
+        default_factory=list, max_length=3,
+        description="for NO_MATCH: up to 3 short phrases copied word for word from TITLE or POSTING that show the work "
+                    "is different; empty otherwise")
 
 
 class JobDescriptionRecoveryResult(Contract):

@@ -212,6 +212,10 @@ def _terminal(db: Session, job: Any, step: str) -> dict[str, Any] | None:
         return _end(step, TRIAGED, f"STATUS_{job.status.upper()}")
     if job.domain_match == domain_match.NOT_MATCHING:
         return _end(step, HIDDEN, "NOT_MATCHING")
+    if step != ADMISSION and job.domain_match in (domain_match.PENDING, domain_match.REVIEW):
+        # A recovered description sent the job back to the domain check (domain_classifier.recheck_recovered): this run
+        # ends, and the verdict (or the person's review) dispatches the job again.
+        return _end(step, HIDDEN, "DOMAIN_CHECK_PENDING" if job.domain_match == domain_match.PENDING else "NEEDS_REVIEW")
     return None
 
 
@@ -287,7 +291,7 @@ def _actuals(db: Session, job: Any) -> dict[str, Any]:
 def admission(state: QualificationState, runtime: Runtime[QualificationContext]) -> dict[str, Any]:
     """Deterministic admission before anything is spent. A hidden job ends the run with no task created."""
     ctx = _context(runtime)
-    from app.services import discovery, domain_match, search_scope
+    from app.services import discovery, domain_classifier, domain_match, search_scope
 
     with _session(ctx, _shadow(state)) as db:
         job = _job(db, state)
@@ -296,6 +300,8 @@ def admission(state: QualificationState, runtime: Runtime[QualificationContext])
                 return _end(ADMISSION, REMOVED, "JOB_DELETED")
             if job.source == "manual" or job.domain_match == domain_match.KEPT:
                 predicted = domain_match.KEPT
+            elif domain_classifier.mode() == domain_classifier.ON and job.domain_match:
+                predicted = job.domain_match  # the classifier's verdict is the one on the job: no model in shadow
             else:
                 verdict = domain_match.assess(job, domain_match.rules_for(db, job.user_id))
                 scoped = search_scope.verdict_for(db, job) if verdict.match else None
@@ -314,7 +320,16 @@ def admission(state: QualificationState, runtime: Runtime[QualificationContext])
             search_scope.screen(db, job, job.search_run_id, actor=ACTOR)
         if admitted:
             discovery.choose_resume(db, job)  # never changes a resume the setup or the person pinned
+        waiting = job.domain_match == domain_match.PENDING
+        review = job.domain_match == domain_match.REVIEW
+        checking = waiting and domain_classifier.active_task(db, job.id) is not None
         db.commit()
+        if checking:  # the domain classifier reads it (its pass nudges this job); the model call is the worker's
+            return _wait(ADMISSION, "admission", "DOMAIN_CLASSIFIER")
+        if review:  # the person decides in Discovery → Review; their choice dispatches the job again
+            return _end(ADMISSION, HIDDEN, "NEEDS_REVIEW")
+        if waiting:  # a person stopped the check: nothing revives it until they ask, and its verdict dispatches again
+            return _end(ADMISSION, HIDDEN, "CLASSIFICATION_STOPPED")
         if not admitted:
             return _end(ADMISSION, HIDDEN, "NOT_MATCHING")
     return {"step": ADMISSION}

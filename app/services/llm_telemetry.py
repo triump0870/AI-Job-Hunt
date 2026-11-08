@@ -40,6 +40,7 @@ STAGE_BY_PROMPT = {
     "evidence_extraction": "RESUME_PARSER", "application_question": "APPLICATION", "application_form": "APPLICATION", "followup": "FOLLOW_UP",
     "inbox": "INBOX", "company_insights": "COMPANY_INSIGHTS", "interview_insights": "INTERVIEW_INSIGHTS", "job_description_parser": "JD_PARSER", "job_description_recovery": "JD_RECOVERY", "ai_optimization": "ADVISOR",
     "application_inbox": "INBOX", "application_email_match": "INBOX", "browser_navigation": "BROWSER_NAVIGATION",
+    "domain_classifier": "DOMAIN_CLASSIFIER",
 }
 VALIDATION_FAILURE_REASONS = ("INVALID_JSON", "WRONG_OUTPUT_SCHEMA", "POSSIBLE_CROSS_WORKER_OUTPUT",
                               "SEMANTIC_VALIDATION")

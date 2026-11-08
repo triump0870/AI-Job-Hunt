@@ -197,7 +197,7 @@ function readHash() {
   if (screen === 'workers' && WK_TABS.some(([id]) => id === sub)) wkState().tab = sub;
   if (screen === 'settings') S.settingsSection = settingsSection(sub);
   if (screen === 'knowledge') S.knowledgeSection = knowledgeSection(sub);
-  if (screen === 'discovery' && ['triage', 'table', 'setup'].includes(sub)) S.discMode = sub;
+  if (screen === 'discovery' && ['triage', 'table', 'review', 'setup'].includes(sub)) S.discMode = sub;
   if (screen === 'today' && ['focus', 'run'].includes(sub)) S.todayVariant = sub;
 }
 function go(screen, extra = {}) {
@@ -222,6 +222,8 @@ const LOADERS = {
   async overview() { [D.overview, D.gateway] = await Promise.all([api('/api/workspace/overview'), api('/api/settings/ai/gateway').catch(() => null)]); },
   async today() { D.today = await api('/api/workspace/today'); },
   async discovery() {
+    D.review = await api('/api/discovery/review').catch(() => null);
+    if (S.discMode === 'review') return;
     if (S.discMode === 'triage') await loadQueue();
     else if (S.discMode === 'table') await loadTable();
     else await loadSetup();
@@ -429,7 +431,7 @@ function renderTop() {
   let seg = '';
   if (S.screen === 'today') seg = [['focus', 'Command centre'], ['run', 'Run sheet']].map(([id, t]) => `<button class="${S.todayVariant === id ? 'on' : ''}" data-act="variant" data-kind="today" data-id="${id}">${t}</button>`).join('');
   if (S.screen === 'tailor') seg = [['single', 'One job'], ['bulk', 'Bulk tailor']].map(([id, t]) => `<button class="${S.tailorMode === id ? 'on' : ''}" data-act="variant" data-kind="tailor" data-id="${id}">${t}</button>`).join('');
-  if (S.screen === 'discovery') seg = [['triage', 'Triage queue'], ['table', 'Table + detail'], ['setup', 'Search setup']].map(([id, t]) => `<button class="${S.discMode === id ? 'on' : ''}" data-act="variant" data-kind="discovery" data-id="${id}">${t}</button>`).join('');
+  if (S.screen === 'discovery') seg = [['triage', 'Triage queue'], ['table', 'Table + detail'], ...(D.review?.total || S.discMode === 'review' ? [['review', `Needs review${D.review?.total ? ` ${D.review.total}` : ''}`]] : []), ['setup', 'Search setup']].map(([id, t]) => `<button class="${S.discMode === id ? 'on' : ''}" data-act="variant" data-kind="discovery" data-id="${id}">${t}</button>`).join('');
   return `<div class="top-row"><div><h1>${esc(title)}</h1><div class="sub">${esc(sub)}</div></div>
     <div class="row gap8 wrap">${seg ? `<div class="seg">${seg}</div>` : ''}
       <button class="btn" data-act="palette">Search · ⌘K</button>
@@ -606,8 +608,31 @@ function renderRunSheet(t) {
 }
 
 /* ───────────── discovery ───────────── */
+function domainCheckNote(job) {
+  if (job.domain_match === 'REVIEW') return `<div class="banner warn mb12" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="grow"><b>Needs your review.</b> ${esc((job.domain_reason || '').replace('Needs your review: ', ''))} Nothing is spent on it until you choose.</span>${btn('It matches', 'review-decide', { ids: String(job.id), matches: '1' }, 'sm soft')}${btn('Not a match', 'review-decide', { ids: String(job.id), matches: '0' }, 'sm')}</div>`;
+  if (job.domain_match === 'PENDING') return `<div class="xs muted mb12">${esc(job.domain_reason || 'Waiting for the AI check')}: it runs before anything else is spent on this job.</div>`;
+  return (job.domain_reason || '').startsWith('AI check') ? `<div class="xs muted mb12">${esc(job.domain_reason)}</div>` : '';
+}
+function renderReview() {
+  const r = D.review || { total: 0, jobs: [] };
+  const picked = S.reviewChecked || (S.reviewChecked = new Set());
+  if (!r.jobs.length) return '<div class="card"><p class="settings-help">Nothing needs your review. Jobs the domain check cannot settle wait here, and nothing is spent on them until you choose.</p></div>';
+  const ids = [...picked].filter(id => r.jobs.some(j => j.id === id));
+  const bulk = ids.length ? `${btn(label('reviewYes', `These ${ids.length} match`, 'Saving…'), 'review-decide', { ids: ids.join(','), matches: '1' }, 'primary sm', isBusy('reviewYes'))}${btn(label('reviewNo', `Remove these ${ids.length}`, 'Saving…'), 'review-decide', { ids: ids.join(','), matches: '0' }, 'sm', isBusy('reviewNo'))}` : '<span class="xs muted">Select jobs to decide several at once</span>';
+  return `<div class="card flush"><div class="row gap10 wrap" style="padding:14px 18px;align-items:center;border-bottom:1px solid var(--line2)">
+      <input type="checkbox" data-act="review-all" ${ids.length === r.jobs.length ? 'checked' : ''} aria-label="Select all"><div class="grow"><b>${r.total} job${r.total === 1 ? '' : 's'} could go either way</b><div class="xs muted">The rules and the AI check could not settle these, so you decide. Jobs that match go on to the detailed match; removed ones move to Not matching.</div></div>
+      <div class="row gap8 wrap">${bulk}</div></div>
+    ${r.jobs.map(j => `<div class="row gap10" style="padding:14px 18px;align-items:flex-start;border-bottom:1px solid var(--line2)">
+      <input type="checkbox" data-act="review-check" data-id="${j.id}" ${picked.has(j.id) ? 'checked' : ''} aria-label="Select" style="margin-top:3px"><div class="grow" style="min-width:0">
+        <div class="small b">${j.url ? `<a href="${attr(j.url)}" target="_blank" rel="noopener">${esc(j.title)}</a>` : esc(j.title)}</div><div class="xs muted">${esc([j.company, j.location].filter(Boolean).join(' · '))}</div>
+        ${j.reason ? `<div class="small mt4">${esc(j.reason)}</div>` : ''}
+        <div class="row gap6 wrap mt6">${j.your_skills_found.length ? j.your_skills_found.slice(0, 10).map(s => pill(s, 'good')).join('') : '<span class="xs muted">None of your skills found in the posting</span>'}${j.points_against.slice(0, 2).map(p => pill(p, 'warn')).join('')}</div>
+        ${j.summary ? `<div class="xs muted mt6 pretty">${esc(j.summary)}…</div>` : ''}</div>
+      <div class="row gap6" style="flex:none">${btn('It matches', 'review-decide', { ids: String(j.id), matches: '1' }, 'sm soft')}${btn('Remove', 'review-decide', { ids: String(j.id), matches: '0' }, 'sm')}</div></div>`).join('')}</div>`;
+}
 function renderDiscovery() {
   const banner = S.polling ? `<div class="banner mb14"><span class="dot" style="background:var(--brand)"></span><span class="grow">${esc(S.polling.text)}</span></div>` : '';
+  if (S.discMode === 'review') return banner + renderReview();
   if (S.discMode === 'table') return banner + renderTable();
   if (S.discMode === 'setup') return banner + renderSetup();
   return banner + renderTriage();
@@ -944,7 +969,7 @@ function renderTable() {
     ${j.items.map(r => `<div class="jgrid jrow ${r.id === S.selJob ? 'sel' : ''}" data-act="select-job" data-id="${r.id}">
       <input type="checkbox" data-act="check" data-id="${r.id}" ${S.checked.has(r.id) ? 'checked' : ''} aria-label="Select">
       <div style="min-width:0"><div class="b ellipsis" style="font-size:13.5px">${esc(r.title)}</div><div class="xs muted ellipsis">${esc(r.company)}${r.location ? ' · ' + esc(r.location) : ''}</div></div>
-      <div class="tr mono bb ${fitCls(r.fit)}" style="font-size:13.5px">${fitTxt(r.fit)}</div><div class="col gap4" style="align-items:flex-start">${r.domain_match === 'NOT_MATCHING' ? `<span title="${attr(r.domain_reason || 'Outside your domain')}">${pill('Not matching', 'warn')}</span>` : statusPill(r.status)}${descBadge(r.description_state)}</div><div class="xs muted">${esc(r.board)}</div><div class="tr xs ${r.posted_ago || r.posted_raw ? 'muted' : 'faint'}" title="${attr(`found ${r.posted}`)}">${esc(r.posted_ago || r.posted_raw || `found ${r.posted}`)}</div></div>`).join('')}
+      <div class="tr mono bb ${fitCls(r.fit)}" style="font-size:13.5px">${fitTxt(r.fit)}</div><div class="col gap4" style="align-items:flex-start">${r.domain_match === 'NOT_MATCHING' ? `<span title="${attr(r.domain_reason || 'Outside your domain')}">${pill('Not matching', 'warn')}</span>` : r.domain_match === 'PENDING' ? pill('AI check', 'muted') : r.domain_match === 'REVIEW' ? pill('Needs review', 'warn') : statusPill(r.status)}${descBadge(r.description_state)}</div><div class="xs muted">${esc(r.board)}</div><div class="tr xs ${r.posted_ago || r.posted_raw ? 'muted' : 'faint'}" title="${attr(`found ${r.posted}`)}">${esc(r.posted_ago || r.posted_raw || `found ${r.posted}`)}</div></div>`).join('')}
     ${!j.total ? `<div class="empty small muted">No jobs match these filters. <a href="#" data-act="reset-filters">Reset</a> to see all ${j.total_all}.</div>` : ''}
     <div class="row wrap gap10 pager" style="padding:12px 14px;background:#fbfbfe"><div class="row gap6"><span class="small muted">Rows</span><select class="select" style="margin:0;width:auto;padding:6px 8px" id="flt-per" data-filter="per_page">${opts([[10, 10], [25, 25], [50, 50]], f.per_page)}</select></div><div class="grow"></div>
       ${btn('← Prev', 'page', { page: j.page - 1 }, 'sm', j.page <= 1)}${pages.map(p => btn(String(p), 'page', { page: p }, 'sm ' + (p === j.page ? 'on' : ''))).join('')}${btn('Next →', 'page', { page: j.page + 1 }, 'sm', j.page >= j.pages)}</div>
@@ -952,7 +977,7 @@ function renderTable() {
   <section class="card pad18 c-side sticky-panel">${sel ? `
     <div class="row top-align between gap10"><div class="grow"><div style="font-size:17px;font-weight:600">${esc(sel.title)}</div><div class="base muted mt4">${esc(sel.company)}${sel.location ? ' · ' + esc(sel.location) : ''}</div></div><div class="mono bb ${fitCls(sel.fit)}" style="font-size:24px">${fitTxt(sel.fit)}</div></div>
     <div class="row gap6 wrap" style="margin:14px 0">${statusPill(sel.status)}${pill(sel.board + ' · found ' + sel.posted, 'plain', 'lg')}${postedTxt(sel) ? pill(postedTxt(sel), 'plain', 'lg') : ''}${pill(`${sel.matches.length} matched`, 'good', 'lg')}${pill(`${sel.gaps.length + sel.missing.length} gaps`, 'warn', 'lg')}</div>
-    ${sel.domain_match === 'NOT_MATCHING' ? `<div class="banner warn mb12" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="grow"><b>Hidden: not matching.</b> ${esc(sel.domain_reason || 'Outside your domain')}. It is not ranked, so no model is used on it.</span>${btn(label('keep' + sel.id, 'Keep this job', 'Keeping…'), 'domain-keep', { id: sel.id }, 'sm soft', isBusy('keep' + sel.id))}</div>` : ''}
+    ${sel.domain_match === 'NOT_MATCHING' ? `<div class="banner warn mb12" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="grow"><b>Hidden: not matching.</b> ${esc(sel.domain_reason || 'Outside your domain')}. It is not ranked further.</span>${btn(label('keep' + sel.id, 'Keep this job', 'Keeping…'), 'domain-keep', { id: sel.id }, 'sm soft', isBusy('keep' + sel.id))}</div>` : domainCheckNote(sel)}
     <div class="base pretty" style="color:var(--ink3);line-height:1.6;border-top:1px solid var(--line2);padding-top:14px">${esc(sel.summary || (sel.description || '').slice(0, 420) || 'No description captured.')}</div>
     <div class="mt12"><div class="row gap8" style="align-items:center;min-width:0"><span class="xs muted" style="white-space:nowrap">Resume used</span>${resumeSelect('job-resume', sel.resume_choice_id, { id: sel.id, choice: sel.resume_choice })}</div>${sel.resume_choice === 'AUTO' ? '<div class="xs faint mt4">Matched by resume tags</div>' : ''}</div>
     <div class="row gap8 mt16">${['tailored', 'needs_retailor', 'approved', 'applied', 'pending_approval'].includes(sel.status) ? btn(sel.status === 'needs_retailor' ? 'Re-tailor' : 'Open packet', 'go', { screen: sel.status === 'applied' ? 'tracker' : sel.status === 'approved' ? 'approvals' : 'tailor', job: sel.id }, 'primary grow') : sel.needs_description ? `<span class="grow" title="Ranking needs the job description">${btn('Add description', 'open-job', { id: sel.id }, 'primary grow')}</span>`
@@ -2038,7 +2063,7 @@ function renderJobModal() {
       <div class="wizard">${j.wizard.map((w, i) => `<div class="${w.done ? 'done' : i === hereIdx ? 'here' : ''}"><div class="row gap6"><span class="m">${w.done ? '✓' : i + 1}</span><span class="small b" style="color:${w.done ? 'var(--ink)' : i === hereIdx ? 'var(--brand-ink)' : 'var(--faint)'}">${w.label}</span></div><div class="xs muted mt4">${esc(i === hereIdx && !w.done ? 'next step' : w.meta)}</div></div>`).join('')}</div></div>
     ${rejectionBanner(j)}
     ${pipelineBanner(j)}
-    ${j.domain_match === 'NOT_MATCHING' ? `<div class="banner warn" style="margin:0 24px;display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="grow"><b>Hidden: not matching.</b> ${esc(j.domain_reason || 'Outside your domain')} — not ranked, no model used.</span>${btn(label('keep' + j.id, 'Keep this job', 'Keeping…'), 'domain-keep', { id: j.id }, 'sm soft', isBusy('keep' + j.id))}</div>` : ''}
+    ${j.domain_match === 'NOT_MATCHING' ? `<div class="banner warn" style="margin:0 24px;display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="grow"><b>Hidden: not matching.</b> ${esc(j.domain_reason || 'Outside your domain')} — not ranked further.</span>${btn(label('keep' + j.id, 'Keep this job', 'Keeping…'), 'domain-keep', { id: j.id }, 'sm soft', isBusy('keep' + j.id))}</div>` : domainCheckNote(j)}
     <div class="split gap16" style="padding:18px 24px 24px">
       <section class="card flush" style="flex:1 1 420px;min-width:0"><div class="tabs under">${[['description', 'Description'], ['structured', 'Structured JD'], ['requirements', 'Requirements map'], ['insights', 'Insights'], ['notes', 'Notes']].map(([id, t]) => `<button class="${S.jobTab === id ? 'on' : ''}" data-act="job-tab" data-id="${id}">${t}</button>`).join('')}</div>${tab}</section>
       <div class="col gap14" style="flex:1 1 280px;min-width:0">
@@ -2529,6 +2554,18 @@ const A = {
   }, action => ({ disable: 'Rule turned off', enable: 'Rule turned on', promote: 'Added to your permanent excludes', delete: 'Rule forgotten' }[action])),
   'domain-reapply': () => busy('domainReapply', () => api('/api/jobs/domain/reapply', { method: 'POST' }),
     out => `Checked ${out.checked} unranked job${out.checked === 1 ? '' : 's'} · ${out.hidden} hidden · ${out.restored} back in the queue`),
+  'domain-recheck': () => busy('domainRecheck', () => api('/api/jobs/domain/recheck', { method: 'POST' }),
+    out => `Checked ${out.checked} hidden job${out.checked === 1 ? '' : 's'} · ${out.queued} sent to the AI check · ${out.restored} back in the queue · ${out.still_hidden} still hidden`),
+  'review-check': el => { const picked = S.reviewChecked || (S.reviewChecked = new Set()), id = Number(el.dataset.id); picked.has(id) ? picked.delete(id) : picked.add(id); render(); },
+  'review-all': () => { const all = (D.review?.jobs || []).map(j => j.id), picked = S.reviewChecked || new Set(); S.reviewChecked = new Set(all.every(id => picked.has(id)) ? [] : all); render(); },
+  'review-decide': el => busy(el.dataset.matches === '1' ? 'reviewYes' : 'reviewNo', async () => {
+    const ids = el.dataset.ids.split(',').map(Number), matches = el.dataset.matches === '1';
+    const out = await api('/api/discovery/review', { method: 'POST', body: { ids, matches } });
+    ids.forEach(id => S.reviewChecked?.delete(id));
+    if (S.jobOpen) D.jobModal = await api(`/api/jobs/${S.jobOpen}`).catch(() => D.jobModal);
+    await load();
+    return out;
+  }, out => `${out.done.length} job${out.done.length === 1 ? '' : 's'} ${out.matches ? 'sent on to the detailed match' : 'moved to Not matching'}`),
   'show-not-matching': (el, e) => { e.preventDefault(); S.filters = { ...S.filters, domain: 'not_matching', page: 1 }; go('discovery', { discMode: 'table' }); },
   'rtag-edit': el => {
     S.tagEdit = `${el.dataset.kind}:${el.dataset.id}`;

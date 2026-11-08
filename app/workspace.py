@@ -45,6 +45,7 @@ from app.scheduler_hooks import run_soon
 from app.services import (
     approval,
     ats_keywords,
+    domain_match,
     evidence_tags,
     feedback_learning,
     ranker,
@@ -356,8 +357,7 @@ def get_job(db: Session, job_id: int) -> Job:
 # ───────────────────────────── summary / overview / today ─────────────────────────────
 
 def triage_query(db: Session):
-    query = select(Job).where(Job.triaged_at.is_(None), Job.status.in_(QUEUE_STATUSES),
-                              Job.domain_match.is_distinct_from("NOT_MATCHING"))
+    query = select(Job).where(Job.triaged_at.is_(None), Job.status.in_(QUEUE_STATUSES), domain_match.not_held())
     excluded = excluded_companies(db)
     if excluded:
         query = query.where(func.lower(Job.company).not_in(excluded))
@@ -1036,12 +1036,16 @@ def bulk_delete(payload: BulkIdsIn, db: Session = Depends(get_user_db)):
     for jobs the domain filter had already hidden: clearing those out says nothing new."""
     deleted, protected = 0, []
     owner = None
+    # Clearing out many jobs at once is tidying, not a judgement on each of them (AGENTS.md: Discovery quality).
+    from app.services import domain_classifier
+
+    cleanup = domain_classifier.mode() == domain_classifier.ON and len(payload.ids) > 3
     for job in db.scalars(select(Job).where(Job.id.in_(payload.ids))).all():
         if job.status in PROTECTED_STATUSES and not payload.include_submitted:
             protected.append(job.id)
             continue
         if job.domain_match != "NOT_MATCHING":
-            feedback_learning.record(db, job, "DELETED")
+            feedback_learning.record(db, job, cleanup and "BULK_DELETED" or "DELETED")
             owner = job.user_id
         delete_job(db, job)
         deleted += 1
@@ -1087,6 +1091,8 @@ def bulk_parse(payload: BulkIdsIn, request: Request, background: BackgroundTasks
         state = job_description.description_state(job, statuses.get(job_id)) if job else None
         why = ("not found" if job is None
                else "hidden: not matching your domain" if job.domain_match == "NOT_MATCHING"
+               else "waiting for the AI check" if job.domain_match == "PENDING"
+               else "waiting for your review" if job.domain_match == "REVIEW"
                else "no description" if state == "NO_DESCRIPTION"
                else "already parsed" if state == "PARSED"
                else "already parsing" if state == "PARSING"

@@ -867,6 +867,9 @@ class LLMClient:
                                      ("title", "company", "location", "remote_type", "job_type", "seniority")},
                                   source_board=None, source="mock")
             return deterministic_parse(job, text.strip())
+        if "CLASSIFY_JOB_DOMAIN" in user.split("\n", 1)[0]:
+            return {"classification": "UNCERTAIN", "reason": "Mock: no model read this posting.", "matched_skills": [],
+                    "irrelevance_evidence": []}
         if "RECOVER_JOB_DESCRIPTION" in user.split("\n", 1)[0]:
             from app.services.jd_extractors import likely_blocks
 

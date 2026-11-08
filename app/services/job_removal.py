@@ -27,6 +27,7 @@ from app.models import (
     Application,
     InsightObservation,
     Job,
+    JobClassificationTask,
     JobDescriptionFetchTask,
     JobDescriptionParseTask,
     JobInsight,
@@ -107,8 +108,8 @@ def delete_job(db: Session, job: Job) -> None:
     application_execution.on_job_deleted(db, job.id)
     from app.models import ApplicationClaim, ApprovedPacket
 
-    for model in (JobDescriptionFetchTask, JobDescriptionParseTask, JobRankingTask, JobInsightTask, ApprovedPacket,
-                  ApplicationClaim):
+    for model in (JobClassificationTask, JobDescriptionFetchTask, JobDescriptionParseTask, JobRankingTask, JobInsightTask,
+                  ApprovedPacket, ApplicationClaim):
         for row in db.scalars(select(model).where(model.job_id == job.id)).all():
             db.delete(row)
     for insight in db.scalars(select(JobInsight).where(JobInsight.job_id == job.id)).all():

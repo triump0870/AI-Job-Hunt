@@ -90,7 +90,7 @@ def test_every_worker_lists_its_own_tasks_with_counts(user_id, signed_in):
     client = signed_in(user_id)
     summary = client.get("/api/workers").json()
     kinds = {w["kind"]: w for w in summary["workers"]}
-    assert list(kinds) == ["parsing", "recovery", "ranking", "qualification", "preparation", "application", "insights",
+    assert list(kinds) == ["parsing", "classification", "recovery", "ranking", "qualification", "preparation", "application", "insights",
                            "tailoring", "reviewing", "indexing", "resume_parsing"]
     assert kinds["parsing"]["counts"] == {"running": 1, "queued": 0, "retrying": 1, "active": 2}
     assert kinds["tailoring"]["counts"]["queued"] == 1 and summary["active"] == 3
@@ -359,7 +359,7 @@ def test_reset_cooldowns_endpoint(user_id, signed_in):
 
 
 def test_kinds_registry_is_complete():
-    assert set(workers.KINDS) == {"parsing", "recovery", "ranking", "qualification", "preparation", "application",
+    assert set(workers.KINDS) == {"classification", "parsing", "recovery", "ranking", "qualification", "preparation", "application",
                                   "insights", "tailoring", "reviewing", "indexing", "resume_parsing"}
     for spec in workers.KINDS.values():
         assert hasattr(spec.model, "run_now_at") and spec.max_attempts() >= 1

@@ -118,7 +118,6 @@ The semantic classifier must **not** invent candidate preferences. Read the acco
 5. Perform the **one** signed submit through `GuardedPage.submit(ticket)` or `submission.signed_submit` in the existing runner. Keep `tests/test_no_automated_submit.py` enforcing a single authorized click path.
 6. Collect confirmation evidence; record successful submission only through `apply_queue.record_submission` and canonical workflow transitions.
 7. If an outcome cannot be proved, mark UNCERTAIN and pause for reconciliation. After CLICKING, **never click again automatically**, even after timeout, process restart, Kill or lease expiry.
-
 - Preserve route exclusivity, posting-alias claims, immutable packet digests, provenance (`verified_browser` versus `reported`), and duplicate prevention.
 - Existing confirmation requires same-site non-GET success, form disappearance and a confirmation marker. A provider-specific verifier may be proposed **only with tests establishing evidence of actual submission, not merely a success-looking page**. Never weaken verification globally just to raise completion metrics.
 - Read-only ATS status/email checks may add evidence for **human reconciliation** of UNCERTAIN claims; do not automatically release or re-submit them unless a separately reviewed policy safely proves that no click occurred.
@@ -174,5 +173,3 @@ Keep detailed subsystem contracts, retention settings, rate-limit semantics, sch
 - `docs/prompts.md` for prompt contracts and versioning.
 - `docs/resume-extraction-plan.md` for extraction and verification.
 - `README.md` sections 9–14 for worker workflows, applications, research and monitoring.
-
-**Important migration note:** This file expresses both preserved current rules and explicitly marked proposed improvements. Replacing `AGENTS.md` alone does **not** implement tri-state filtering, semantic Knowledge Bank matching or additional ATS support. Those features require code changes, migrations where applicable, tests, and safe rollout before being enabled.
