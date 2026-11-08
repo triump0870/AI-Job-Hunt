@@ -26,7 +26,7 @@ import asyncio
 import contextlib
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -38,7 +38,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import ACTIVE_JD_FETCH_STATUSES, Job, JobDescriptionFetchTask, JobRanking
-from app.services import backoff, jd_extractors, jd_quality, server_settings, system_log, tracing, worker_settings
+from app.services import (
+    backoff,
+    jd_extractors,
+    jd_quality,
+    server_settings,
+    system_log,
+    tracing,
+    worker_settings,
+)
 from app.services.lifecycle import ErrorCategory
 from app.services.lifecycle import WorkflowState as S
 from app.settings import get_settings
@@ -241,6 +249,45 @@ def sweep(db: Session, limit: int | None = None, *, now: datetime | None = None)
             continue
     db.commit()
     return {"assessed": assessed, "queued": queued}
+
+
+def enqueue_missing(db: Session, *, excluded_companies: Collection[str] = (), limit: int | None = None,
+                    now: datetime | None = None) -> dict[str, int]:
+    """A person asked for every job with no description to be read from its posting: queue them, at most `limit` at a
+    time, newest first. As with asking for one job, a URL tried before is tried again. Nothing is spent on a job the
+    domain check hides or holds, one the person set aside, or one with no URL; the counts say what was left out.
+    Commits. Nothing is fetched here: the recovery worker does it, one visit at a time for listed hosts."""
+    from app.services import domain_match, ranker
+
+    limit = max(1, limit or get_settings().jd_fetch_enqueue_batch_size)
+    now = now or utcnow()
+    counts = {"queued": 0, "already_queued": 0, "hidden_by_domain": 0, "held_for_review": 0, "set_aside": 0,
+              "no_url": 0, "over_limit": 0}
+    jobs = db.scalars(select(Job).where(func.trim(func.coalesce(Job.description, "")) == "")
+                      .order_by(Job.id.desc())).all()
+    for job in jobs:
+        if job.domain_match == domain_match.NOT_MATCHING:
+            counts["hidden_by_domain"] += 1
+        elif job.domain_match in domain_match.HELD:
+            counts["held_for_review"] += 1
+        elif (job.status in ("archived", "dismissed") or (job.company or "").lower() in excluded_companies
+              or ranker.removed_by_user(db, job)):
+            counts["set_aside"] += 1
+        elif not (job.url or job.source_url or "").strip():
+            counts["no_url"] += 1
+        elif active_task(db, job.id) is not None:
+            counts["already_queued"] += 1
+        elif counts["queued"] >= limit:
+            counts["over_limit"] += 1
+        else:
+            try:
+                with db.begin_nested():
+                    enqueue(db, job, reason="user_request", force=True, now=now)
+                counts["queued"] += 1
+            except IntegrityError:  # queued by another request at the same moment
+                counts["already_queued"] += 1
+    db.commit()
+    return counts
 
 
 def waiting_reason(db: Session, job: Job) -> str | None:
@@ -563,23 +610,26 @@ async def _runner_stage(snapshot: Snapshot, start_url: str) -> PageResult:
 
 
 async def _visible_read(snapshot: Snapshot, browser: Any, start_url: str) -> tuple[PageResult, dict[str, Any]]:
-    """A listed host: the browser-use runner first, the visible window when the runner failed. One at a time and spaced
-    apart, so a fallback is not a second visit straight after the first. Returns the result and what each one did."""
+    """A listed host: the browser-use runner, then Playwright's visible window only if the runner failed and
+    PLAYWRIGHT_VISIBLE_WINDOW_FALLBACK allows it. Never the headless browser. One at a time and spaced apart, so a
+    fallback is not a second visit straight after the first. Returns the result and what each one did."""
     from app.infrastructure.application_browser import browser_use_sidecar as sidecar
 
     global _visible_last
-    notes: dict[str, Any] = {"visible": True, "backend": "visible_window"}
-    window = browser is not None and browser.is_available()
+    notes: dict[str, Any] = {"visible": True, "backend": "browser_use_runner"}
+    window = (get_settings().playwright_visible_window_fallback and browser is not None
+              and browser.is_available())
     async with _gate():
+        result = PageResult("unavailable", "RUNNER_UNAVAILABLE", detail="The browser-use runner is not configured")
         if sidecar.configured():
             await _visible_turn()
             try:
                 result = await _runner_stage(snapshot, start_url)
             finally:
                 _visible_last = time.monotonic()
-            notes.update(backend="browser_use_runner", runner=_stage_note(result))
-            if not _runner_failed(result) or not window:
-                return result, notes
+        notes["runner"] = _stage_note(result)
+        if not window or not _runner_failed(result):
+            return result, notes
         await _visible_turn()
         try:
             rendered = await _browser_stage(snapshot, browser, start_url, visible=True)
@@ -662,6 +712,28 @@ def _stage_note(result: PageResult) -> dict[str, Any]:
             "detail": (result.detail or "")[:200] or None}
 
 
+def read_route(diagnostics: dict[str, Any] | None) -> dict[str, str | None] | None:
+    """Which route a task's latest attempt ended on and, when an earlier one came first, which and why it moved on. Read
+    only from what that attempt recorded, as short labels: None when it recorded no read at all."""
+    attempts = [(int(key[8:]), value) for key, value in (diagnostics or {}).items()
+                if key.startswith("attempt_") and key[8:].isdigit() and isinstance(value, dict)]
+    if not attempts:
+        return None
+    latest = max(attempts, key=lambda attempt: attempt[0])[1]
+    http, browser = latest.get("http") or {}, latest.get("playwright") or {}
+    if browser.get("attempted"):
+        backend, runner = browser.get("backend"), browser.get("runner")
+        if backend == "visible_window" and runner:
+            came_from, code = "browser-use runner", runner.get("code")
+        else:
+            came_from, code = "HTTP", http.get("code")
+        label = {"browser_use_runner": "browser-use runner", "visible_window": "Visible window"}.get(
+            backend, "Headless browser")
+        return {"label": label, "from": came_from if came_from == "browser-use runner" or http else None,
+                "reason": message_for(code) or None}
+    return {"label": "HTTP", "from": None, "reason": None} if http else None
+
+
 def should_try_browser_after_http(result: PageResult) -> bool:
     """Central policy for a single ordinary browser attempt after HTTP.
 
@@ -738,9 +810,7 @@ async def recover(sessions: Callable[[], Session], snapshot: Snapshot, *, browse
         outcome.diagnostics["playwright"] = {"attempted": False, "kind": "skipped",
                                              "reason": "The browser fallback is turned off for your account"}
     elif best is None and try_browser:
-        from app.infrastructure.application_browser import browser_use_sidecar as sidecar
-
-        if (browser is None or not browser.is_available()) and not (visible_host and sidecar.configured()):
+        if (browser is None or not browser.is_available()) and not visible_host:
             outcome.diagnostics["playwright"] = {"attempted": False, "kind": "unavailable",
                                                  "code": "PLAYWRIGHT_UNAVAILABLE",
                                                  "detail": (browser.diagnostics().get("reason")

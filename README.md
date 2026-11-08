@@ -3268,24 +3268,27 @@ container is not found. The Docker image only has the headless shell, so headed 
 
 Some boards answer a headless browser with `403 Access Denied` but serve the same public page to an ordinary window.
 Naukri does this: its postings end `BLOCKED` with "The site refused access". On a local install you can have recovery
-read those hosts in a visible window:
+read those hosts with the browser-use runner:
 
 ```bash
 PLAYWRIGHT_VISIBLE_HOSTS=naukri.com
 PLAYWRIGHT_VISIBLE_MIN_INTERVAL_SECONDS=10
+PLAYWRIGHT_VISIBLE_WINDOW_FALLBACK=false
 ```
 
-Recovery tries two browsers for these hosts, after HTTP:
+After HTTP, these hosts go to **the browser-use runner**, which needs `BROWSER_USE_WEBUI_ENABLED` and `BROWSER_USE_PYTHON`.
+It runs on the Web UI's Python install, as a runner of its own per posting: it only loads and reads the page, sends
+nothing but GET and stays on the posting's host. It shares nothing with an application run. The Web UI does not need to
+be running, and no model is involved. If the runner can't read the page, that is the result, and the headless browser is
+never tried for these hosts.
 
-1. **The browser-use runner**, when it is configured (`BROWSER_USE_WEBUI_ENABLED`, `BROWSER_USE_PYTHON`). A runner of its
-   own per posting: it only loads and reads the page, sends nothing but GET and stays on the posting's host. It shares
-   nothing with an application run. The Web UI does not need to be running, and no model is involved.
-2. **The shared browser's visible window**, when the runner could not run or found no description.
+`PLAYWRIGHT_VISIBLE_WINDOW_FALLBACK=true` adds **the shared browser's visible window** for when the runner could not run or
+found no description. A page that answered is not asked again in the second browser: a refusal, a challenge, a login wall
+or a removed posting is the result.
 
-A page that answered is not asked again in the second browser: a refusal, a challenge, a login wall or a removed posting
-is the result. Either way a plain Chromium window, with no sign-in or profile of yours, opens for each posting and closes
-when it has been read. Visits go one at a time and may take focus while the queue runs. Other sites and the daily listing
-check stay headless. Jobs already `BLOCKED` are not retried by themselves: use Retry in Running workers. A task's
+Either way a plain Chromium window, with no sign-in or profile of yours, opens for each posting and closes when it has
+been read. Visits go one at a time and may take focus while the queue runs. Other sites and the daily listing check stay
+headless with `PLAYWRIGHT_ENABLED`, so leave that on unless you want them off too. Jobs already `BLOCKED` are not retried by themselves: use Retry in Running workers, or filter Jobs by **No description** and click **Fetch missing descriptions**. That queues every job with no description, up to `JD_FETCH_ENQUEUE_BATCH_SIZE` per click, and says what it left out: jobs your domain filter hides or still holds, jobs you dismissed, archived or removed, and jobs with no URL. A task's
 diagnostics say which browser read it (`backend`).
 
 It is off by default because it is your decision: it reads a site that refuses automated browsers, from your own

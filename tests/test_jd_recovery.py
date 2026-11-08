@@ -26,11 +26,12 @@ from app.models import (
     JobStructuredDataChange,
     ProviderCooldown,
     SystemLogEntry,
+    User,
     WorkflowTransition,
 )
 from app.services import backoff, jd_quality, jd_recovery, job_description, ranker, sources
 from app.services.lifecycle import WorkflowState as S
-from app.settings import get_settings
+from app.settings import Settings, get_settings
 from tests.conftest import ensure_test_user
 from tests.jd_support import FakeBrowser, PostingServer, navigation_failed, page
 
@@ -477,6 +478,7 @@ def visible_host(monkeypatch):
     monkeypatch.setattr(settings, "playwright_visible_hosts", " Example.org, 127.0.0.1 ")
     monkeypatch.setattr(settings, "playwright_visible_min_interval_seconds", 0)
     monkeypatch.setattr(settings, "browser_use_webui_enabled", False)  # the runner has tests of its own, below
+    monkeypatch.setattr(settings, "playwright_visible_window_fallback", True)  # off by default: see runner_only
 
 
 class FakeRunner:
@@ -639,6 +641,45 @@ def test_a_rate_limit_to_the_runner_never_moves_on_to_the_window(owner, server, 
     shell_job(owner, server)
     assert run_recovery(browser) == ["retrying"]
     assert browser.calls == [] and cooldown(owner) is not None
+
+
+@pytest.fixture
+def runner_only(visible_host, monkeypatch):
+    monkeypatch.setattr(get_settings(), "playwright_visible_window_fallback", False)
+
+
+def test_the_window_fallback_is_off_unless_asked_for():
+    assert Settings.model_fields["playwright_visible_window_fallback"].default is False
+
+
+def test_with_the_fallback_off_the_runner_still_reads_a_listed_site(owner, server, runner_only, monkeypatch):
+    runner = FakeRunner(monkeypatch, page_=(200, page("posting")))
+    browser = FakeBrowser({"shell": (200, page("posting"))})
+    job_id = shell_job(owner, server)
+    assert run_recovery(browser) == ["recovered"]
+    assert len(runner.calls) == 1 and browser.calls == []
+    assert task_of(job_id).diagnostics["attempt_1"]["playwright"]["backend"] == "browser_use_runner"
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "refused", "empty"])
+def test_with_the_fallback_off_a_runner_failure_opens_no_playwright(owner, server, runner_only, monkeypatch, failure):
+    from app.infrastructure.application_browser import browser_use_sidecar as bus
+
+    FakeRunner(monkeypatch, page_=(200, SHELL), error={
+        "unavailable": bus.SidecarUnavailable("not installed"), "refused": bus.SidecarRefused("BROWSER_ERROR", "no"),
+        "empty": None}[failure])
+    browser = FakeBrowser({"shell": (200, page("posting"))})  # Playwright *could* read it: it must not be tried
+    job_id = shell_job(owner, server)
+    assert "recovered" not in run_recovery(browser)
+    assert browser.calls == [] and task_of(job_id).status != "COMPLETED"
+
+
+def test_with_the_fallback_off_a_runner_not_configured_opens_no_playwright(owner, server, runner_only):
+    browser = FakeBrowser({"shell": (200, page("posting"))})
+    job_id = shell_job(owner, server)
+    assert "recovered" not in run_recovery(browser)
+    notes = task_of(job_id).diagnostics["attempt_1"]["playwright"]
+    assert browser.calls == [] and notes["runner"]["code"] == "RUNNER_UNAVAILABLE"
 
 
 def test_a_site_not_listed_never_reaches_the_runner(owner, server, monkeypatch):
@@ -905,6 +946,139 @@ def test_the_manual_recovery_api_queues_and_reports(owner, server):
     assert "Traceback" not in str(status) and len(status["history"]) == 1
     detail = client.get(f"/api/jobs/{job_id}").json()
     assert detail["description_recovery"]["state"] == "BLOCKED"
+
+
+@pytest.mark.parametrize("attempt,expected", [
+    ({"http": {"kind": "found"}, "playwright": {"attempted": False}}, ("HTTP", None, None)),
+    ({"http": {"kind": "empty", "code": "EXTRACTION_FAILED"}, "playwright": {"attempted": True, "kind": "blocked"}},
+     ("Headless browser", "HTTP", "No job description could be found on the page")),
+    ({"http": {"kind": "empty", "code": "EXTRACTION_FAILED"}, "playwright": {
+        "attempted": True, "kind": "found", "backend": "browser_use_runner", "runner": {"kind": "found"}}},
+     ("browser-use runner", "HTTP", "No job description could be found on the page")),
+    ({"http": {"kind": "empty"}, "playwright": {"attempted": True, "kind": "found", "backend": "visible_window",
+                                                "runner": {"kind": "unavailable", "code": "RUNNER_UNAVAILABLE"}}},
+     ("Visible window", "browser-use runner", "Runner unavailable"))])
+def test_a_task_says_which_route_read_it(attempt, expected):
+    route = jd_recovery.read_route({"attempt_1": {"http": {"kind": "stale"}}, "attempt_2": attempt})
+    assert (route["label"], route["from"], route["reason"]) == expected
+
+
+def test_a_task_with_no_read_recorded_has_no_route():
+    assert jd_recovery.read_route(None) is None and jd_recovery.read_route({}) is None
+    assert jd_recovery.read_route({"attempt_1": {"playwright": {"attempted": False}}}) is None
+    assert jd_recovery.read_route({"attempt_x": {"http": {"kind": "found"}}}) is None
+
+
+def test_the_latest_attempt_is_read_by_number_not_by_text():
+    diagnostics = {f"attempt_{n}": {"http": {"kind": "empty"}} for n in (2, 10)}
+    diagnostics["attempt_2"] = {"playwright": {"attempted": True}}
+    assert jd_recovery.read_route(diagnostics)["label"] == "HTTP"
+
+
+def test_a_finished_recovery_row_shows_its_route_and_its_change(owner, server, visible_host, monkeypatch):
+    from app.services import workers
+
+    FakeRunner(monkeypatch, page_=(200, page("posting")))
+    job_id = shell_job(owner, server)
+    assert run_recovery(FakeBrowser()) == ["recovered"]
+    with SessionLocal() as db:
+        db.info["user_id"] = owner
+        rows = workers.rows(db, owner, "recovery")["rows"]
+    done = next(r for r in rows if r["job_id"] == job_id)
+    assert done["model"] == {"model": None, "source": "none"} and done["read_route"] == "browser-use runner"
+    assert done["model_change"] == {"kind": "ROUTE", "from": "HTTP", "to": "browser-use runner",
+                                    "reason": "No job description could be found on the page"}
+
+
+def test_a_waiting_recovery_row_has_no_route_yet(owner, server):
+    from app.services import workers
+
+    job_id = new_job(owner, server.url("posting.html"), description="")
+    with SessionLocal() as db:
+        db.info["user_id"] = owner
+        rows = workers.rows(db, owner, "recovery")["rows"]
+    assert "read_route" not in next(r for r in rows if r["job_id"] == job_id)
+
+
+def _no_tasks(*job_ids: int) -> None:
+    with SessionLocal() as db:  # automatic recovery already ran for them
+        db.execute(delete(JobDescriptionFetchTask).where(JobDescriptionFetchTask.job_id.in_(job_ids)))
+        db.commit()
+
+
+def test_the_bulk_api_queues_every_job_with_no_description(owner, server):
+    client = TestClient(web_app)
+    empty = new_job(owner, server.url("posting.html"), description="")
+    blank = new_job(owner, server.url("posting.html") + "?2", description="   ")
+    described = new_job(owner, server.url("posting.html") + "?3", description=page("posting"))
+    _no_tasks(empty, blank, described)
+    out = client.post("/api/jobs/recover-descriptions")
+    assert out.status_code == 202 and out.json()["queued"] == 2
+    assert server.hits == [], "the request itself never fetches the page"
+    assert task_of(empty).reason == "user_request" and task_of(blank).status == "PENDING"
+    assert task_of(described) is None
+
+
+def test_the_bulk_api_tries_a_blocked_job_again_and_never_queues_one_twice(owner, server):
+    client = TestClient(web_app)
+    job_id = new_job(owner, server.url("login.html"), description="")
+    _no_tasks(job_id)
+    assert client.post("/api/jobs/recover-descriptions").json()["queued"] == 1
+    again = client.post("/api/jobs/recover-descriptions").json()
+    assert again["queued"] == 0 and again["already_queued"] == 1
+    run_recovery(FakeBrowser())
+    assert task_of(job_id).status == "BLOCKED"
+    assert client.post("/api/jobs/recover-descriptions").json()["queued"] == 1
+    assert task_of(job_id).status == "PENDING"
+
+
+@pytest.mark.parametrize("fields,reason", [
+    ({"domain_match": "NOT_MATCHING"}, "hidden_by_domain"), ({"domain_match": "PENDING"}, "held_for_review"),
+    ({"domain_match": "REVIEW"}, "held_for_review"), ({"status": "dismissed"}, "set_aside"),
+    ({"status": "archived"}, "set_aside"), ({"company": "Skipped Inc"}, "set_aside"),
+    ({"url": "", "source_url": ""}, "no_url")])
+def test_the_bulk_api_spends_nothing_on_a_job_left_out(owner, server, fields, reason):
+    fields = dict(fields)
+    job_id = new_job(owner, fields.pop("url", server.url("posting.html")), description="", **fields)
+    _no_tasks(job_id)
+    with SessionLocal() as db:
+        db.info["user_id"] = owner
+        out = jd_recovery.enqueue_missing(db, excluded_companies={"skipped inc"})
+    assert out[reason] >= 1 and task_of(job_id) is None  # other files may leave jobs of this user behind
+
+
+def test_the_bulk_api_keeps_a_job_the_domain_check_kept(owner, server):
+    job_id = new_job(owner, server.url("posting.html"), description="", domain_match="KEPT")
+    _no_tasks(job_id)
+    assert TestClient(web_app).post("/api/jobs/recover-descriptions").json()["queued"] == 1
+
+
+def test_the_bulk_api_queues_a_bounded_number_newest_first(owner, server):
+    ids = [new_job(owner, server.url("posting.html") + f"?{n}", description="") for n in range(3)]
+    _no_tasks(*ids)
+    with SessionLocal() as db:
+        db.info["user_id"] = owner
+        out = jd_recovery.enqueue_missing(db, limit=2)
+    assert out["queued"] == 2 and out["over_limit"] == 1
+    assert task_of(ids[0]) is None and task_of(ids[2]) is not None
+
+
+def test_the_bulk_api_leaves_another_accounts_jobs_alone(owner, server):
+    with SessionLocal() as db:
+        other = User(email=f"{uuid.uuid4().hex}@jobhunt.test", password_hash="!")
+        db.add(other)
+        db.commit()
+        other_id = other.id
+    try:
+        theirs = new_job(other_id, server.url("posting.html"), description="")
+        _no_tasks(theirs)
+        assert TestClient(web_app).post("/api/jobs/recover-descriptions").json()["queued"] == 0
+        assert task_of(theirs) is None
+    finally:
+        _clean(other_id)
+        with SessionLocal() as db:
+            db.execute(delete(User).where(User.id == other_id))
+            db.commit()
 
 
 def test_the_manual_api_leaves_a_usable_description_alone(owner, server):

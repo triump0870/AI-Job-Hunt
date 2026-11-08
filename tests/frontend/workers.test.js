@@ -4,7 +4,7 @@ import { createContext, runInContext } from 'node:vm';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const appSource = readFileSync('app/static/app.js', 'utf8').split('/* ───────────── boot ───────────── */')[0];
-const names = ['S', 'D', 'A', 'render', 'go', 'wkState', 'loadWorkers', 'wkPoll', 'wkPollDelay', 'scheduleWkPoll',
+const names = ['S', 'D', 'A', 'render', 'go', 'wkState', 'wkModel', 'wkModelChange', 'loadWorkers', 'wkPoll', 'wkPollDelay', 'scheduleWkPoll',
   'stopWkPoll', 'readHash', 'WK_KINDS', 'fmtDateTime', 'wkLastRun'];
 let ui, context, fetchMock, confirmMock, routes;
 
@@ -190,6 +190,28 @@ describe('Running workers', () => {
     expect(rows[1].textContent).toContain('timed out');
     expect(rows[2].querySelector('[data-act="wk-kill"]')).toBeNull();
     expect(rows[2].querySelector('[data-act="wk-run-now"]')).not.toBeNull();
+  });
+
+  it('shows what read a finished recovery task and how it got there, with no model call', () => {
+    const none = { model: null, source: 'none' };
+    const cells = r => {
+      const div = document.createElement('div');
+      div.innerHTML = ui.wkModel(r) + ui.wkModelChange(r);
+      return div;
+    };
+    const moved = cells({ status: 'COMPLETED', model: none, read_route: 'browser-use runner',
+      model_change: { kind: 'ROUTE', from: 'HTTP', to: 'browser-use runner', reason: 'No job description could be found on the page' } });
+    expect(moved.querySelector('.wk-route').textContent).toBe('browser-use runner');
+    expect(moved.querySelector('.wk-model').textContent).toContain('No model call');
+    expect(moved.querySelector('.wk-change').textContent).toContain('Route changed');
+    expect(moved.querySelector('.wk-change s').textContent).toBe('HTTP');
+    expect(moved.querySelector('.wk-change').title).toContain('No job description could be found');
+    const direct = cells({ status: 'COMPLETED', model: none, read_route: 'HTTP', model_change: null });
+    expect(direct.querySelector('.wk-route').textContent).toBe('HTTP');
+    expect(direct.querySelector('.wk-change').textContent).toContain('No change');
+    const nothing = cells({ status: 'FAILED', model: none, model_change: null });
+    expect(nothing.querySelector('.wk-route')).toBeNull();
+    expect(nothing.querySelector('.wk-change').textContent).toBe('');
   });
 
   it('shows each active task’s model and route, and what moved it off its model', async () => {

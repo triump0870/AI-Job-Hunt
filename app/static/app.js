@@ -362,6 +362,13 @@ function rankQueuedMsg(out) {
   const n = out.queued.length;
   return `${n ? `Queued ${n} job${n === 1 ? '' : 's'} for ranking` : 'Nothing new to rank'}${out.skipped.length ? ` · ${out.skipped.length} skipped` : ''}${out.blocked ? ` · waiting: ${out.blocked}` : ''}`;
 }
+function recoverQueuedMsg(out) {
+  const n = out.queued;
+  const notes = [[out.already_queued, 'already queued'], [out.hidden_by_domain, 'hidden by your domain filter left out'],
+    [out.held_for_review, 'waiting on the domain check left out'], [out.set_aside, 'you set aside left out'], [out.no_url, 'with no posting URL left out'],
+    [out.over_limit, 'more: click again once these finish']].filter(([count]) => count).map(([count, text]) => `${count} ${text}`);
+  return [n ? `Queued ${n} job${n === 1 ? ' to read from its posting' : 's to read from their postings'}` : 'Nothing new to fetch', ...notes].join(' · ');
+}
 async function afterPull(results) {
   const ok = results.filter(r => r.ok && r.id);
   if (ok[0]) S.runSel = ok[0].id;
@@ -916,6 +923,7 @@ function filterBar(j, opts) {
       <select class="select" id="flt-sort" data-filter="sort" aria-label="Sort">${opts([['fit', 'Sort: best fit'], ['new', 'Sort: newest found'], ['posted', 'Sort: newest posted'], ['company', 'Sort: company']], f.sort)}</select>
       <button type="button" class="btn sm ${S.moreFilters || moreCount ? 'soft' : ''}" data-act="toggle-more-filters" aria-expanded="${S.moreFilters}" aria-controls="flt-more">More filters${moreCount ? ` · ${moreCount}` : ''} <span aria-hidden="true">${S.moreFilters ? '▴' : '▾'}</span></button>
       <span class="grow"></span>
+      ${S.checked.size || f.description !== 'NO_DESCRIPTION' ? '' : `<span title="Reads every job with no description from its posting. Jobs your domain filter hides are left out.">${btn(label('recoverDescriptions', 'Fetch missing descriptions', 'Queueing…'), 'recover-descriptions', {}, 'sm', isBusy('recoverDescriptions'))}</span>`}
       ${S.checked.size ? '' : btn(label('rankBatch', 'Rank unranked', 'Queueing…'), 'rank-batch', {}, 'sm', isBusy('rankBatch'))}
     </div>
     ${S.datePop ? datePopover(f) : ''}
@@ -2982,6 +2990,11 @@ const A = {
     await load(); watchRanking(out.queued);
     return out;
   }, rankQueuedMsg),
+  'recover-descriptions': () => busy('recoverDescriptions', async () => {
+    const out = await api('/api/jobs/recover-descriptions', { method: 'POST' });
+    await load();
+    return out;
+  }, recoverQueuedMsg),
   // tailor
   'pick-tailor': el => go('tailor', { tailorJob: Number(el.value) }),
   'tailor-tab': el => { S.tailorTab = el.dataset.id; S.editing = null; render(); },

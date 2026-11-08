@@ -23,7 +23,7 @@ beforeEach(() => {
       runInContext(readFileSync(`app/static/${file}`, 'utf8'), context, { filename: resolve(`app/static/${file}`) });
     }
     runInContext(appSource, context, { filename: resolve('app/static/app.js') });
-    ui = runInContext('({ S, D, A, renderTable, renderTriage, freshFilters, tableQuery, DEFAULT_FILTERS, FILTERS_KEY })', context);
+    ui = runInContext('({ S, D, A, renderTable, renderTriage, freshFilters, tableQuery, DEFAULT_FILTERS, FILTERS_KEY, recoverQueuedMsg })', context);
     runInContext('load = async () => {}; render = () => {};', context);
   }
   ui.S.checked = new Set(); ui.S.rankedIds = new Set(); ui.S.parsedIds = new Set(); ui.S.busy = {}; ui.S.selJob = null; ui.D.selDetail = null;
@@ -155,6 +155,27 @@ describe('Jobs · modern filter bar', () => {
     expect(root.querySelector('.selbar').textContent).toContain('1 selected');
     expect(root.querySelector('[data-act="rank-batch"]')).toBeNull();
     expect(root.querySelector('.selbar [data-act="bulk-delete"]').disabled).toBe(false);
+  });
+
+  it('offers to fetch every missing description only under the No description filter', () => {
+    ui.S.checked = new Set();
+    ui.S.filters.description = 'all';
+    expect(view().querySelector('[data-act="recover-descriptions"]')).toBeNull();
+    ui.S.filters.description = 'NO_DESCRIPTION';
+    const button = view().querySelector('[data-act="recover-descriptions"]');
+    expect(button.textContent).toContain('Fetch missing descriptions');
+    ui.S.checked = new Set([1]);
+    expect(view().querySelector('[data-act="recover-descriptions"]')).toBeNull();
+    ui.S.checked = new Set();
+    ui.S.filters.description = 'all';
+  });
+
+  it('says what the bulk fetch queued and what it left out', () => {
+    const none = { queued: 0, already_queued: 0, hidden_by_domain: 0, held_for_review: 0, set_aside: 0, no_url: 0, over_limit: 0 };
+    expect(ui.recoverQueuedMsg({ ...none, queued: 1 })).toBe('Queued 1 job to read from its posting');
+    expect(ui.recoverQueuedMsg({ ...none, queued: 29, hidden_by_domain: 77, already_queued: 2 }))
+      .toBe('Queued 29 jobs to read from their postings · 2 already queued · 77 hidden by your domain filter left out');
+    expect(ui.recoverQueuedMsg({ ...none, over_limit: 5 })).toBe('Nothing new to fetch · 5 more: click again once these finish');
   });
 
   it('labels older-than and between-dates ranges, and offers No posting date only for Posted', () => {
