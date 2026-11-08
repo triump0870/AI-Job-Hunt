@@ -1104,6 +1104,32 @@ def bulk_parse(payload: BulkIdsIn, request: Request, background: BackgroundTasks
     return {"queued": queued, "skipped": skipped}
 
 
+@router.post("/api/jobs/listing-check", status_code=202)
+def listing_check_start(background: BackgroundTasks, db: Session = Depends(get_user_db)):
+    """Queue a check of one batch of this account's postings. Returns at once; poll the status route below."""
+    from app.db import SessionLocal
+    from app.services import job_removal
+
+    if not get_settings().auto_delete_removed_jobs:
+        raise HTTPException(409, "Removed postings are kept on this server (AUTO_DELETE_REMOVED_JOBS=false)")
+    owner = db.info["user_id"]
+    if job_removal.manual_running(owner):
+        raise HTTPException(409, "A listing check is already running")
+    now = job_removal.utcnow()
+    due = job_removal.manual_due(db, owner, now)
+    if due:
+        background.add_task(job_removal.check_account, SessionLocal, owner, due, now)
+    return {"due": len(due), "since": now.isoformat()}
+
+
+@router.get("/api/jobs/listing-check/status")
+def listing_check_status(since: datetime, db: Session = Depends(get_user_db)):
+    from app.services import job_removal
+
+    owner = db.info["user_id"]
+    return {**job_removal.manual_progress(db, owner, since), "running": job_removal.manual_running(owner)}
+
+
 @router.get("/api/jobs/{job_id}")
 def job_detail(job_id: int, db: Session = Depends(get_user_db)):
     job = get_job(db, job_id)
@@ -1370,6 +1396,27 @@ def save_job_description(job_id: int, payload: JobDescriptionIn, request: Reques
     db.commit()
     run_soon(background, request.app, "ranking")
     return {"job": job_card(job), "ranking_queued": why is None, "ranking_skipped": why}
+
+
+class JobTitleIn(BaseModel):
+    title: str = Field(max_length=300)
+
+
+@router.put("/api/jobs/{job_id}/title")
+def save_job_title(job_id: int, payload: JobTitleIn, db: Session = Depends(get_user_db)):
+    """Correct a job's title by hand (boards can send a URL or a placeholder). It queues no ranking, so it costs no
+    model call, and it leaves dedupe_key alone: the posting's identity for duplicates and claims does not change."""
+    from app.services import job_description  # local import, as save_job_description does
+
+    job = job_description.lock_job(db, job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    title = " ".join(payload.title.split())
+    if not title or title.lower() in ranker.PLACEHOLDER_TITLES:
+        raise HTTPException(422, "Enter the job's title")
+    job.title = title
+    db.commit()
+    return {"job": job_card(job)}
 
 
 class CustomActorIn(BaseModel):

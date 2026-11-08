@@ -20,7 +20,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -126,16 +126,19 @@ CHECKED_STATES = ("DISCOVERED", "NORMALIZED", "FILTERED", "RANK_PENDING", "RANKE
                   "REVIEWED", "READY_TO_APPLY", "SKIPPED", "ARCHIVED")
 
 
-def due_jobs(db: Session, now: datetime, limit: int) -> list[tuple[int, int]]:
+def due_jobs(db: Session, now: datetime, limit: int, *, owner: int | None = None,
+             checked_before: datetime | None = None) -> list[tuple[int, int]]:
     """(job id, owner) of postings worth re-checking: a URL, up to approval (approved ones only get labelled), not
-    held by a worker, not checked recently."""
-    cutoff = now - timedelta(days=max(0, get_settings().listing_check_max_age_days))
+    held by a worker, not checked recently. `owner` and `checked_before` are for a check a person asked for."""
+    cutoff = checked_before or now - timedelta(days=max(0, get_settings().listing_check_max_age_days))
     tailoring = select(TailorTask.id).where(TailorTask.job_id == Job.id, TailorTask.status.in_(("queued", "running")))
-    return list(db.execute(
-        select(Job.id, Job.user_id).where(Job.user_id.is_not(None), Job.url != "", Job.state.in_(CHECKED_STATES),
-                                          Job.status != "applied", Job.lock_token.is_(None), ~tailoring.exists(),
-                                          or_(Job.listing_checked_at.is_(None), Job.listing_checked_at < cutoff))
-        .order_by(Job.listing_checked_at.asc().nulls_first(), Job.id).limit(max(1, limit))).all())
+    query = select(Job.id, Job.user_id).where(Job.user_id.is_not(None), Job.url != "", Job.state.in_(CHECKED_STATES),
+                                              Job.status != "applied", Job.lock_token.is_(None), ~tailoring.exists(),
+                                              or_(Job.listing_checked_at.is_(None), Job.listing_checked_at < cutoff))
+    if owner is not None:
+        query = query.where(Job.user_id == owner)
+    return list(db.execute(query.order_by(Job.listing_checked_at.asc().nulls_first(), Job.id)
+                           .limit(max(1, limit))).all())
 
 
 def closed_banner(result: Any) -> bool:
@@ -214,6 +217,11 @@ async def check_listings(sessions: Callable[[], Session], now: datetime, *, limi
                          concurrency: int | None = None, browser: Any = None) -> dict[str, Any]:
     with sessions() as db:
         due = due_jobs(db, now, limit or get_settings().listing_check_batch_size)
+    return await _check_due(sessions, due, now, concurrency=concurrency, browser=browser)
+
+
+async def _check_due(sessions: Callable[[], Session], due: list[tuple[int, int]], now: datetime, *,
+                     concurrency: int | None = None, browser: Any = None) -> dict[str, Any]:
     semaphore = asyncio.Semaphore(max(1, concurrency or get_settings().jd_fetch_max_concurrency))
 
     async def run(job_id: int, owner: int) -> str:
@@ -230,3 +238,52 @@ async def check_listings(sessions: Callable[[], Session], now: datetime, *, limi
         summary["browser_used"] += bool(used)
         summary[outcome] = summary.get(outcome, 0) + 1
     return summary
+
+
+# ───────────── a check a person asked for ─────────────
+
+# Pressing the button again soon after moves on to other postings instead of reading the same pages again.
+MANUAL_RECHECK_AFTER = timedelta(hours=1)
+# Accounts with a check running in this process. Only stops a double press: a second server process could overlap it,
+# which reads a page twice at worst (check_one finds a deleted job "missing").
+_manual_running: set[int] = set()
+
+
+def manual_due(db: Session, owner: int, now: datetime) -> list[tuple[int, int]]:
+    """One batch of this account's postings for a check it asked for, least recently checked first."""
+    return due_jobs(db, now, get_settings().listing_check_batch_size, owner=owner,
+                    checked_before=now - MANUAL_RECHECK_AFTER)
+
+
+def manual_running(owner: int) -> bool:
+    return owner in _manual_running
+
+
+def manual_progress(db: Session, owner: int, since: datetime) -> dict[str, int]:
+    """What has been read since a check started, from the rows the check writes. A scheduled pass running at the same
+    time counts too: these are the account's postings read and removed since then."""
+    still_listed = db.scalar(select(func.count(Job.id)).where(Job.user_id == owner,
+                                                              Job.listing_checked_at >= since)) or 0
+    removed = db.scalar(select(func.count(RemovedPosting.id)).where(RemovedPosting.user_id == owner,
+                                                                    RemovedPosting.removed_at >= since)) or 0
+    return {"checked": still_listed + removed, "removed": removed}
+
+
+async def check_account(sessions: Callable[[], Session], owner: int, due: list[tuple[int, int]],
+                        now: datetime) -> None:
+    """Run after the response of the request that asked for it: the request itself never reads a posting."""
+    from app.infrastructure.browser import get_browser_service
+
+    if owner in _manual_running:
+        return
+    _manual_running.add(owner)
+    browser = get_browser_service()
+    try:
+        summary = await _check_due(sessions, due, now, browser=browser)
+        system_log.log_event(category="WORKFLOW", level="INFO", operation="listing_check_manual", workflow="DISCOVERY",
+                             user_id=owner, status="succeeded", details=summary,
+                             message=f"Listing check you asked for read {summary['checked']} postings and deleted "
+                                     f"{summary.get('deleted', 0)}")
+    finally:
+        _manual_running.discard(owner)
+        await browser.release_idle()

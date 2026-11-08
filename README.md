@@ -3409,6 +3409,10 @@ model. A page that still shows the description but carries a closed banner ("No 
 as closed. Each deletion is a Monitoring → Logs line (`posting_removed`) with the title, company and URL; each run's
 counts (deleted, kept, live, unknown, browser_used) are in Monitoring → Scheduler.
 
+**Check listings** on the Discovery table runs the same check for your own account right away: one batch
+(`LISTING_CHECK_BATCH_SIZE`), least recently checked first, skipping postings read in the last hour. It runs in the
+background after the request answers, and the same rules decide what is deleted.
+
 ```env
 AUTO_DELETE_REMOVED_JOBS=true
 LISTING_CHECK_INTERVAL_MINUTES=240     # 0 disables the job

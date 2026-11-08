@@ -444,6 +444,37 @@ def test_a_deleted_posting_is_not_imported_again(user, server):
     assert again["created"] == 0 and again["previously_removed"] == 1
 
 
+def test_check_listings_button_reads_this_accounts_postings_and_deletes_the_gone(user, server, client):
+    gone, live = add(user, "Backend Engineer", url=server.url("gone")), add(user, "AI Engineer",
+                                                                            url=server.url("posting.html"))
+    other = make_user(SessionLocal)
+    theirs = add(other, "Backend Engineer", url=server.url("gone"))
+    started = client.post("/api/jobs/listing-check")
+    assert started.status_code == 202 and started.json()["due"] == 2
+    assert job_of(gone) is None and job_of(live).listing_checked_at is not None
+    with SessionLocal() as db:
+        db.info["user_id"] = other
+        assert db.get(Job, theirs).listing_checked_at is None, "another account's postings are not touched"
+    status = client.get("/api/jobs/listing-check/status", params={"since": started.json()["since"]}).json()
+    assert status == {"checked": 2, "removed": 1, "running": False}
+
+
+def test_check_listings_moves_on_from_postings_it_just_read(user, server, client):
+    add(user, "AI Engineer", url=server.url("posting.html"))
+    assert client.post("/api/jobs/listing-check").json()["due"] == 1
+    assert client.post("/api/jobs/listing-check").json()["due"] == 0
+
+
+def test_check_listings_refuses_a_double_press_and_a_server_that_keeps_removed_postings(user, client, monkeypatch):
+    job_removal._manual_running.add(user)
+    try:
+        assert client.post("/api/jobs/listing-check").status_code == 409
+    finally:
+        job_removal._manual_running.discard(user)
+    monkeypatch.setattr(get_settings(), "auto_delete_removed_jobs", False)
+    assert client.post("/api/jobs/listing-check").status_code == 409
+
+
 def test_the_scheduled_listing_check_is_bounded(user, server, monkeypatch):
     monkeypatch.setattr(get_settings(), "listing_check_batch_size", 2)
     for _ in range(3):
