@@ -102,11 +102,14 @@ class BrowserService(ABC):
 
     @abstractmethod
     async def fetch_rendered_page(self, url: str, *, wait_for: Sequence[str] = (),
-                                  metadata: dict[str, Any] | None = None) -> RenderedPage:
+                                  metadata: dict[str, Any] | None = None, visible: bool = False) -> RenderedPage:
         """Load `url` in an isolated page and return its rendered HTML.
 
         Navigation waits for DOMContentLoaded, then for any `wait_for` selector and for the page text to settle —
         bounded waits, never `networkidle`. Raises BrowserUnavailable or NavigationFailed.
+
+        `visible` renders in a window of its own, closed with the page: one at a time, spaced apart. Only JD recovery
+        asks for it, for the hosts in PLAYWRIGHT_VISIBLE_HOSTS.
         """
 
     async def release_idle(self) -> None:

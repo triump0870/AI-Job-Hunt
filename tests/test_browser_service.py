@@ -4,6 +4,7 @@ recovery, bounded navigation, failure classification, concurrency limits and cle
 Lifecycle tests drive a fake Playwright runtime (tests/jd_support.py). The last tests start real headless Chromium
 against a local page and are skipped when Chromium is not installed (`python -m playwright install chromium`)."""
 import asyncio
+import time
 
 import pytest
 
@@ -176,6 +177,65 @@ def test_headless_is_the_default_and_can_be_turned_off_for_debugging(runtime, mo
     headed.record_telemetry = False
     run(headed.fetch_rendered_page(URL))
     assert runtime.launches[-1]["headless"] is False and headed.diagnostics()["headless"] is False
+
+
+def test_a_visible_page_gets_its_own_window_closed_with_the_page(runtime):
+    browser = service()
+    page = run(browser.fetch_rendered_page(URL, visible=True))
+    assert page.status == 200 and runtime.launches == [{"headless": False}]
+    assert runtime.closed_browsers == 1 and runtime.stopped == 1 and runtime.contexts[0].closed
+    assert runtime.contexts[0].pages[0].closed and browser.diagnostics()["running"] is False
+
+
+def test_visible_pages_leave_the_shared_browser_headless(runtime):
+    browser = service()
+
+    async def go():
+        await browser.fetch_rendered_page(URL)
+        await browser.fetch_rendered_page(URL, visible=True)
+        await browser.fetch_rendered_page(URL)
+        running = browser.diagnostics()["running"]
+        await browser.stop()
+        return running
+
+    assert run(go()) is True
+    assert runtime.launches == [{"headless": True}, {"headless": False}], "the shared browser was reused, not replaced"
+
+
+def test_visible_pages_open_one_at_a_time_and_spaced_apart(runtime):
+    runtime.delay = 0.01
+    browser = service(max_concurrency=5, visible_min_interval_seconds=0.1)
+
+    async def go():
+        clock = time.monotonic()
+        await asyncio.gather(*(browser.fetch_rendered_page(URL, visible=True) for _ in range(3)))
+        return time.monotonic() - clock
+
+    assert run(go()) >= 0.2 and runtime.peak == 1
+
+
+def test_visible_spacing_counts_a_failed_page_too(runtime):
+    browser = service(visible_min_interval_seconds=0.1)
+    runtime.goto_error = RuntimeError("net::ERR_CONNECTION_RESET")
+
+    async def go():
+        with pytest.raises(NavigationFailed):
+            await browser.fetch_rendered_page(URL, visible=True)
+        runtime.goto_error = None
+        clock = time.monotonic()
+        await browser.fetch_rendered_page(URL, visible=True)
+        return time.monotonic() - clock
+
+    assert run(go()) >= 0.05 and runtime.closed_browsers == 2
+
+
+def test_a_machine_without_a_display_reports_the_visible_browser_unavailable(monkeypatch):
+    fake = FakeRuntime(launch_error=RuntimeError("Missing X server or $DISPLAY"))
+    monkeypatch.setattr("playwright.async_api.async_playwright", fake)
+    monkeypatch.setattr("app.services.url_safety.check_public_url", lambda url, allow_private=False: None)
+    with pytest.raises(BrowserUnavailable) as failure:
+        run(service().fetch_rendered_page(URL, visible=True))
+    assert failure.value.code == BROWSER_START_FAILED and fake.stopped == 1
 
 
 def test_compatibility_defaults_and_diagnostics(runtime):

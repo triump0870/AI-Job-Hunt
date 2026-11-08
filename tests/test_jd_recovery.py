@@ -466,6 +466,104 @@ def test_access_denied_by_http_and_rendered_page_is_blocked(owner, server):
     assert task.diagnostics["attempt_1"]["playwright"]["kind"] == "blocked"
 
 
+# ───────────── hosts read in a visible window (PLAYWRIGHT_VISIBLE_HOSTS) ─────────────
+
+SHELL = "<html><body><div id='root'></div></body></html>"  # what such a site answers plain HTTP with
+
+
+@pytest.fixture
+def visible_host(monkeypatch):
+    monkeypatch.setattr(get_settings(), "playwright_visible_hosts", " Example.org, 127.0.0.1 ")
+
+
+def shell_job(owner: int, server: PostingServer, key: str = "shell") -> int:
+    server.routes[key] = (200, SHELL, {})
+    return new_job(owner, server.url(f"custom/{key}"))
+
+
+def cooldown(owner: int) -> ProviderCooldown | None:
+    with SessionLocal() as db:
+        return db.scalar(select(ProviderCooldown).where(ProviderCooldown.user_id == owner,
+                                                        ProviderCooldown.provider == "WEB:127.0.0.1"))
+
+
+@pytest.mark.parametrize("url,expected", [
+    ("https://www.example.org/job/1", "example.org"), ("https://example.org/job/1", "example.org"),
+    ("http://127.0.0.1:9/x", "127.0.0.1"), ("https://notexample.org/job", None), ("https://example.com/job", None),
+    ("", None), (None, None)])
+def test_only_listed_hosts_and_their_subdomains_are_visible(visible_host, url, expected):
+    assert jd_recovery._visible_host(url) == expected
+
+
+def test_a_site_not_listed_stays_headless(owner, server):
+    browser = FakeBrowser({"shell": (200, page("posting"))})
+    assert run_recovery(browser) == [] and shell_job(owner, server)
+    assert run_recovery(browser) == ["recovered"]
+    assert browser.visible_calls == [False]
+
+
+def test_a_listed_site_is_read_in_a_visible_window_after_http(owner, server, visible_host):
+    browser = FakeBrowser({"shell": (200, page("posting"))})
+    job_id = shell_job(owner, server)
+    assert run_recovery(browser) == ["recovered"]
+    task = task_of(job_id)
+    assert browser.visible_calls == [True] and server.hits, "HTTP is still tried first"
+    assert task.fetch_method == "PLAYWRIGHT" and task.diagnostics["attempt_1"]["playwright"]["visible"] is True
+    assert cooldown(owner) is None
+
+
+@pytest.mark.parametrize("rendered,code", [
+    ((403, "<title>Access Denied</title><h1>Access denied</h1>"), "ACCESS_DENIED"),
+    ((200, page("captcha")), "CAPTCHA_OR_ANTI_BOT")])
+def test_a_refusal_in_the_window_stays_blocked_and_pauses_the_host(owner, server, visible_host, rendered, code):
+    browser = FakeBrowser({"shell": rendered})
+    job_id = shell_job(owner, server)
+    assert run_recovery(browser) == ["blocked"]
+    task = task_of(job_id)
+    assert (task.status, task.result_code) == ("BLOCKED", code) and len(browser.calls) == 1, "never tried again"
+    rest = cooldown(owner)
+    assert timedelta(minutes=59) < rest.until - jd_recovery.utcnow() <= timedelta(hours=1)
+
+
+def test_a_paused_host_is_left_alone_and_the_task_keeps_its_attempt(owner, server, visible_host):
+    backoff.record_limit(owner, "WEB:127.0.0.1", policy=jd_recovery.VISIBLE_REST)
+    browser = FakeBrowser({"shell": (200, page("posting"))})
+    job_id = shell_job(owner, server)
+    assert run_recovery(browser) == ["retrying"]
+    task = task_of(job_id)
+    assert browser.calls == [] and server.hits == [], "neither the browser nor HTTP touched the site"
+    assert task.status == "PENDING" and task.attempt_count == 0 and task.result_code == "RATE_LIMITED"
+    assert task.next_attempt_at > jd_recovery.utcnow() + timedelta(minutes=59)
+
+
+def test_a_pause_on_one_host_does_not_hold_another(owner, server):
+    backoff.record_limit(owner, "WEB:EXAMPLE.ORG", policy=jd_recovery.VISIBLE_REST)
+    browser = FakeBrowser({"shell": (200, page("posting"))})
+    shell_job(owner, server)
+    assert run_recovery(browser) == ["recovered"]
+
+
+def test_a_person_asking_to_run_now_goes_ahead_during_the_pause(owner, server, visible_host):
+    backoff.record_limit(owner, "WEB:127.0.0.1", policy=jd_recovery.VISIBLE_REST)
+    browser = FakeBrowser({"shell": (200, page("posting"))})
+    job_id = shell_job(owner, server)
+    with SessionLocal() as db:
+        db.get(JobDescriptionFetchTask, task_of(job_id).id).run_now_at = jd_recovery.utcnow()
+        db.commit()
+    assert run_recovery(browser) == ["recovered"]
+    assert browser.visible_calls == [True] and cooldown(owner) is None
+
+
+def test_the_daily_listing_check_never_opens_a_window(owner, server, visible_host):
+    from app.services import job_removal
+
+    server.routes["shell"] = (200, SHELL, {})
+    browser = FakeBrowser({"shell": (200, page("posting"))})
+    snapshot = jd_recovery.Snapshot(1, owner, server.url("custom/shell"), TITLE, "Northwind", 1)
+    asyncio.run(job_removal.read_posting(snapshot, browser))
+    assert browser.visible_calls == [False]
+
+
 @pytest.mark.parametrize("path,code", [("gone", "JOB_REMOVED"), ("expired", "JOB_REMOVED"),
                                        ("closed.html", "JOB_CLOSED")])
 def test_removed_and_closed_postings_are_deleted_and_not_imported_again(owner, server, path, code):

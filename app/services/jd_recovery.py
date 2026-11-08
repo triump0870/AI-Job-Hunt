@@ -96,6 +96,10 @@ CATEGORY_OF = {"NETWORK_ERROR": ErrorCategory.TRANSIENT, "TIMEOUT": ErrorCategor
                "SSL_ERROR": ErrorCategory.EXTERNAL_SERVICE, "REDIRECT_LOOP": ErrorCategory.EXTERNAL_SERVICE,
                jd_quality.ERROR_PAGE: ErrorCategory.EXTERNAL_SERVICE, jd_quality.UNRELATED_PAGE: ErrorCategory.VALIDATION,
                "LEASE_EXPIRED": ErrorCategory.LEASE_EXPIRED}
+# A refusal from a host read in a visible window (PLAYWRIGHT_VISIBLE_HOSTS) pauses that host for a fixed hour. These
+# visits share the person's address with their own use of the site, so it is left alone rather than asked again.
+VISIBLE_REFUSALS = frozenset({jd_quality.ACCESS_DENIED, jd_quality.CAPTCHA_OR_ANTI_BOT, "RATE_LIMITED"})
+VISIBLE_REST = backoff.RateLimitPolicy(base_seconds=3600, multiplier=1.0, max_seconds=3600)
 
 
 def utcnow() -> datetime:
@@ -371,8 +375,9 @@ class Snapshot:
 
 @dataclass
 class Outcome:
-    status: str  # COMPLETED | FAILED | BLOCKED | SKIPPED | RETRY
+    status: str  # COMPLETED | FAILED | BLOCKED | SKIPPED | RETRY | HOLD
     code: str
+    held_seconds: int = 0  # HOLD: nothing was fetched, so the attempt is given back and the task waits this long
     text: str = ""
     method: str | None = None
     final_url: str | None = None
@@ -500,7 +505,21 @@ def _http_stage(snapshot: Snapshot) -> PageResult:
                       redirects=redirects, extractor=jd_extractors.extractor_for(current))
 
 
-async def _browser_stage(snapshot: Snapshot, browser: Any, start_url: str) -> PageResult:
+def _visible_host(url: str | None) -> str | None:
+    """The PLAYWRIGHT_VISIBLE_HOSTS entry this URL belongs to (the host or a subdomain of it), if any."""
+    host = (urlparse(url or "").hostname or "").lower()
+    for entry in get_settings().playwright_visible_hosts.split(","):
+        entry = entry.strip().lower()
+        if entry and host and (host == entry or host.endswith(f".{entry}")):
+            return entry
+    return None
+
+
+def _visible_provider(host: str) -> str:
+    return f"WEB:{host}"  # a cooldown of its own: other sites and external calls are not held up
+
+
+async def _browser_stage(snapshot: Snapshot, browser: Any, start_url: str, *, visible: bool = False) -> PageResult:
     from app.infrastructure.browser.service import (
         BLOCKED_URL,
         REDIRECT_LOOP,
@@ -514,7 +533,7 @@ async def _browser_stage(snapshot: Snapshot, browser: Any, start_url: str) -> Pa
     try:
         with tracing.trace(job_id=snapshot.job_id, user_id=snapshot.user_id):
             page = await browser.fetch_rendered_page(start_url, wait_for=extractor.selectors, metadata={
-                "worker": WORKER, "extractor": extractor.name, "attempt": snapshot.attempt})
+                "worker": WORKER, "extractor": extractor.name, "attempt": snapshot.attempt}, visible=visible)
     except BrowserUnavailable as exc:
         return PageResult("unavailable", "PLAYWRIGHT_UNAVAILABLE", detail=f"{exc.code}: {exc}")
     except NavigationFailed as exc:
@@ -619,6 +638,16 @@ async def recover(sessions: Callable[[], Session], snapshot: Snapshot, *, browse
         outcome.status, outcome.code, outcome.detail = SKIPPED, "INVALID_URL", str(exc)
         return outcome
 
+    visible_host = _visible_host(snapshot.url) if snapshot.use_browser else None
+    if visible_host and not backoff.bypassing():  # a person's Run now goes ahead; a new refusal pauses the host again
+        until = await asyncio.to_thread(backoff.cooling_until, snapshot.user_id, _visible_provider(visible_host))
+        if until is not None:
+            outcome.status, outcome.code = "HOLD", "RATE_LIMITED"
+            outcome.held_seconds = max(1, round((until - utcnow()).total_seconds()))
+            outcome.detail = f"{visible_host} refused a recent visit, so visits are paused until {until:%H:%M} UTC"
+            outcome.diagnostics["playwright"] = {"attempted": False, "kind": "skipped", "reason": outcome.detail}
+            return outcome
+
     http = await asyncio.to_thread(_http_stage, snapshot)
     outcome.diagnostics["http"] = _stage_note(http)
     outcome.final_url, outcome.http_status, outcome.redirect_count = http.final_url, http.status, http.redirect_count
@@ -646,8 +675,16 @@ async def recover(sessions: Callable[[], Session], snapshot: Snapshot, *, browse
                                                             if browser is not None else "no browser service")}
         else:
             outcome.playwright_used = True
-            rendered = await _browser_stage(snapshot, browser, http.final_url or snapshot.url)
+            rendered = await _browser_stage(snapshot, browser, http.final_url or snapshot.url,
+                                            visible=visible_host is not None)
             outcome.diagnostics["playwright"] = {"attempted": True, **_stage_note(rendered)}
+            if visible_host:
+                outcome.diagnostics["playwright"]["visible"] = True
+                if rendered.code in VISIBLE_REFUSALS:
+                    await asyncio.to_thread(backoff.record_limit, snapshot.user_id, _visible_provider(visible_host),
+                                            policy=VISIBLE_REST)
+                elif rendered.kind == "found":
+                    await asyncio.to_thread(backoff.note_success, snapshot.user_id, _visible_provider(visible_host))
             if rendered.kind == "found":
                 return _done(snapshot, rendered, PLAYWRIGHT, outcome)
             if rendered.kind in ("removed", "blocked", "permanent"):
@@ -748,6 +785,10 @@ def _settle(sessions: Callable[[], Session], claim_: FetchClaim, snapshot: Snaps
                 label = "skipped"
             else:
                 label = apply_recovered(db, job, task, outcome, now)
+        elif outcome.status == "HOLD":  # nothing was fetched: the attempt is given back and the task waits
+            task.attempt_count = max(0, task.attempt_count - 1)
+            _release(task, now, outcome.code, retry_in=outcome.held_seconds, detail=outcome.detail)
+            label = "retrying"
         elif outcome.status == "RETRY" and task.attempt_count < (own := worker_settings.for_user(
                 db, task.user_id, "recovery"))["max_attempts"]:
             _release(task, now, outcome.code, detail=message_for(outcome.code), retry_seconds=own["retry_seconds"])

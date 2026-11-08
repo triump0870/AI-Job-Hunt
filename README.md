@@ -3264,6 +3264,27 @@ PLAYWRIGHT_HEADLESS=false PLAYWRIGHT_MAX_CONCURRENCY=1 uvicorn app.main:app --re
 A Chromium window opens for each page the recovery worker renders, which is the quickest way to see why a site's
 container is not found. The Docker image only has the headless shell, so headed mode is for local runs.
 
+### Sites that refuse the headless browser
+
+Some boards answer a headless browser with `403 Access Denied` but serve the same public page to an ordinary window.
+Naukri does this: its postings end `BLOCKED` with "The site refused access". On a local install you can have recovery
+read those hosts in a visible window:
+
+```bash
+PLAYWRIGHT_VISIBLE_HOSTS=naukri.com
+PLAYWRIGHT_VISIBLE_MIN_INTERVAL_SECONDS=10
+```
+
+A plain Chromium window, with no sign-in or profile of yours, opens for each posting and closes when it has been read.
+Windows open one at a time and may take focus while the queue runs. Other sites and the daily listing check stay
+headless. Jobs already `BLOCKED` are not retried by themselves: use Retry in Running workers.
+
+It is off by default because it is your decision: it reads a site that refuses automated browsers, from your own
+address, so check the site's terms first. If the site refuses a visit or shows a challenge, that job stays `BLOCKED` and
+the host is paused for an hour (Monitoring lists the `WEB:<host>` cooldown). Queued jobs wait without using an attempt.
+Nothing tries to get past the refusal; paste the description by hand. The Docker image has no display, so there the
+page is reported as browser unavailable.
+
 Set `PLAYWRIGHT_DEBUG_ARTIFACTS=true` to keep failure-only screenshots and limited metadata under
 `data/playwright-debug/`. At most 20 screenshot/metadata pairs are retained; delete that directory when diagnosis is
 complete. Rendered HTML is deliberately not persisted because job pages can contain personal or sensitive data.
