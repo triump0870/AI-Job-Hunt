@@ -1167,6 +1167,7 @@ def _submit_browser_use(ctx: ApplicationContext, state: ApplicationState, job: A
     validate again, CLICKING, one signed click on the form's own submit control, the site's confirmation. An unknown
     outcome keeps the window open for the person."""
     from app.infrastructure.application_browser.browser_use_sidecar import (
+        REFUSED_BEFORE_CLICK,
         SidecarRefused,
         get_sidecars,
     )
@@ -1272,18 +1273,19 @@ def _submit_browser_use(ctx: ApplicationContext, state: ApplicationState, job: A
         token = submission.signed_submit(session, again["submit_key"], again["host"])
         try:
             ctx.run_async(session.call("submit", key=again["submit_key"], token=token))
-        except SidecarRefused as exc:  # refused by the runner before its click: nothing was sent
-            with _session(ctx) as db:
-                task, job_row = _load(db, state)
-                effects.held(db, ctx.run)
-                submission.abort(db, db.get(submission.SubmissionIntent, intent_id), job_row,
-                                 f"Refused before the click: {exc.code}", refused_at_click=True)
-                task, _ = _load(db, state)
-                service.set_stage(task, "BLOCKED")
-                task.result_code = exc.code
-                db.commit()
-            return _end(SUBMIT, BLOCKED, exc.code)
-        except Exception as exc:  # noqa: BLE001  the click may have happened: the outcome is unknown
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, SidecarRefused) and exc.code in REFUSED_BEFORE_CLICK:  # nothing was sent
+                with _session(ctx) as db:
+                    task, job_row = _load(db, state)
+                    effects.held(db, ctx.run)
+                    submission.abort(db, db.get(submission.SubmissionIntent, intent_id), job_row,
+                                     f"Refused before the click: {exc.code}", refused_at_click=True)
+                    task, _ = _load(db, state)
+                    service.set_stage(task, "BLOCKED")
+                    task.result_code = exc.code
+                    db.commit()
+                return _end(SUBMIT, BLOCKED, exc.code)
+            # Anything else, a refusal with another code too: the click may have happened, the outcome is unknown.
             keep = _park_or_close(ctx, session, FIELDS_NEED_YOU)
             with _session(ctx) as db:
                 task, _ = _load(db, state)

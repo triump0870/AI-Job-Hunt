@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -813,6 +814,8 @@ class _RedirectSite:
 
     def respond(self, path: str) -> tuple[int, str, dict[str, str]]:
         page = "<html><head><title>t</title></head><body><h1>The form</h1>{}</body></html>"
+        if path == "/post-slow":
+            time.sleep(2.5)  # longer than browser-use's own click waits (1.5 s)
         return {
             "/go-off": (302, "", {"Location": f"{self.off}/landed"}),
             "/go-on": (302, "", {"Location": f"{self.on}/landed"}),
@@ -825,6 +828,8 @@ class _RedirectSite:
             "/popup": (200, page.format("<script>window.open('/go-popup')</script>"), {}),
             "/form": (200, page.format("<form method='post' action='/post-off'><input name='a'>"
                                        "<button type='submit'>Submit application</button></form>"), {}),
+            "/slow-form": (200, page.format("<form method='post' action='/post-slow'><input name='a'>"
+                                            "<button type='submit'>Submit application</button></form>"), {}),
         }.get(path, (200, page.format("<p>Landed</p>"), {}))
 
     def reached(self, host: str = "localhost") -> list[tuple[str, str]]:
@@ -926,6 +931,7 @@ def test_a_signed_submit_is_not_sent_again_to_where_a_307_points(runner, tmp_pat
     """A 307 repeats the POST and its body: with the form's answers in it, off the application's host. The evidence
     keeps what the site answered and shows no confirmation, so the outcome stays for a person to reconcile."""
     from app.services import application_execution
+    from app.services.submission import ConfirmationVerifier
 
     with _RedirectSite() as site, application_execution.background_loop() as loop:
         run = application_execution.loop_runner(loop, timeout=90)
@@ -938,8 +944,30 @@ def test_a_signed_submit_is_not_sent_again_to_where_a_307_points(runner, tmp_pat
             assert site.reached("127.0.0.1").count(("POST", "/post-off")) == 1 and site.reached() == []
             evidence = run(session.call("evidence"))
             assert [(r["method"], r["status"]) for r in evidence["responses"]] == [("POST", 307)]
+            assert not ConfirmationVerifier.verify("", "127.0.0.1", evidence).confirmed
         finally:
             run(bus.get_sidecars().close(1, 74))
+
+
+def test_a_site_slow_to_answer_the_signed_submit_is_not_a_failed_click(runner, tmp_path):
+    """browser-use's own click gives up on the navigation after 1.5 s and clicks again by script, then raises. The form
+    was sent all the same: `submit` answers, once, and the site's answer is the evidence."""
+    from app.services import application_execution
+
+    with _RedirectSite() as site, application_execution.background_loop() as loop:
+        run = application_execution.loop_runner(loop, timeout=90)
+        session = _redirect_session(run, tmp_path, 75)
+        try:
+            run(session.call("goto", url=f"{site.on}/slow-form"))
+            button = _element(run(session.call("observe")), "Submit application")
+            token = bus.sign_action(session, "SUBMIT", button["key"], "127.0.0.1")
+            clicked = run(session.call("submit", key=button["key"], token=token))
+            assert clicked["clicked"] and clicked["click_error"] is None
+            assert site.reached("127.0.0.1").count(("POST", "/post-slow")) == 1
+            evidence = run(session.call("evidence"))
+            assert [(r["method"], r["status"]) for r in evidence["responses"]] == [("POST", 200)]
+        finally:
+            run(bus.get_sidecars().close(1, 75))
 
 
 @pytest.fixture
@@ -989,6 +1017,162 @@ def test_the_runners_hop_check_refuses_internal_addresses(runner_module):
         blocked = asyncio.run(go(site))
         assert blocked == 2 and site.reached() == []
         assert ("GET", "/go-off") in site.reached("127.0.0.1") and ("GET", "/go-frame") in site.reached("127.0.0.1")
+
+
+class _Control:
+    """The form's submit control and its page: records every click, and raises what the case asks of it."""
+
+    def __init__(self, *, trial_fails=False, click_fails=False, load_fails=False, url="https://site.example/form"):
+        self.calls: list[str] = []
+        self.trial_fails, self.click_fails, self.load_fails, self.url = trial_fails, click_fails, load_fails, url
+
+    async def click(self, *, trial=False, timeout=None):
+        self.calls.append("trial" if trial else "click")
+        if self.trial_fails and trial:
+            raise RuntimeError("covered")
+        if self.click_fails and not trial:
+            raise RuntimeError("timed out waiting for the navigation the click started")
+
+    async def evaluate(self, script):
+        self.calls.append(script)
+        return True
+
+    async def wait_for_load_state(self, state, timeout=None):
+        if self.load_fails:
+            raise RuntimeError("never loaded")
+
+
+def _signed(runner_module, control, kind="SUBMIT"):
+    instance = runner_module.Runner()
+    instance.elements = {"k": {"key": "k", "submit_like": True, "node": None}}
+    instance._verify = lambda *args: None
+
+    async def same(*args):
+        return control
+
+    instance._page, instance._handle = same, same
+    return instance, instance._signed_click({"key": "k", "token": "t"}, kind)
+
+
+@pytest.mark.parametrize("case,calls,error", [
+    ({}, ["trial", "click"], None),
+    ({"load_fails": True}, ["trial", "click"], None),  # a page that never fires `load`: browser-use clicks again here
+    ({"click_fails": True}, ["trial", "click"], "RuntimeError"),  # it may have happened, so it is not made again
+    ({"trial_fails": True}, ["trial", "CLICK_JS"], None),  # covered by a banner: by script, once
+])
+def test_a_signed_click_is_one_click_whatever_happens_after_it(runner_module, case, calls, error):
+    control = _Control(**case)
+    instance, signed = _signed(runner_module, control)
+    result = asyncio.run(signed)
+    assert control.calls == [runner_module.CLICK_JS if c == "CLICK_JS" else c for c in calls]
+    assert (result["clicked"], result["click_error"]) == (error is None, error)
+    assert instance.armed is None
+
+
+@pytest.mark.parametrize("case", [{"click_fails": True}, {"url": "chrome-error://chromewebdata/"}])
+def test_a_login_that_went_nowhere_is_refused_and_not_clicked_again(runner_module, case):
+    control = _Control(**case)
+    instance, signed = _signed(runner_module, control, "LOGIN")
+    with pytest.raises(runner_module.Refused) as refused:
+        asyncio.run(signed)
+    assert refused.value.code == "LOGIN_NOT_SENT"
+    assert control.calls == [runner_module.LOGIN_FORM_JS, "trial", "click"] and instance.armed is None
+
+
+def test_only_what_the_runner_refuses_before_its_click_can_release_a_claim():
+    source = RUNNER.read_text()
+    signed = source[source.index("    async def _signed_click("):source.index("    async def submit(")]
+    before_click, after_click = signed.split("self.armed = (kind", 1)
+    refusals = re.findall(r'Refused\("(\w+)"', source)
+    assert bus.REFUSED_BEFORE_CLICK <= set(refusals), "a code the runner no longer sends proves nothing"
+    assert "BROWSER_ERROR" not in bus.REFUSED_BEFORE_CLICK  # also what a click that raised used to answer
+    assert re.findall(r'Refused\("(\w+)"', after_click) == ["LOGIN_NOT_SENT"]  # never `submit`'s: it is under LOGIN
+    assert not set(re.findall(r'Refused\("(\w+)"', after_click)) & bus.REFUSED_BEFORE_CLICK
+    assert {"BAD_TOKEN", "NOT_A_SUBMIT"} <= bus.REFUSED_BEFORE_CLICK and "self._verify(" in before_click
+
+
+def _settled(sessions, task, job_id):
+    from app.models import ApplicationClaim, Job, SubmissionIntent
+
+    with sessions() as db:
+        intent = db.scalar(select(SubmissionIntent).where(SubmissionIntent.execution_task_id == task.id))
+        claim = db.get(ApplicationClaim, intent.claim_id)
+        return intent.status, claim.status, db.get(Job, job_id).status
+
+
+def _guarded_run_through_the_click(sessions, pg_engine, monkeypatch, tmp_path, answer="confirm"):
+    _auto_submit(monkeypatch, tmp_path)
+    checkpoint.forget_setup()
+    qs.clear_checkpoints(pg_engine)
+    with gs.FakeATS(answer) as ats:
+        user = aps.owner(sessions)
+        aps.answer(sessions, user, aps.PYTHON_QUESTION, "8")
+        gs.consent(sessions, user)
+        job_id = aps.approved_job(sessions, user, ats.url("dynamic_form"))
+        asyncio.run(aps.drive_async(sessions, passes=6))
+        asyncio.run(aps.drive_async(sessions, passes=3))  # nothing may click again later
+        return job_id, list(ats.submits), [p for _, p in ats.requests]
+
+
+def test_a_signed_submit_answered_by_a_307_off_the_site_stays_for_a_person(runner, pg_sessions, pg_engine, monkeypatch,
+                                                                           tmp_path):
+    sessions = qs.app_sessions(pg_engine)
+    job_id, submits, paths = _guarded_run_through_the_click(sessions, pg_engine, monkeypatch, tmp_path, "off_site")
+    task = aps.task_of(sessions, job_id)
+    assert submits == ["/apply/submit"] and "/elsewhere" not in paths
+    assert task.outcome == "SUBMISSION_UNCERTAIN", (task.result_code, task.last_error)
+    assert _settled(sessions, task, job_id)[:2] == ("UNCERTAIN", "UNCERTAIN")
+
+
+class _SubmitFails(bus.SidecarManager):
+    """The real runner, whose `submit` then answers with `code`; after really clicking, or (`clicks` false) without."""
+
+    def __init__(self, code: str, *, clicks: bool):
+        super().__init__()
+        self.code, self.clicks = code, clicks
+
+    async def start(self, **kwargs):
+        session = await super().start(**kwargs)
+        real = session.call
+
+        async def call(cmd, **args):
+            if cmd != "submit":
+                return await real(cmd, **args)
+            if self.clicks:
+                await real(cmd, **args)
+            raise bus.SidecarRefused(self.code, "URLNotAllowedError")
+
+        session.call = call
+        return session
+
+
+def test_an_error_from_the_signed_click_keeps_the_claim_and_is_never_retried(runner, pg_sessions, pg_engine, monkeypatch,
+                                                                             tmp_path):
+    """The runner's generic error, as a click that raised after sending the form used to answer. It is not a refusal:
+    the claim stays, so nothing can send the application a second time."""
+    sessions = qs.app_sessions(pg_engine)
+    bus.set_sidecars(_SubmitFails("BROWSER_ERROR", clicks=True))
+    try:
+        job_id, submits, _ = _guarded_run_through_the_click(sessions, pg_engine, monkeypatch, tmp_path)
+    finally:
+        bus.set_sidecars(None)
+    task = aps.task_of(sessions, job_id)
+    assert submits == ["/apply/submit"]
+    assert task.outcome == "SUBMISSION_UNCERTAIN", (task.result_code, task.last_error)
+    assert _settled(sessions, task, job_id)[:2] == ("UNCERTAIN", "UNCERTAIN")
+
+
+def test_a_refusal_before_the_click_releases_the_claim(runner, pg_sessions, pg_engine, monkeypatch, tmp_path):
+    sessions = qs.app_sessions(pg_engine)
+    bus.set_sidecars(_SubmitFails("BAD_TOKEN", clicks=False))
+    try:
+        job_id, submits, _ = _guarded_run_through_the_click(sessions, pg_engine, monkeypatch, tmp_path)
+    finally:
+        bus.set_sidecars(None)
+    task = aps.task_of(sessions, job_id)
+    assert submits == [] and (task.stage, task.result_code) == ("BLOCKED", "BAD_TOKEN")
+    assert _settled(sessions, task, job_id)[0] == "ABORTED"
+    assert _settled(sessions, task, job_id)[1] != "UNCERTAIN"
 
 
 def test_a_hop_that_cannot_be_judged_is_not_sent(runner_module):

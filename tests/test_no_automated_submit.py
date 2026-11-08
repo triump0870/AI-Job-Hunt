@@ -142,7 +142,10 @@ def test_the_runner_clicks_submit_controls_only_when_signed_and_runs_only_its_ow
     click = source[source.index("    async def click("):source.index("    async def scroll(")]
     assert 'element.get("submit_like")' in click and "SUBMIT_REFUSED" in click
     signed = source[source.index("    async def _signed_click("):source.index("    async def submit(")]
-    assert signed.index("self._verify(") < signed.index("_click_element_node")
+    assert signed.index("self._verify(") < signed.index(".click(")
+    assert "_click_element_node" not in signed, "browser-use's helper clicks again by script when its wait fails"
+    assert signed.count("handle.click(timeout=") == 1 and signed.count("handle.evaluate(CLICK_JS)") == 1
+    assert signed.index("reachable = False") < signed.index("handle.click(timeout="), "one or the other, never both"
     (launch,) = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "launch"]
     assert [k.arg for k in launch.keywords] == ["headless"], "plain Chromium: no extra flags, no debugging port"
     assert 'os.environ["ANONYMIZED_TELEMETRY"] = "false"' in source
