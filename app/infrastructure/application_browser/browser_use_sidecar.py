@@ -213,7 +213,7 @@ class SidecarManager:
 
     async def start(self, *, user_id: int, task_id: int, job_id: int | None, allowed_hosts: list[str],
                     upload_dir: str, storage_state: dict[str, Any] | None = None, headless: bool | None = None,
-                    allow_private: bool = False) -> SidecarSession:
+                    allow_private: bool = False, redirect_domains: list[str] | None = None) -> SidecarSession:
         if not configured():
             raise SidecarUnavailable("The browser-use backend is not configured (BROWSER_USE_WEBUI_ENABLED, "
                                      "BROWSER_USE_PYTHON)")
@@ -231,7 +231,8 @@ class SidecarManager:
             if health.get("protocol") != PROTOCOL:
                 raise SidecarUnavailable("The browser-use runner speaks another protocol version")
             await session.call("open", timeout=90, session=session.session_id, hmac_key=session.hmac_key.hex(),
-                               allowed_hosts=allowed_hosts, allow_private=allow_private, upload_dir=upload_dir,
+                               allowed_hosts=allowed_hosts, redirect_domains=redirect_domains or [],
+                               allow_private=allow_private, upload_dir=upload_dir,
                                headless=headless, storage_state=storage_state or {},
                                session_seconds=settings.browser_use_timeout_seconds)
         except BaseException:

@@ -417,3 +417,170 @@ def test_real_chromium_contexts_share_no_cookies():
         first, second, launches = run(go())
     assert "cookie=[]" in first.html and "cookie=[]" in second.html, "the second page saw the first page's cookie"
     assert launches == 1
+
+
+# ───────────── HTTP redirects (Playwright's routing does not see their hops) ─────────────
+
+@pytest.fixture
+def public_loopback(monkeypatch):
+    """127.0.0.1 counts as public, so a page can be loaded with the private checks on; every other address and name
+    meets the real checks. `localhost` is the same server, and internal."""
+    from app.services import url_safety
+
+    real_check, real_private = url_safety.check_public_url, url_safety.obviously_private
+
+    def check(url, allow_private=False):
+        if "//127.0.0.1" not in url:
+            real_check(url, allow_private=allow_private)
+
+    monkeypatch.setattr(url_safety, "check_public_url", check)
+    monkeypatch.setattr(url_safety, "obviously_private", lambda url: "//127.0.0.1" not in url and real_private(url))
+
+
+def _redirecting_site(server: PostingServer) -> str:
+    """Every way a page can start a request that a server then redirects to `localhost` (internal)."""
+    internal = f"http://localhost:{server.httpd.server_port}"
+    routes = server.routes
+    for name in ("top", "image", "frame", "popup", "worker", "serviceworker"):
+        routes[f"go-{name}"] = (302, "", {"Location": f"{internal}/custom/internal-{name}"})
+        routes[f"internal-{name}"] = (200, "<html><body>internal</body></html>", {})
+    page = "<html><body><main><p>A posting long enough to read</p></main>{}</body></html>"
+    routes["image-page"] = (200, page.format("<img src='/custom/go-image'>"), {})
+    routes["frame-page"] = (200, page.format("<iframe src='/custom/go-frame'></iframe>"), {})
+    routes["popup-page"] = (200, page.format("<script>window.open('/custom/go-popup')</script>"), {})
+    routes["worker-page"] = (200, page.format("<script>new Worker('/custom/worker.js')</script>"), {})
+    routes["worker.js"] = (200, "fetch('/custom/go-worker', {mode: 'no-cors'})", {"Content-Type": "text/javascript"})
+    routes["sw-page"] = (200, page.format("<script>navigator.serviceWorker.register('/custom/sw.js', "
+                                          "{scope: '/custom/'})</script>"), {})
+    routes["sw.js"] = (200, "fetch('/custom/go-serviceworker', {mode: 'no-cors'})",
+                       {"Content-Type": "text/javascript"})
+    return internal
+
+
+def _reached(server: PostingServer) -> list[str]:
+    return [hit for hit in server.hits if "/internal-" in hit]
+
+
+SUBREQUEST_PAGES = ("image-page", "frame-page", "popup-page", "worker-page", "sw-page")
+
+
+@needs_chromium
+def test_real_chromium_sends_no_redirect_hop_to_an_internal_address(public_loopback):
+    with PostingServer() as server:
+        _redirecting_site(server)
+        browser = pw.PlaywrightBrowserService(record_telemetry=False, navigation_timeout_seconds=15)
+
+        async def go():
+            try:
+                with pytest.raises(NavigationFailed) as failed:
+                    await browser.fetch_rendered_page(server.url("custom/go-top"))
+                assert failed.value.category == BLOCKED_URL and not failed.value.retryable
+                for name in SUBREQUEST_PAGES:  # the page itself still loads; only the hop is stopped
+                    page = await browser.fetch_rendered_page(server.url(f"custom/{name}"))
+                    assert "A posting long enough" in page.html, name
+                    await asyncio.sleep(0.5)  # what the page started has had its time
+            finally:
+                await browser.stop()
+
+        run(go())
+        assert _reached(server) == []
+        assert {f"/custom/go-{n}" for n in ("top", "image", "frame", "popup", "worker", "serviceworker")} <= set(
+            server.hits), "every first hop was sent, so every redirect was really met"
+
+
+@needs_chromium
+def test_real_chromium_would_reach_those_addresses_without_the_private_checks():
+    """The control: the same site with private hosts allowed, so `localhost` is reachable and every hop arrives."""
+    with PostingServer() as server:
+        _redirecting_site(server)
+        browser = pw.PlaywrightBrowserService(allow_private_hosts=True, record_telemetry=False,
+                                              navigation_timeout_seconds=15)
+
+        async def go():
+            try:
+                first = await browser.fetch_rendered_page(server.url("custom/go-top"))
+                for name in SUBREQUEST_PAGES:
+                    await browser.fetch_rendered_page(server.url(f"custom/{name}"))
+                await asyncio.sleep(0.5)
+                return first
+            finally:
+                await browser.stop()
+
+        first = run(go())
+        assert first.redirect_count == 1 and "localhost" in first.final_url
+        assert {f"/custom/internal-{n}" for n in ("top", "image", "frame", "popup", "worker", "serviceworker")} <= set(
+            server.hits)
+
+
+@needs_chromium
+def test_real_chromium_still_follows_a_redirect_to_a_public_address(public_loopback):
+    with PostingServer() as server:
+        browser = pw.PlaywrightBrowserService(record_telemetry=False, navigation_timeout_seconds=15)
+
+        async def go():
+            try:
+                return await browser.fetch_rendered_page(server.url("redirect/rendered"),
+                                                         wait_for=(".job-description",))
+            finally:
+                await browser.stop()
+
+        page = run(go())
+    assert page.redirect_count == 1 and page.final_url.endswith("/rendered.html") and page.status == 200
+
+
+@needs_chromium
+def test_real_chromium_a_browser_started_again_still_stops_redirects(public_loopback):
+    with PostingServer() as server:
+        _redirecting_site(server)
+        browser = pw.PlaywrightBrowserService(record_telemetry=False, navigation_timeout_seconds=15)
+
+        async def go():
+            try:
+                await browser.start()
+                await browser.stop()
+                with pytest.raises(NavigationFailed):
+                    await browser.fetch_rendered_page(server.url("custom/go-top"))
+            finally:
+                await browser.stop()
+
+        run(go())
+        assert _reached(server) == [] and "/custom/go-top" in server.hits
+
+
+@needs_chromium
+def test_real_chromium_an_application_page_is_stopped_at_the_same_redirect(public_loopback):
+    from app.infrastructure.application_browser.ephemeral import EphemeralApplicationSessions
+
+    with PostingServer() as server:
+        _redirecting_site(server)
+        browser = pw.PlaywrightBrowserService(record_telemetry=False, navigation_timeout_seconds=15)
+        sessions = EphemeralApplicationSessions(browser, record_telemetry=False)
+
+        async def go():
+            try:
+                async with sessions.session(user_id=1, ats="generic") as page:
+                    with pytest.raises(NavigationFailed) as failed:
+                        await page.goto(server.url("custom/go-top"))
+                    assert failed.value.category == BLOCKED_URL
+                async with sessions.session(user_id=1, ats="generic") as page:
+                    await page.goto(server.url("custom/image-page"))  # loads; its image's hop does not
+                    await asyncio.sleep(0.3)
+            finally:
+                await browser.stop()
+
+        run(go())
+        assert _reached(server) == [] and {"/custom/go-top", "/custom/go-image"} <= set(server.hits)
+
+
+def test_a_browser_without_the_redirect_guard_does_not_start(monkeypatch):
+    fake = FakeRuntime()
+    monkeypatch.setattr("playwright.async_api.async_playwright", fake)
+
+    async def refuses(self):
+        raise RuntimeError("no CDP here")
+
+    monkeypatch.setattr("tests.jd_support.FakeBrowserProcess.new_browser_cdp_session", refuses)
+    browser = service()
+    with pytest.raises(BrowserUnavailable) as failed:
+        run(browser.start())
+    assert failed.value.code == BROWSER_START_FAILED and not browser._running()

@@ -1,7 +1,7 @@
 """Ephemeral application sessions: a fresh anonymous context per step, on the shared Chromium process.
 
 The context comes from `BrowserService.new_context()` exactly as JD recovery's do (no cookies, storage, credentials,
-downloads; the same SSRF routing), and it is never handed to JD recovery or reused: it is closed when the step ends.
+downloads; the same SSRF routing, redirect hops included), and it is never handed to JD recovery or reused: it is closed when the step ends.
 On top, every request that is not a GET is aborted, at the page and at its context, so nothing a page does — a script,
 a stray Enter, a form, a service worker it registers — can post an application. (`page.route` alone does not see
 requests a service worker makes or answers; the shared context allows service workers for JD recovery, and in
