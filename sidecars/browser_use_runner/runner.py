@@ -27,7 +27,11 @@ bug upstream must still not be able to submit an application:
     ERR_BLOCKED_BY_CLIENT; `goto` reports that as URL_NOT_ALLOWED.
   * A click on a submit-like element (type=submit, a form button without a type, or a Submit/Apply/Send label inside
     a form) is refused unless it is `submit` / `login_submit` with that token. Nothing evaluates script a caller
-    sent: the only scripts are the constants below, which read the page.
+    sent: the only scripts are the constants below, which read the page (and CLICK_JS, the signed click's one way in).
+  * A signed click is exactly one click (`_signed_click`), not browser-use's `_click_element_node`: that one clicks
+    again by script whenever waiting after its click fails (an answer slower than its 1.5 s, a page that never fires
+    `load`), and raises for a page it dislikes after the form was sent. Once the click may have happened `submit`
+    answers normally, with `click_error` if something failed: the site's evidence decides, nothing is retried.
   * Uploads only from the run's own folder. Password fields only through `login_fill`, and only on the login domain.
   * Nothing is logged but command names and error classes (stderr); values never are.
 
@@ -52,6 +56,8 @@ from urllib.parse import urlparse
 os.environ["ANONYMIZED_TELEMETRY"] = "false"
 os.environ.setdefault("BROWSER_USE_LOGGING_LEVEL", "result")
 LOAD_WAIT_MS = 8000  # how long observe waits for a page's `load` event before reading it as it is
+CLICK_CHECK_MS = 1500  # how long a signed click waits for its control to be clickable before clicking it by script
+CLICK_WAIT_MS = 15000  # how long a signed click waits for the navigation it started to begin (a slow site's answer)
 
 PROTOCOL = 1
 MAX_ELEMENTS = 200
@@ -157,6 +163,8 @@ RESTORE_STORAGE_JS = """(items) => {
   for (const item of items) { window.localStorage.setItem(String(item.name), String(item.value)); }
   return items.length;
 }"""
+# The signed click, on a control Playwright cannot reach (covered by a banner, off-screen). Never sent after a real click.
+CLICK_JS = "(el) => el.click()"
 FILE_NAMES_JS = "(el) => Array.from(el.files || []).map(f => f.name)"
 FILE_SIZES_JS = "(el) => Array.from(el.files || []).map(f => f.size)"
 # A challenge widget a person must answer, per frame: a visible checkbox iframe of reCAPTCHA (v2 / Enterprise), hCaptcha
@@ -762,13 +770,27 @@ class Runner:
         self._verify(args.get("token") or "", kind, element["key"], domain)
         if kind == "SUBMIT" and not element.get("submit_like"):
             raise Refused("NOT_A_SUBMIT", "The signed element is not the form's submit control")
-        if kind == "LOGIN" and not await (await self._handle(element)).evaluate(LOGIN_FORM_JS):
+        handle = await self._handle(element)
+        if kind == "LOGIN" and not await handle.evaluate(LOGIN_FORM_JS):
             raise Refused("NOT_A_LOGIN", "The signed element is not in the form that holds the password field")
         self.responses = []
         self.armed = (kind, domain, time.monotonic() + 30)
         started = time.monotonic()
+        problem = None
         try:
-            await self.ctx._click_element_node(element["node"])
+            try:  # `trial` only checks the control can be clicked: nothing reaches the page
+                await handle.click(trial=True, timeout=CLICK_CHECK_MS)
+                reachable = True
+            except Exception:  # noqa: BLE001
+                reachable = False
+            try:  # from here on the click may have happened, whatever is raised: it is never made a second time
+                if reachable:
+                    await handle.click(timeout=CLICK_WAIT_MS)
+                else:
+                    await handle.evaluate(CLICK_JS)
+            except Exception as exc:  # noqa: BLE001
+                problem = type(exc).__name__
+                log(f"signed click: {problem}")
             for state in ("load", "networkidle"):
                 try:
                     await page.wait_for_load_state(state, timeout=15000)
@@ -776,7 +798,9 @@ class Runner:
                     pass
         finally:
             self.armed = None
-        return {"clicked": True, "seconds": round(time.monotonic() - started, 2)}
+        if kind == "LOGIN" and (problem or page.url.startswith("chrome-error:")):
+            raise Refused("LOGIN_NOT_SENT", "The login did not reach a page of the site")  # a person may log in again
+        return {"clicked": problem is None, "click_error": problem, "seconds": round(time.monotonic() - started, 2)}
 
     async def submit(self, args: dict[str, Any]) -> dict[str, Any]:
         return await self._signed_click(args, "SUBMIT")
