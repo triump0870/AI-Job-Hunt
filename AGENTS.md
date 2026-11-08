@@ -173,5 +173,3 @@ Keep detailed subsystem contracts, retention settings, rate-limit semantics, sch
 - `docs/prompts.md` for prompt contracts and versioning.
 - `docs/resume-extraction-plan.md` for extraction and verification.
 - `README.md` sections 9–14 for worker workflows, applications, research and monitoring.
-
-**Important migration note:** This file expresses both preserved current rules and explicitly marked proposed improvements. Replacing `AGENTS.md` alone does **not** implement tri-state filtering, semantic Knowledge Bank matching or additional ATS support. Those features require code changes, migrations where applicable, tests, and safe rollout before being enabled.

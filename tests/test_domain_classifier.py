@@ -766,6 +766,42 @@ def test_metrics_read_the_tasks_and_never_invent_a_cost(user, on, model):
     assert out["classifications"] == {"MATCH": 1} and out["cost"] is None
 
 
+def test_the_gate_review_says_what_each_check_stopped_and_where_those_jobs_stand(user, on, model):
+    model.answer = answer("NO_MATCH", "words nobody wrote")
+    waiting = add(user, "Payments Infrastructure Engineer", company="Waiting")
+    kept = add(user, "Payments Infrastructure Engineer", company="Kept")
+    removed = add(user, "Payments Infrastructure Engineer", company="Removed")
+    run_pass()
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        assert dc.resolve_review(db, user, [kept], True, actor="test")["done"] == [kept]
+        assert dc.resolve_review(db, user, [removed], False, actor="test")["done"] == [removed]
+        db.commit()
+        start, end = dc.utcnow() - timedelta(hours=1), dc.utcnow() + timedelta(hours=1)
+        out = dc.gate_review(db, user, start, end)
+    assert (out["no_match"], out["stopped"], out["stood"], out["unavailable"]) == (3, 3, 0, 0)
+    entry = out["codes"][0]
+    assert entry["code"] == "EVIDENCE_NOT_IN_POSTING" and entry["jobs"] == 3
+    assert entry["now"] == {"waiting": 1, "kept": 1, "removed": 1, "moved_on": 0, "other": 0}
+    assert {e["job_id"] for e in entry["examples"]} == {waiting, kept, removed}
+    assert entry["examples"][0]["evidence"] == ["words nobody wrote"]
+
+
+def test_the_gate_review_counts_a_job_by_its_latest_read_and_only_its_own_account(user, on, model):
+    model.answer = answer("NO_MATCH", "words nobody wrote")
+    job_id = add(user, "Payments Infrastructure Engineer")
+    run_pass()
+    with SessionLocal() as db:
+        db.info["user_id"] = user
+        start, end = dc.utcnow() - timedelta(hours=1), dc.utcnow() + timedelta(hours=1)
+        assert dc.gate_review(db, user, start, end)["stopped"] == 1
+        assert dc.gate_review(db, user + 999, start, end)["no_match"] == 0
+        db.add(JobClassificationTask(user_id=user, job_id=job_id, status="COMPLETED", classification="MATCH",
+                                     model_classification="MATCH", created_at=dc.utcnow()))
+        db.commit()
+        assert dc.gate_review(db, user, start, end)["no_match"] == 0  # read again and matched: nothing was stopped
+
+
 def test_the_comparison_lists_only_shadow_disagreements(user, model, monkeypatch):
     monkeypatch.setattr(get_settings(), "domain_classifier_mode", "shadow")
     monkeypatch.setattr(get_settings(), "domain_classifier_shadow_daily_limit", 5)

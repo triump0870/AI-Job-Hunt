@@ -452,6 +452,66 @@ function wkPerformanceInsights(tab, x) {
       ${wkCard('Why tasks failed', categories.length ? categories.map(([k, n]) => `${wkHumanize(k)} ${n}`).join(' · ') : 'Most common errors in the selected range', wkRanked(errors, WK_COLORS.failed, 'No failed tasks in this range.'))}
       ${decisions || outcomes}</div>`;
 }
+// The model's NO_MATCH must pass code's checks before a job is hidden: what each check stopped, and where those jobs are now.
+const WK_GATE_TEXT = {
+  TITLE_PROTECTED: ['The title is yours', 'The title is one of your target roles, or another name for one.'],
+  TEXT_NAMES_OWN_SKILLS: ['Names your skills', 'The posting names at least two of your skills.'],
+  SKILLS_MATCHED: ['Model found your skills', 'The model said no match, yet listed skills of yours that the posting asks for.'],
+  EVIDENCE_NOT_IN_POSTING: ['Proof not in the posting', 'The phrases the model quoted are not in the text it was shown.'],
+  NO_EVIDENCE: ['No proof given', 'The model quoted no phrases to back its answer.'],
+  TITLE_ONLY_TECHNICAL: ['Technical title, no description', 'Only a technical title was known, which is too little to reject on.'],
+};
+const WK_GATE_NOW = [
+  ['waiting', 'Waiting for you', 'var(--amber)'],
+  ['kept', 'You kept', WK_COLORS.done],
+  ['removed', 'You removed', WK_COLORS.failed],
+  ['moved_on', 'Moved on', 'var(--brand)'],
+  ['other', 'Other', WK_COLORS.queued],
+];
+const wkGateNowLabel = key => (WK_GATE_NOW.find(([id]) => id === key) || [key, key])[1];
+function wkGateExamples(entry) {
+  return `<div class="wk-gate-examples"><div class="xs faint">Most recent ${entry.examples.length === 1 ? 'job' : `${entry.examples.length} jobs`}</div>${entry.examples.map(e => `<div class="wk-gate-example">
+    <div class="grow" style="min-width:0"><div class="small b">${esc(e.title || `Job #${e.job_id}`)} <span class="muted" style="font-weight:400">· ${esc(e.company || '')}</span></div>
+      ${e.reason ? `<div class="xs muted mt4">Model: ${esc(e.reason)}</div>` : ''}
+      ${(e.evidence || []).length ? `<div class="xs muted mt4">Quoted as proof: ${e.evidence.map(p => `“${esc(p)}”`).join(', ')}</div>` : ''}</div>
+    <div class="row gap8 none">${pill(wkGateNowLabel(e.now))}${btn('Job', 'open-job', { id: e.job_id }, 'sm')}</div></div>`).join('')}</div>`;
+}
+function wkGateReview(g) {
+  if (!g || (!g.no_match && !g.unavailable)) return '';
+  const codes = g.codes || [], open = wkState().gateOpen;
+  const total = key => codes.reduce((sum, entry) => sum + (entry.now[key] || 0), 0);
+  const waiting = total('waiting'), kept = total('kept'), removed = total('removed'), decided = kept + removed;
+  const max = Math.max(1, ...codes.map(entry => entry.jobs));
+  const shown = WK_GATE_NOW.filter(([key]) => total(key));
+  const tiles = `<div class="wk-tiles">
+    ${wkTile('Model said no match', wkNum(g.no_match), 'jobs in this range')}
+    ${wkTile('Stopped by a check', wkNum(g.stopped), g.no_match ? `${wkPct(g.stopped / g.no_match)} of the model’s no-match answers` : '', g.stopped ? 'warn' : '', g.no_match ? wkMeter(g.stopped / g.no_match, 'var(--amber)') : '')}
+    ${wkTile('Hidden', wkNum(g.stood), 'passed every check')}
+    ${wkTile('Your decisions', `${wkNum(kept)} · ${wkNum(removed)}`, decided ? `kept · removed: the check was right on ${wkNum(kept)} of ${wkNum(decided)}` : 'kept · removed: none settled yet')}</div>`;
+  const rows = codes.map(entry => {
+    const [name, meaning] = WK_GATE_TEXT[entry.code] || [wkHumanize(entry.code), ''];
+    const expanded = open === entry.code;
+    const segments = WK_GATE_NOW.filter(([key]) => entry.now[key]).map(([key, text, color]) => `<i style="flex:${entry.now[key]};background:${color}" title="${attr(`${text}: ${entry.now[key]}`)}"></i>`).join('');
+    const cell = key => `<td class="num">${entry.now[key] ? wkNum(entry.now[key]) : '<span class="faint">—</span>'}</td>`;
+    return `<tr><td class="wk-gate-name"><div class="small b">${esc(name)}</div>${meaning ? `<div class="xs muted">${esc(meaning)}</div>` : ''}<div class="xs faint mono">${esc(entry.code)}</div></td>
+      <td class="num"><b>${wkNum(entry.jobs)}</b><div class="xs faint">${g.stopped ? Math.round(100 * entry.jobs / g.stopped) : 0}%</div></td>
+      <td class="wk-gate-bar"><div class="wk-stack" style="width:${Math.max(4, 100 * entry.jobs / max)}%" role="img" aria-label="${attr(WK_GATE_NOW.filter(([key]) => entry.now[key]).map(([key, text]) => `${text}: ${entry.now[key]}`).join(', '))}">${segments}</div></td>
+      ${shown.map(([key]) => cell(key)).join('')}
+      <td class="num">${entry.examples.length ? `<button class="btn sm" data-act="wk-gate-toggle" data-id="${attr(entry.code)}" aria-expanded="${expanded}">${expanded ? 'Hide' : 'Jobs'}</button>` : ''}</td></tr>
+      ${expanded ? `<tr class="wk-gate-open"><td colspan="${shown.length + 4}">${wkGateExamples(entry)}</td></tr>` : ''}`;
+  }).join('');
+  const table = codes.length ? `<div class="wk-legend" style="margin:14px 0 8px">${shown.map(([, text, color]) => `<span><i style="background:${color}"></i>${esc(text)}</span>`).join('')}</div>
+    <div class="mon-table-wrap wk-gate-table"><table class="mon-table"><thead><tr><th>Check</th><th class="num">Jobs</th><th>Where they are now</th>${shown.map(([, text]) => `<th class="num">${esc(text)}</th>`).join('')}<th></th></tr></thead><tbody>${rows}</tbody></table></div>` : '';
+  const notes = [
+    total('moved_on') ? 'Moved on: read under earlier rules, or settled by a later read.' : '',
+    total('other') ? 'Other: hidden by another rule, being read again, or recorded in shadow mode.' : '',
+    g.unavailable ? `The check could not run for ${wkNum(g.unavailable)} ${g.unavailable === 1 ? 'job, which' : 'jobs, which'} went on without a verdict.` : '',
+    g.truncated ? 'Counted over the most recent 5,000 reads of this range.' : '',
+  ].filter(Boolean);
+  const review = waiting ? `<a class="btn sm primary" href="#discovery/review">Review ${wkNum(waiting)} ${waiting === 1 ? 'job' : 'jobs'}</a>` : '';
+  return wkCard('When code overruled the model', 'A no-match answer hides a job only if it passes these checks. Each job counts once, by its latest read.',
+    `${tiles}${table}${notes.length ? `<div class="xs faint mt8">${notes.map(esc).join(' ')}</div>` : ''}`, review);
+}
 function wkClassificationInsights(data) {
   const x = data.metrics || {}, c = x.classifications || {}, cmp = data.comparison || {};
   const tiles = `<div class="wk-tiles">
@@ -462,10 +522,9 @@ function wkClassificationInsights(data) {
     ${wkTile('Model calls', wkNum(x.model_calls), x.tokens_per_call == null ? 'no tokens reported' : `${x.tokens_per_call.toLocaleString()} tokens per call`)}
     ${wkTile('Model latency', monMs(x.latency_p50_ms), `p95 ${monMs(x.latency_p95_ms)}`)}
     ${wkTile('Cost', x.cost == null ? '—' : monUSD(x.cost), x.cost == null ? 'not reported' : `reported on ${wkNum(x.calls_with_cost)} calls`)}</div>`;
-  const gates = Object.entries(x.gate_codes || {}).map(([code, n]) => `<div class="small">${esc(code)} · ${wkNum(n)}</div>`).join('');
   const comparison = cmp.compared ? `<div class="small">${wkNum(cmp.compared)} compared · the old filter hid ${wkNum(cmp.old_hides_new_keeps)} this keeps · it kept ${wkNum(cmp.old_keeps_new_hides)} this hides</div>` : '';
   return `${wkCard('Performance', 'The domain check in the selected range', tiles, wkRangeSeg())}
-    ${gates ? wkCard('Why a verdict changed', 'Code turned the model\'s NO_MATCH into UNCERTAIN, or the check could not run', gates) : ''}
+    ${wkGateReview(x.gate_review)}
     ${comparison ? wkCard('Against the old filter', 'Shadow mode: nothing here moved a job', comparison) : ''}`;
 }
 function wkParsingInsights(data) {
@@ -837,6 +896,7 @@ const WORKERS_ACTIONS = {
   'wk-set-jump': (el, e) => { e?.preventDefault?.(); document.getElementById(`wk-set-${el.dataset.id}`)?.scrollIntoView?.({ behavior: 'smooth', block: 'start' }); },
   'wk-range': el => { wkState().range = el.dataset.id; wkReload().then(render).catch(err => toast(err.message, true)); },
   'wk-open': el => { wkState().tab = el.dataset.tab || wkState().tab; if (S.orch) Object.assign(S.orch, { node: null, edge: null }); go('workers'); },
+  'wk-gate-toggle': el => { const w = wkState(); w.gateOpen = w.gateOpen === el.dataset.id ? null : el.dataset.id; render(); },
   'wk-refresh': () => busy('wkRefresh', wkReload),
   // A browser setting, not an account one: it applies at once and needs a click for the browser's permission prompt.
   'wk-notify': async el => { await setNotifyApproved(el.checked); render(); },

@@ -798,6 +798,61 @@ def purge_cache(db: Session, now: datetime | None = None) -> int:
 
 # ───────────── reading ─────────────
 
+GATE_ROW_LIMIT = 5000
+GATE_EXAMPLES = 3
+
+
+def _where_it_stands(mode: str, state: str | None, reason: str | None) -> str:
+    """Where a job the gate held stands today. Only a person's own choices count as kept or removed."""
+    if mode == TASK_SHADOW:
+        return "other"  # shadow verdicts moved nothing, so today's state says nothing about them
+    if state == domain_match.REVIEW:
+        return "waiting"
+    if state == domain_match.KEPT:
+        return "kept"
+    if state == domain_match.NOT_MATCHING:
+        return "removed" if reason == PERSON_REASON else "other"
+    return "moved_on" if state == domain_match.MATCH or state is None else "other"
+
+
+def gate_review(db: Session, user_id: int, start: datetime, end: datetime) -> dict[str, Any]:
+    """The model's NO_MATCH answers in the range: which ones the gate stopped, why, and where those jobs stand now. Each
+    job counts once, by its latest finished read, so a re-check never counts it twice. A deleted job's task goes with it.
+    Bounded, and read from the task rows only."""
+    m = JobClassificationTask
+    rows = db.execute(select(m.job_id, m.gate_code, m.model_classification, m.classification, m.explanation,
+                             m.irrelevance_evidence, m.mode, Job.title, Job.company, Job.domain_match, Job.domain_reason)
+                      .join(Job, Job.id == m.job_id)
+                      .where(m.user_id == user_id, m.created_at >= start, m.created_at <= end,
+                             m.classification.is_not(None))
+                      .order_by(m.id.desc()).limit(GATE_ROW_LIMIT + 1)).all()
+    truncated = len(rows) > GATE_ROW_LIMIT
+    seen: set[int] = set()
+    codes: dict[str, dict[str, Any]] = {}
+    stood = unavailable = 0
+    for row in rows[:GATE_ROW_LIMIT]:
+        if row.job_id in seen:
+            continue
+        seen.add(row.job_id)
+        if row.gate_code == UNAVAILABLE:
+            unavailable += 1
+        elif row.classification == NO_MATCH:
+            stood += 1
+        elif row.gate_code and row.model_classification == NO_MATCH:
+            stands = _where_it_stands(row.mode, row.domain_match, row.domain_reason)
+            entry = codes.setdefault(row.gate_code, {
+                "code": row.gate_code, "jobs": 0, "examples": [],
+                "now": {"waiting": 0, "kept": 0, "removed": 0, "moved_on": 0, "other": 0}})
+            entry["jobs"] += 1
+            entry["now"][stands] += 1
+            if len(entry["examples"]) < GATE_EXAMPLES:
+                entry["examples"].append({"job_id": row.job_id, "title": row.title, "company": row.company, "now": stands,
+                                          "reason": row.explanation, "evidence": list(row.irrelevance_evidence or [])[:3]})
+    stopped = sum(entry["jobs"] for entry in codes.values())
+    return {"no_match": stopped + stood, "stopped": stopped, "stood": stood, "unavailable": unavailable,
+            "truncated": truncated, "codes": sorted(codes.values(), key=lambda e: (-e["jobs"], e["code"]))}
+
+
 def metrics(db: Session, user_id: int, start: datetime, end: datetime) -> dict[str, Any]:
     """Call rate, cache hits, what the gate changed and what it cost. Tokens and cost are the gateway's own rows, read
     here and never counted twice; a cost nobody reported is None, not 0."""
@@ -830,7 +885,7 @@ def metrics(db: Session, user_id: int, start: datetime, end: datetime) -> dict[s
               if c.input_tokens is not None or c.output_tokens is not None]
     held = db.scalar(select(func.count(Job.id)).where(Job.user_id == user_id, Job.domain_match == domain_match.REVIEW)) or 0
     return {"jobs": total, "needs_review": held, "routes": routes, "classifications": classes, "gate_codes": gates,
-            "asked": asked, "cache_hits": cached, "model_calls": len(calls),
+            "gate_review": gate_review(db, user_id, start, end), "asked": asked, "cache_hits": cached, "model_calls": len(calls),
             "ask_rate": round(asked / total, 4) if total else None,
             "cache_hit_rate": round(cached / asked, 4) if asked else None,
             "tokens": sum(tokens) if tokens else None, "tokens_per_call": round(sum(tokens) / len(tokens)) if tokens else None,

@@ -22,7 +22,7 @@ beforeEach(() => {
   for (const file of ['monitoring.js', 'orchestration.js', 'workers.js', 'settings.js', 'resume_data.js', 'job_data.js', 'knowledge.js', 'inbox.js', 'guide.js', 'job_insights.js']) {
     runInContext(readFileSync(`app/static/${file}`, 'utf8'), context, { filename: resolve(`app/static/${file}`) });
   }
-  const names = ['S', 'D', 'A', 'renderReview', 'domainCheckNote'];
+  const names = ['S', 'D', 'A', 'renderReview', 'domainCheckNote', 'wkGateReview', 'wkState'];
   runInContext(`${appSource}\n;globalThis.__ui = { ${names.map(n => `${n}: typeof ${n} !== 'undefined' ? ${n} : undefined`).join(', ')} };`,
     context, { filename: resolve('app/static/app.js') });
   ui = context.__ui;
@@ -66,5 +66,47 @@ describe('Discovery → Needs review', () => {
     box.innerHTML = ui.domainCheckNote({ id: 9, domain_match: 'REVIEW', domain_reason: 'Needs your review: Unclear.' });
     expect(box.textContent).toContain('Unclear.');
     expect(box.querySelector('[data-act="review-decide"][data-ids="9"][data-matches="0"]')).not.toBeNull();
+  });
+});
+
+describe('When code overruled the model', () => {
+  const gate = () => ({ no_match: 80, stopped: 75, stood: 5, unavailable: 2, truncated: false, codes: [
+    { code: 'TITLE_PROTECTED', jobs: 50, now: { waiting: 30, kept: 12, removed: 3, moved_on: 5, other: 0 },
+      examples: [{ job_id: 7, title: '<b>Staff</b> Engineer', company: 'Acme', now: 'waiting', reason: 'Sales role', evidence: ['<i>quota</i>'] }] },
+    { code: 'SOMETHING_NEW', jobs: 25, now: { waiting: 25, kept: 0, removed: 0, moved_on: 0, other: 0 }, examples: [] }] });
+  const shown = html => { const el = document.createElement('div'); el.innerHTML = html; return el; };
+
+  it('renders nothing when the model rejected nothing', () => {
+    expect(ui.wkGateReview({ no_match: 0, unavailable: 0, codes: [] })).toBe('');
+    expect(ui.wkGateReview(undefined)).toBe('');
+  });
+
+  it('explains each check in words, with its count and where those jobs are', () => {
+    const el = shown(ui.wkGateReview(gate()));
+    expect(el.textContent).toContain('The title is yours');
+    expect(el.textContent).toContain('TITLE_PROTECTED');
+    expect(el.textContent).toContain('the check was right on 12 of 15');
+    expect(el.textContent).toContain('The check could not run for 2 jobs');
+    expect(el.querySelector('a[href="#discovery/review"]').textContent).toBe('Review 55 jobs');
+    expect(el.querySelector('[role="img"]').getAttribute('aria-label')).toBe('Waiting for you: 30, You kept: 12, You removed: 3, Moved on: 5');
+    expect([...el.querySelectorAll('th')].map(th => th.textContent)).not.toContain('Other');
+  });
+
+  it('shows a job only when its check is opened, and escapes what the model and the posting wrote', () => {
+    expect(shown(ui.wkGateReview(gate())).querySelector('.wk-gate-open')).toBeNull();
+    ui.A['wk-gate-toggle']({ dataset: { id: 'TITLE_PROTECTED' } });
+    expect(ui.wkState().gateOpen).toBe('TITLE_PROTECTED');
+    const open = shown(ui.wkGateReview(gate())).querySelector('.wk-gate-open');
+    expect(open.textContent).toContain('<b>Staff</b> Engineer');
+    expect(open.textContent).toContain('“<i>quota</i>”');
+    expect(open.querySelector('b, i')).toBeNull();
+    ui.A['wk-gate-toggle']({ dataset: { id: 'TITLE_PROTECTED' } });
+    expect(ui.wkState().gateOpen).toBeNull();
+  });
+
+  it('does not credit the check before anyone has decided', () => {
+    const data = gate();
+    data.codes[0].now = { waiting: 50, kept: 0, removed: 0, moved_on: 0, other: 0 };
+    expect(shown(ui.wkGateReview(data)).textContent).toContain('none settled yet');
   });
 });
