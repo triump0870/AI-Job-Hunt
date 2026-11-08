@@ -82,13 +82,30 @@ def allowed_hosts(match: ats_map.AtsMatch | None, final_url: str | None = None) 
     return sorted(hosts)
 
 
+def redirect_domains(match: ats_map.AtsMatch | None) -> list[str]:
+    """Where a server redirect may take the page besides `allowed_hosts`: the ATS's own domains (one board moving a form
+    between its hosts, which `allowed_hosts` also accepts as a final URL), or an employer's own site. A country's
+    second-level domain (acme.co.uk) is not a site: only hosts under the apply domain itself count there."""
+    if match is None:
+        return []
+    hosts = ats_map.ats_named(match.ats).hosts
+    if hosts:
+        return sorted(hosts)
+    labels = (match.apply_domain or "").lower().strip(".").split(".")
+    parent = labels[1:] if len(labels) > 2 else labels
+    if len(parent) == 2 and len(parent[1]) == 2 and len(parent[0]) <= 3:
+        parent = labels
+    return [".".join(parent)] if any(parent) else []
+
+
 async def start_session(*, user_id: int, task_id: int, job_id: int, match: ats_map.AtsMatch | None, upload_dir: str,
                         storage_state: dict[str, Any] | None) -> Any:
     from app.infrastructure.application_browser.browser_use_sidecar import get_sidecars
 
     allow_private = get_settings().application_allow_private_hosts
     return await get_sidecars().start(user_id=user_id, task_id=task_id, job_id=job_id,
-                                      allowed_hosts=allowed_hosts(match), upload_dir=upload_dir,
+                                      allowed_hosts=allowed_hosts(match), redirect_domains=redirect_domains(match),
+                                      upload_dir=upload_dir,
                                       storage_state=storage_state, allow_private=allow_private)
 
 

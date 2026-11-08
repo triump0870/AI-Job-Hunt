@@ -3280,8 +3280,9 @@ features (ATS form assistance, confirmation capture) reuse it:
 - navigation waits for `domcontentloaded`, then a known container and for the text to stop growing, within
   `PLAYWRIGHT_NAVIGATION_TIMEOUT_SECONDS` / `PLAYWRIGHT_PAGE_TIMEOUT_SECONDS` — never `networkidle`;
 - at most `PLAYWRIGHT_MAX_CONCURRENCY` pages at once; a crashed Chromium is started again on next use;
-- every navigation is checked against private addresses (redirects included), and pages never receive API keys,
-  credentials or environment values;
+- every navigation is checked against private addresses, and pages never receive API keys, credentials or
+  environment values. Each hop of an HTTP redirect is checked before it is sent, by a browser-level CDP `Fetch` session
+  beside Playwright's routing (which does not see redirect hops); this works on Chromium only, the only browser used;
 - closed at app shutdown and after each `python -m app.cron` run, so no Chromium process is left behind.
 
 Every page load is an External API row (provider `WEB`, service `playwright`), beside the HTTP fetches (`WEB`,

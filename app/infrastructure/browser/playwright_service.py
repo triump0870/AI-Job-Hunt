@@ -12,9 +12,15 @@ Lifecycle:
 
 The service belongs to the event loop it started in. A new loop (a `python -m app.cron` run) gets a fresh browser.
 
-Security: pages never receive application data — no extra headers, no cookies, no init scripts. Navigation requests
-are checked against app.services.url_safety, so a redirect or subrequest cannot reach a private address. Resource
-blocking is an independent, opt-in performance setting; normal contexts preserve modern page behaviour.
+Security: pages never receive application data — no extra headers, no cookies, no init scripts. Requests are checked
+against app.services.url_safety, so a subrequest or navigation cannot reach a private address. Playwright's routing
+sees only the first request of an HTTP redirect, so a browser-level CDP Fetch session (`_guard_redirects`) applies the
+same check to every redirect hop, in every page, popup, frame and worker, before the hop is sent. Resource blocking is an independent, opt-in performance setting; normal contexts preserve
+modern page behaviour.
+
+Limits: this is Chromium's CDP, and it rests on `redirectedRequestId` marking a hop: the real-Chromium tests fail if a
+browser or Playwright upgrade changes that. A host name is checked by what it resolves to at that moment, for a hop as
+for a first request; the browser resolves it again itself, so DNS rebinding is not covered by either.
 """
 from __future__ import annotations
 
@@ -139,6 +145,7 @@ class PlaywrightBrowserService(BrowserService):
         self.debug_artifacts = debug_artifacts
         self._playwright: Any = None
         self._browser: Any = None
+        self._redirect_guard: Any = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._lock: asyncio.Lock | None = None
         self._semaphore: asyncio.Semaphore | None = None
@@ -229,6 +236,7 @@ class PlaywrightBrowserService(BrowserService):
 
                 self._playwright = await async_playwright().start()
                 self._browser = await self._playwright.chromium.launch(headless=self.headless)
+                await self._guard_redirects()  # a browser that cannot have it does not start
             except Exception as exc:
                 await self._discard()
                 text = str(exc)
@@ -252,7 +260,7 @@ class PlaywrightBrowserService(BrowserService):
     async def _discard(self) -> None:
         """Close whatever is left of a previous browser. Never raises."""
         browser, runtime = self._browser, self._playwright
-        self._browser = self._playwright = None
+        self._browser = self._playwright = self._redirect_guard = None
         self._contexts = set()
         if browser is not None:
             with contextlib.suppress(Exception):
@@ -293,20 +301,53 @@ class PlaywrightBrowserService(BrowserService):
             if self.block_nonessential_resources and request.resource_type in SKIPPED_RESOURCES:
                 await route.abort("blockedbyclient")
                 return
-            from app.services.url_safety import UnsafeURL, check_public_url, obviously_private
-
-            if not self.allow_private_hosts and obviously_private(request.url):
+            if await self._may_reach(request.url, navigation=request.is_navigation_request()):
+                await route.continue_()
+            else:
                 await route.abort("blockedbyclient")  # a page may not make the browser reach internal services
-                return
-            if request.is_navigation_request():
-                try:
-                    await asyncio.to_thread(check_public_url, request.url, allow_private=self.allow_private_hosts)
-                except UnsafeURL:
-                    await route.abort("blockedbyclient")
-                    return
-            await route.continue_()
         except Exception:  # noqa: BLE001  the page closing mid-request is normal
             log.debug("request routing ended early for %s", request.url[:120])
+
+    async def _may_reach(self, url: str, *, navigation: bool) -> bool:
+        """The SSRF check every request meets, its first hop (_route) and each redirect hop (_on_paused) alike."""
+        from app.services.url_safety import UnsafeURL, check_public_url, obviously_private
+
+        if not self.allow_private_hosts and obviously_private(url):
+            return False
+        if navigation:
+            try:
+                await asyncio.to_thread(check_public_url, url, allow_private=self.allow_private_hosts)
+            except UnsafeURL:
+                return False
+        return True
+
+    async def _guard_redirects(self) -> None:
+        """Hold every request of this browser at a browser-level CDP Fetch session, to judge redirect hops before they
+        are sent: Playwright's routing is not called for them. At the browser level (not per page) it covers popups and
+        service workers too, with no moment between a target's creation and its coverage. Everything else is released
+        at once and still meets `_route`."""
+        session = await self._browser.new_browser_cdp_session()
+        self._redirect_guard = session
+        session.on("Fetch.requestPaused", lambda event: self._on_paused(session, event))
+        await session.send("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]})
+
+    async def _on_paused(self, session: Any, event: dict[str, Any]) -> None:
+        allow = True
+        if event.get("redirectedRequestId"):
+            try:
+                allow = await self._may_reach(str(event["request"]["url"]),
+                                              navigation=event.get("resourceType") == "Document")
+            except Exception:  # noqa: BLE001  a hop that cannot be judged is not sent
+                allow = False
+                log.warning("a redirect could not be checked and was stopped")
+            if not allow:
+                log.info("a redirect to %s was stopped", _host(str(event["request"].get("url"))))
+        with contextlib.suppress(Exception):  # the page closing mid-request is normal
+            if allow:
+                await session.send("Fetch.continueRequest", {"requestId": event["requestId"]})
+            else:
+                await session.send("Fetch.failRequest", {"requestId": event["requestId"],
+                                                         "errorReason": "BlockedByClient"})
 
     async def new_context(self) -> Any:
         browser = await self._ensure()

@@ -159,7 +159,7 @@ class FakeManager:
         return True
 
     async def start(self, *, user_id, task_id, job_id, allowed_hosts, upload_dir, storage_state=None,
-                    headless=None, allow_private=False):
+                    headless=None, allow_private=False, redirect_domains=None):
         self.loop = asyncio.get_running_loop()
         self.started.append({"user": user_id, "task": task_id, "hosts": allowed_hosts, "storage": storage_state})
         session = FakeSession(self, user_id, task_id, storage_state)

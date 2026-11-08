@@ -221,6 +221,14 @@ class FakeContext:
         self.closed = True
 
 
+class FakeCDPSession:
+    def on(self, event: str, handler: Any) -> None:
+        pass
+
+    async def send(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        return {}
+
+
 class FakeBrowserProcess:
     def __init__(self, runtime: FakeRuntime):
         self.runtime, self.connected, self.handlers = runtime, True, {}
@@ -230,6 +238,9 @@ class FakeBrowserProcess:
 
     def is_connected(self) -> bool:
         return self.connected
+
+    async def new_browser_cdp_session(self) -> FakeCDPSession:
+        return FakeCDPSession()
 
     async def new_context(self, **options: Any) -> FakeContext:
         context = FakeContext(self.runtime, options)

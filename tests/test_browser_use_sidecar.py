@@ -6,6 +6,7 @@ also needs PostgreSQL. Everything is served by a local fake site; nothing reache
   * it reads a form as indexed elements, fills only what it is told, uploads only the run's own files, never fills a
     password field, refuses a submit-like click, a forged token and an address off the allowed hosts, and aborts every
     non-GET request until a signed SUBMIT arms one domain;
+  * no hop of an HTTP redirect leaves the allowed hosts or reaches an internal address: stopped before it is sent;
   * a timeout or a dead process is SidecarUnavailable (the process is killed), and a new session starts cleanly;
   * one account never reaches another's session;
   * a dynamic form (hidden behind "Apply now", with instructions to the agent in the page) goes through the real
@@ -15,9 +16,13 @@ also needs PostgreSQL. Everything is served by a local fake site; nothing reache
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import os
 import subprocess
 import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -771,3 +776,274 @@ def test_a_page_that_grows_in_the_window_uses_and_saves_answer_library_questions
     assert saved.id in task.interrupt["question_ids"]
     labels = {f["label"] for f in task.plan["extra_fields"]}
     assert labels == {RELOCATION_QUESTION, START_QUESTION} and posts == []
+
+
+# ───────────── HTTP redirects (Playwright's routing does not see their hops) ─────────────
+
+class _RedirectSite:
+    """One server, two names: 127.0.0.1 (the allowed host) and `localhost` (off it). It records which name each request
+    used, which no fixture server does, because that is what tells a stopped hop from a followed one."""
+
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, str, str]] = []
+        site = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args) -> None:
+                pass
+
+            def _answer(self) -> None:
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                site.requests.append((self.command, (self.headers.get("Host") or "").split(":")[0], self.path))
+                status, body, headers = site.respond(self.path)
+                data = body.encode()
+                self.send_response(status)
+                for name, value in {"Content-Type": "text/html", **headers}.items():
+                    self.send_header(name, value)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            do_GET = do_POST = _answer
+
+        self.httpd = ThreadingHTTPServer(("0.0.0.0", 0), Handler)  # both names, on this test's machine
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.on = f"http://127.0.0.1:{self.httpd.server_port}"
+        self.off = f"http://localhost:{self.httpd.server_port}"
+
+    def respond(self, path: str) -> tuple[int, str, dict[str, str]]:
+        page = "<html><head><title>t</title></head><body><h1>The form</h1>{}</body></html>"
+        return {
+            "/go-off": (302, "", {"Location": f"{self.off}/landed"}),
+            "/go-on": (302, "", {"Location": f"{self.on}/landed"}),
+            "/go-frame": (302, "", {"Location": f"{self.off}/framed"}),
+            "/go-popup": (302, "", {"Location": f"{self.off}/popped"}),
+            "/post-off": (307, "", {"Location": f"{self.off}/posted"}),
+            "/links": (200, page.format("<a href='/go-off'>Next page</a>"), {}),
+            "/frame": (200, page.format("<iframe src='/go-frame'></iframe>"), {}),
+            "/timed": (200, page.format("<script>setTimeout(() => { location = '/go-off'; }, 1500)</script>"), {}),
+            "/popup": (200, page.format("<script>window.open('/go-popup')</script>"), {}),
+            "/form": (200, page.format("<form method='post' action='/post-off'><input name='a'>"
+                                       "<button type='submit'>Submit application</button></form>"), {}),
+        }.get(path, (200, page.format("<p>Landed</p>"), {}))
+
+    def reached(self, host: str = "localhost") -> list[tuple[str, str]]:
+        return [(method, path) for method, name, path in self.requests if name == host]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def _redirect_session(run, tmp_path, task_id: int, **options):
+    return run(bus.get_sidecars().start(user_id=1, task_id=task_id, job_id=5, allowed_hosts=["127.0.0.1"],
+                                        upload_dir=str(tmp_path), allow_private=True, **options))
+
+
+def _element(observation: dict, label: str) -> dict:
+    return next(e for e in observation["elements"] if label in (e.get("label") or ""))
+
+
+def test_the_runner_sends_no_redirect_hop_off_the_allowed_hosts(runner, tmp_path):
+    from app.services import application_execution
+
+    with _RedirectSite() as site, application_execution.background_loop() as loop:
+        run = application_execution.loop_runner(loop, timeout=90)
+        session = _redirect_session(run, tmp_path, 70)
+        try:
+            with pytest.raises(bus.SidecarRefused) as refused:  # the address itself is on the allowed host
+                run(session.call("goto", url=f"{site.on}/go-off"))
+            assert refused.value.code == "URL_NOT_ALLOWED"
+            assert site.reached("127.0.0.1") == [("GET", "/go-off")] and site.reached() == []
+
+            run(session.call("goto", url=f"{site.on}/links"))  # a link the page offers meets the same redirect
+            link = _element(run(session.call("observe")), "Next page")
+            with pytest.raises(bus.SidecarRefused):  # browser-use's own check then sees the browser's error page
+                run(session.call("click", key=link["key"]))
+            assert ("GET", "/go-off") in site.reached("127.0.0.1")[1:] and site.reached() == []
+            time.sleep(1)  # browser-use goes back from the error page by itself
+
+            assert run(session.call("goto", url=f"{site.on}/go-on"))["final_url"] == f"{site.on}/landed"
+            assert run(session.call("observe"))["blocked_navigations"] == 2
+
+            run(session.call("goto", url=f"{site.on}/frame"))  # an embedded frame may leave (a board in an iframe)...
+            run(session.call("observe"))
+            assert site.reached() == [("GET", "/framed")]
+        finally:
+            run(bus.get_sidecars().close(1, 70))
+
+
+def test_the_runner_lets_a_popup_no_further_than_its_redirect(runner, tmp_path):
+    """Also holds without the hop check while `_guard` leaves a popup's first request unanswered (Playwright has no
+    frame for it yet); this pins the outcome if that ever changes."""
+    from app.services import application_execution
+
+    with _RedirectSite() as site, application_execution.background_loop() as loop:
+        run = application_execution.loop_runner(loop, timeout=90)
+        session = _redirect_session(run, tmp_path, 71)
+        try:
+            run(session.call("goto", url=f"{site.on}/popup"))
+            run(session.call("observe"))
+            assert site.reached() == []
+        finally:
+            run(bus.get_sidecars().close(1, 71))
+
+
+def test_a_redirect_may_stay_on_the_routes_own_domains(runner, tmp_path):
+    from app.services import application_execution
+
+    with _RedirectSite() as site, application_execution.background_loop() as loop:
+        run = application_execution.loop_runner(loop, timeout=90)
+        session = _redirect_session(run, tmp_path, 72, redirect_domains=["localhost"])
+        try:
+            assert run(session.call("goto", url=f"{site.on}/go-off"))["final_url"] == f"{site.off}/landed"
+            assert site.reached() == [("GET", "/landed")]
+        finally:
+            run(bus.get_sidecars().close(1, 72))
+
+
+def test_a_person_in_the_window_may_follow_a_redirect_off_the_allowed_hosts(runner, tmp_path):
+    from app.services import application_execution
+
+    with _RedirectSite() as site, application_execution.background_loop() as loop:
+        run = application_execution.loop_runner(loop, timeout=90)
+        session = _redirect_session(run, tmp_path, 73)
+        try:
+            run(session.call("goto", url=f"{site.on}/timed"))  # the page moves by itself, as a person's click would
+            run(session.call("set_takeover", on=True, writes=True, seconds=60))
+            give_up = time.monotonic() + 15
+            while not site.reached() and time.monotonic() < give_up:
+                time.sleep(0.1)
+            assert site.reached() == [("GET", "/landed")]
+        finally:
+            run(bus.get_sidecars().close(1, 73))
+
+
+def test_a_signed_submit_is_not_sent_again_to_where_a_307_points(runner, tmp_path):
+    """A 307 repeats the POST and its body: with the form's answers in it, off the application's host. The evidence
+    keeps what the site answered and shows no confirmation, so the outcome stays for a person to reconcile."""
+    from app.services import application_execution
+
+    with _RedirectSite() as site, application_execution.background_loop() as loop:
+        run = application_execution.loop_runner(loop, timeout=90)
+        session = _redirect_session(run, tmp_path, 74)
+        try:
+            run(session.call("goto", url=f"{site.on}/form"))
+            button = _element(run(session.call("observe")), "Submit application")
+            token = bus.sign_action(session, "SUBMIT", button["key"], "127.0.0.1")
+            run(session.call("submit", key=button["key"], token=token))
+            assert site.reached("127.0.0.1").count(("POST", "/post-off")) == 1 and site.reached() == []
+            evidence = run(session.call("evidence"))
+            assert [(r["method"], r["status"]) for r in evidence["responses"]] == [("POST", 307)]
+        finally:
+            run(bus.get_sidecars().close(1, 74))
+
+
+@pytest.fixture
+def runner_module(monkeypatch):
+    spec = importlib.util.spec_from_file_location("browser_use_runner_under_test", RUNNER)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setenv("ANONYMIZED_TELEMETRY", "false")
+    monkeypatch.setenv("BROWSER_USE_LOGGING_LEVEL", "result")
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_runners_hop_check_refuses_internal_addresses(runner_module):
+    """The private-address half of the hop rules, in real Chromium with the runner's own guard: the application pages
+    are public, so 127.0.0.1 stands in for one and `localhost` is the internal service. (The runner's process cannot
+    be asked to do this: with private hosts refused it will not open 127.0.0.1 at all.)"""
+    from playwright.async_api import async_playwright
+
+    real_private, real_resolves = runner_module._private, runner_module._resolves_private
+    runner_module._private = lambda host: host != "127.0.0.1" and real_private(host)
+
+    async def resolves(host):
+        return host != "127.0.0.1" and await real_resolves(host)
+
+    runner_module._resolves_private = resolves
+
+    async def go(site):
+        pw = await async_playwright().start()
+        instance = runner_module.Runner()
+        instance.chromium = await pw.chromium.launch(headless=True)
+        try:
+            await instance._guard_redirects()
+            context = await instance.chromium.new_context()
+            await context.route("**/*", instance._guard)
+            page = await context.new_page()
+            with pytest.raises(Exception, match="ERR_BLOCKED_BY_CLIENT"):
+                await page.goto(f"{site.on}/go-off")
+            await page.wait_for_url(lambda now: now.startswith("chrome-error:"))  # the browser's error page has landed
+            await page.goto(f"{site.on}/frame")  # no allowed hosts here: a frame's hop meets the private check too
+            await asyncio.sleep(0.3)
+            return instance.navigation_blocked
+        finally:
+            await instance.chromium.close()
+            await pw.stop()
+
+    with _RedirectSite() as site:
+        blocked = asyncio.run(go(site))
+        assert blocked == 2 and site.reached() == []
+        assert ("GET", "/go-off") in site.reached("127.0.0.1") and ("GET", "/go-frame") in site.reached("127.0.0.1")
+
+
+def test_a_hop_that_cannot_be_judged_is_not_sent(runner_module):
+    instance = runner_module.Runner()
+    sent = []
+
+    class Session:
+        async def send(self, method, params=None):
+            sent.append(method)
+            if method == "Target.getTargets":
+                raise RuntimeError("gone")
+            return {}
+
+    event = {"requestId": "r1", "redirectedRequestId": "r0", "resourceType": "Document", "frameId": "f",
+             "request": {"url": "https://elsewhere.example/", "method": "GET", "headers": {}}}
+    asyncio.run(instance._on_paused(Session(), event))
+    assert sent == ["Target.getTargets", "Fetch.failRequest"]
+    sent.clear()
+    asyncio.run(instance._on_paused(Session(), {"requestId": "r2", "request": {"url": "https://x.example/"}}))
+    assert sent == ["Fetch.continueRequest"]  # a first hop is `_guard`'s
+
+
+@pytest.mark.parametrize("domain,expected", [
+    ("jobs.lever.co", None),  # the ATS's own domains, checked below
+    ("careers.acme.com", ["acme.com"]),
+    ("acme.com", ["acme.com"]),
+    ("www.acme.co.uk", ["acme.co.uk"]),
+    ("acme.co.uk", ["acme.co.uk"]),  # never every host under co.uk
+])
+def test_where_a_redirect_may_land(domain, expected):
+    from app.services import application_backends, ats_map
+
+    domains = application_backends.redirect_domains(ats_map.detect(f"https://{domain}/job/1"))
+    assert domains == (expected or sorted(ats_map.ats_named("lever").hosts))
+    assert application_backends.redirect_domains(None) == []
+
+
+def test_a_redirected_upload_goes_on_only_while_the_upload_may_send(runner_module):
+    """A storage bucket may answer the upload's PUT with a 307. The hop is the upload; any other write is not."""
+    instance = runner_module.Runner()
+    instance.allow_private = True
+    sent = []
+
+    class Session:
+        async def send(self, method, params=None):
+            sent.append(method)
+            return {}
+
+    event = {"requestId": "r1", "redirectedRequestId": "r0", "resourceType": "XHR", "frameId": "f",
+             "request": {"url": "https://bucket.example/file", "method": "PUT",
+                         "headers": {"Content-Type": "application/pdf"}}}
+    instance.uploading_until = time.monotonic() + 30
+    asyncio.run(instance._on_paused(Session(), event))
+    assert sent == ["Fetch.continueRequest"] and instance.uploads_started == 0  # the same upload, not a second one
+    sent.clear()
+    instance.uploading_until = 0.0
+    asyncio.run(instance._on_paused(Session(), event))
+    assert sent == ["Fetch.failRequest"] and instance.blocked == 1
