@@ -506,7 +506,10 @@ other static files.
   `model_change` (FAILOVER, RESTING, FALLBACK, ESCALATED, CONFIG) to active rows. One bounded query, metadata only, and
   it never raises. Finished rows keep the model their own last request used (`source` `used`, or `none` when the task
   never called a model) and only that request's change (FAILOVER, FALLBACK, ESCALATED); a failover's origin is the
-  request's own `llm_request_logs.failed_over_from`, never today's configuration.
+  request's own `llm_request_logs.failed_over_from`, never today's configuration. A graph that never calls a model
+  (qualification, preparation) keeps its node's empty `workers`: its kind names the workers it hands steps to
+  (`conducts`) and which one each active row is at (`step_worker`); a run with none, waiting for a person, shows what
+  it last used and no next model.
 * **A paused worker holds its queue, never drops it.** Its claim skips the account's tasks unless `run_now_at` is set
   (ranking: unless the task is forced).
 
