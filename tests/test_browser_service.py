@@ -4,6 +4,8 @@ recovery, bounded navigation, failure classification, concurrency limits and cle
 Lifecycle tests drive a fake Playwright runtime (tests/jd_support.py). The last tests start real headless Chromium
 against a local page and are skipped when Chromium is not installed (`python -m playwright install chromium`)."""
 import asyncio
+import os
+import sys
 import time
 
 import pytest
@@ -630,6 +632,47 @@ def test_real_chromium_an_application_page_is_stopped_at_the_same_redirect(publi
 
         run(go())
         assert _reached(server) == [] and {"/custom/go-top", "/custom/go-image"} <= set(server.hits)
+
+
+needs_display = pytest.mark.skipif(sys.platform != "darwin" and not os.environ.get("DISPLAY"),
+                                   reason="a visible window needs a display")
+
+
+@needs_chromium
+@needs_display
+def test_real_chromium_a_visible_window_is_stopped_at_the_same_redirect(public_loopback):
+    """The window launches its own browser, so the shared browser's guard does not cover it."""
+    with PostingServer() as server:
+        _redirecting_site(server)
+        browser = pw.PlaywrightBrowserService(record_telemetry=False, navigation_timeout_seconds=15,
+                                              visible_min_interval_seconds=0)
+
+        async def go():
+            try:
+                with pytest.raises(NavigationFailed) as failed:
+                    await browser.fetch_rendered_page(server.url("custom/go-top"), visible=True)
+                assert failed.value.category == BLOCKED_URL and not failed.value.retryable
+                page = await browser.fetch_rendered_page(server.url("custom/image-page"), visible=True)
+                assert "A posting long enough" in page.html  # the page loads; only its image's hop is stopped
+            finally:
+                await browser.stop()
+
+        run(go())
+        assert _reached(server) == [] and {"/custom/go-top", "/custom/go-image"} <= set(server.hits)
+
+
+def test_a_visible_window_without_the_redirect_guard_does_not_open_a_page(monkeypatch):
+    fake = FakeRuntime()
+    monkeypatch.setattr("playwright.async_api.async_playwright", fake)
+    monkeypatch.setattr("app.services.url_safety.check_public_url", lambda url, allow_private=False: None)
+
+    async def refuses(self):
+        raise RuntimeError("no CDP here")
+
+    monkeypatch.setattr("tests.jd_support.FakeBrowserProcess.new_browser_cdp_session", refuses)
+    with pytest.raises(BrowserUnavailable) as failed:
+        run(service().fetch_rendered_page(URL, visible=True))
+    assert failed.value.code == BROWSER_START_FAILED and fake.contexts == []
 
 
 def test_a_browser_without_the_redirect_guard_does_not_start(monkeypatch):

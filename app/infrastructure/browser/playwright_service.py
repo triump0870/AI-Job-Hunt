@@ -250,7 +250,8 @@ class PlaywrightBrowserService(BrowserService):
 
                 self._playwright = await async_playwright().start()
                 self._browser = await self._playwright.chromium.launch(headless=self.headless)
-                await self._guard_redirects()  # a browser that cannot have it does not start
+                # a browser that cannot have it does not start
+                self._redirect_guard = await self._guard_redirects(self._browser)
             except Exception as exc:
                 await self._discard()
                 raise self._start_failure(exc) from exc
@@ -330,15 +331,15 @@ class PlaywrightBrowserService(BrowserService):
                 return False
         return True
 
-    async def _guard_redirects(self) -> None:
-        """Hold every request of this browser at a browser-level CDP Fetch session, to judge redirect hops before they
+    async def _guard_redirects(self, browser: Any) -> Any:
+        """Hold every request of `browser` at a browser-level CDP Fetch session, to judge redirect hops before they
         are sent: Playwright's routing is not called for them. At the browser level (not per page) it covers popups and
         service workers too, with no moment between a target's creation and its coverage. Everything else is released
-        at once and still meets `_route`."""
-        session = await self._browser.new_browser_cdp_session()
-        self._redirect_guard = session
+        at once and still meets `_route`. The caller keeps the session for as long as the browser runs."""
+        session = await browser.new_browser_cdp_session()
         session.on("Fetch.requestPaused", lambda event: self._on_paused(session, event))
         await session.send("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]})
+        return session
 
     async def _on_paused(self, session: Any, event: dict[str, Any]) -> None:
         allow = True
@@ -384,13 +385,14 @@ class PlaywrightBrowserService(BrowserService):
     async def _visible_session(self) -> AsyncIterator[Any]:
         """A page in a window of its own, with the same isolation and URL checks as any other page. The window and its
         browser close with the page, so nothing stays on the person's screen between postings."""
-        runtime = browser = context = page = None
+        runtime = browser = context = page = guard = None
         try:
             try:
                 from playwright.async_api import async_playwright
 
                 runtime = await async_playwright().start()
                 browser = await runtime.chromium.launch(headless=False)
+                guard = await self._guard_redirects(browser)  # a window that cannot have it does not open a page
             except Exception as exc:
                 raise self._start_failure(exc) from exc
             context = await self._prepare_context(await self._isolated_context(browser))
@@ -401,6 +403,7 @@ class PlaywrightBrowserService(BrowserService):
                 await self.close_page(page)
             if context is not None:
                 await self.close_context(context)
+            del guard  # it stays alive as long as the window, then goes with it
             if browser is not None:
                 with contextlib.suppress(Exception):
                     await browser.close()
@@ -496,6 +499,7 @@ class PlaywrightBrowserService(BrowserService):
     async def _capture_failure(self, page: Any, response: Any) -> None:
         """Write bounded, failure-only local diagnostics. Deliberately omit HTML, headers, cookies and paths."""
         import json
+
         from app.services.redaction import redact_text, redact_url
 
         directory = Path("data/playwright-debug")
