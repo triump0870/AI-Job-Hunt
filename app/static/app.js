@@ -912,35 +912,68 @@ function filterBar(j, opts) {
   const f = S.filters, active = activeFilters(j), moreCount = active.filter(a => a.more).length;
   const hasDate = DATE_KEYS.some(k => f[k]);
   const fitCaps = [[0, 'Any'], [49, 'Below 50'], [69, 'Below 70'], [79, 'Below 80']];
-  const check = (key, text, title = '') => `<label class="check small" ${title ? `title="${attr(title)}"` : ''}><input type="checkbox" id="flt-${key.replace(/_/g, '-')}" data-filter="${key}" ${f[key] ? 'checked' : ''}>${text}</label>`;
+  // A real checkbox inside a pill, so the shared data-filter handler and the keyboard work as on any checkbox.
+  const toggle = (key, text, title = '') => `<label class="filter-toggle ${f[key] ? 'on' : ''}" ${title ? `title="${attr(title)}"` : ''}><input type="checkbox" id="flt-${key.replace(/_/g, '-')}" data-filter="${key}" ${f[key] ? 'checked' : ''}><span class="filter-toggle-mark" aria-hidden="true">✓</span>${text}</label>`;
   const field = (text, control) => `<label class="field xs">${text}${control}</label>`;
+  const group = (name, body) => `<div class="filter-group" role="group" aria-label="${attr(name)}"><div class="filter-group-name">${esc(name)}</div><div class="filter-group-body">${body}</div></div>`;
+  const stage = f.stage || 'all';
   return `<div class="filterbar">
-    <div class="toolbar">
-      <input class="input grow" style="min-width:180px" id="flt-q" data-filter="q" value="${attr(f.q)}" placeholder="Search title, company or location…" aria-label="Search jobs">
-      <button type="button" class="btn sm datebtn ${hasDate ? 'on' : ''}" id="flt-date" data-act="date-pop" aria-expanded="${S.datePop}" aria-controls="flt-date-panel"><span aria-hidden="true">◷</span>${esc(dateLabel(f))}<span class="faint" aria-hidden="true">${S.datePop ? '▴' : '▾'}</span></button>
-      <select class="select" id="flt-min" data-filter="min_fit" aria-label="Minimum fit">${opts([[0, 'Any fit'], [50, 'Fit ≥ 50'], [70, 'Fit ≥ 70'], [80, 'Fit ≥ 80']], f.min_fit)}</select>
-      <select class="select" id="flt-stage" data-filter="stage" aria-label="Stage">${opts([['all', 'All stages'], ['unranked', 'Unranked'], ...['discovered', 'shortlisted', 'maybe', 'archived', 'dismissed', 'tailored', 'needs_retailor', 'pending_approval', 'approved', 'applied'].map(s => [s, statusTitle(s)])], f.stage)}</select>
+    <div class="toolbar filter-find">
+      <input class="input grow filter-search" id="flt-q" data-filter="q" value="${attr(f.q)}" placeholder="Search title, company or location…" aria-label="Search jobs">
       <select class="select" id="flt-sort" data-filter="sort" aria-label="Sort">${opts([['fit', 'Sort: best fit'], ['new', 'Sort: newest found'], ['posted', 'Sort: newest posted'], ['company', 'Sort: company']], f.sort)}</select>
-      <button type="button" class="btn sm ${S.moreFilters || moreCount ? 'soft' : ''}" data-act="toggle-more-filters" aria-expanded="${S.moreFilters}" aria-controls="flt-more">More filters${moreCount ? ` · ${moreCount}` : ''} <span aria-hidden="true">${S.moreFilters ? '▴' : '▾'}</span></button>
-      <span class="grow"></span>
       ${S.checked.size || f.description !== 'NO_DESCRIPTION' ? '' : `<span title="Reads every job with no description from its posting. Jobs your domain filter hides are left out.">${btn(label('recoverDescriptions', 'Fetch missing descriptions', 'Queueing…'), 'recover-descriptions', {}, 'sm', isBusy('recoverDescriptions'))}</span>`}
       ${S.checked.size ? '' : btn(label('rankBatch', 'Rank unranked', 'Queueing…'), 'rank-batch', {}, 'sm', isBusy('rankBatch'))}
     </div>
+    <div class="filter-pills">
+      <button type="button" class="filter-pill ${hasDate ? 'on' : ''}" id="flt-date" data-act="date-pop" aria-expanded="${S.datePop}" aria-controls="flt-date-panel"><span aria-hidden="true">◷</span>${esc(dateLabel(f))}<span class="filter-caret" aria-hidden="true">${S.datePop ? '▴' : '▾'}</span></button>
+      <select class="select filter-pill ${f.min_fit ? 'on' : ''}" id="flt-min" data-filter="min_fit" aria-label="Minimum fit">${opts([[0, 'Any fit'], [50, 'Fit ≥ 50'], [70, 'Fit ≥ 70'], [80, 'Fit ≥ 80']], f.min_fit)}</select>
+      <select class="select filter-pill ${stage !== 'all' ? 'on' : ''}" id="flt-stage" data-filter="stage" aria-label="Stage">${opts([['all', 'All stages'], ['unranked', 'Unranked'], ...['discovered', 'shortlisted', 'maybe', 'archived', 'dismissed', 'tailored', 'needs_retailor', 'pending_approval', 'approved', 'applied'].map(s => [s, statusTitle(s)])], f.stage)}</select>
+      <span class="grow"></span>
+      <button type="button" class="filter-pill ${S.moreFilters || moreCount ? 'on' : ''}" data-act="toggle-more-filters" aria-expanded="${S.moreFilters}" aria-controls="flt-more">More filters${moreCount ? `<span class="filter-count" aria-label="${moreCount} active">${moreCount}</span>` : ''}<span class="filter-caret" aria-hidden="true">${S.moreFilters ? '▴' : '▾'}</span></button>
+    </div>
     ${S.datePop ? datePopover(f) : ''}
     ${S.moreFilters ? `<div class="filter-more" id="flt-more">
-      ${field('Board', `<select class="select" id="flt-board" data-filter="board">${opts([['all', 'All boards'], ...(j.boards || []).map(b => [b, b])], f.board)}</select>`)}
-      ${field('Location', `<select class="select" id="flt-location" data-filter="location">${opts(locationOptions(j.locations || []), f.location)}</select>`)}
-      ${field('Work mode', `<select class="select" id="flt-work-mode" data-filter="work_mode" title="As the board states it: a job that does not say remote or hybrid is “not stated”">${opts([['all', 'Any work mode'], ...Object.entries(WORK_MODE_NAMES).map(([k, t]) => [k, `${t} (${j.work_modes?.[k] ?? 0})`])], f.work_mode)}</select>`)}
-      ${field('Job type', `<select class="select" id="flt-job-type" data-filter="job_type">${opts([['all', 'Any job type'], ...(j.job_types || []).map(t => [t, titleCase(t)])], f.job_type)}</select>`)}
-      ${field('Fit up to', `<select class="select" id="flt-max" data-filter="max_fit">${opts(fitCaps, f.max_fit)}</select>`)}
-      ${field('Search setup', `<select class="select" id="flt-setup" data-filter="setup_id">${opts([['', 'Any setup'], ...(j.setups || [])], f.setup_id)}</select>`)}
-      ${field('Domain', `<select class="select" id="flt-domain" data-filter="domain" title="Jobs outside your domain are hidden at discovery and never ranked (Settings → Domain filter)">${opts([['matching', `Matching (${j.domain_counts?.matching ?? 0})`], ['not_matching', `Not matching (${j.domain_counts?.not_matching ?? 0})`], ['all', 'Any domain']], f.domain || 'matching')}</select>`)}
-      ${field('Description', `<select class="select" id="flt-description" data-filter="description">${opts([['all', 'Any description'], ...(j.description_states || []).map(([k, name, n]) => [k, `${name} (${n})`])], f.description)}</select>`)}
-      <div class="filter-wide"><div class="xs muted mb4">Must mention <span class="faint">· all of them; use / for either</span></div>${tagBox('flt', 'keywords', f.keywords || [], 'Python, Lead/Principal… then Enter', 6)}</div>
-      <div class="filter-wide row gap16 wrap">${check('has_salary', 'Salary listed', 'Only jobs whose posting states a salary')}${check('hide_agencies', 'Hide staffing agencies')}${check('hide_reposts', 'Hide reposts')}${check('include_applied', 'Show applied', 'Jobs you already applied to are hidden from Discovery; the Applied stage always shows them')}</div>
+      ${group('Role', `
+        ${field('Location', `<select class="select" id="flt-location" data-filter="location">${opts(locationOptions(j.locations || []), f.location)}</select>`)}
+        ${field('Work mode', `<select class="select" id="flt-work-mode" data-filter="work_mode" title="As the board states it: a job that does not say remote or hybrid is “not stated”">${opts([['all', 'Any work mode'], ...Object.entries(WORK_MODE_NAMES).map(([k, t]) => [k, `${t} (${j.work_modes?.[k] ?? 0})`])], f.work_mode)}</select>`)}
+        ${field('Job type', `<select class="select" id="flt-job-type" data-filter="job_type">${opts([['all', 'Any job type'], ...(j.job_types || []).map(t => [t, titleCase(t)])], f.job_type)}</select>`)}`)}
+      ${group('Source', `
+        ${field('Board', `<select class="select" id="flt-board" data-filter="board">${opts([['all', 'All boards'], ...(j.boards || []).map(b => [b, b])], f.board)}</select>`)}
+        ${field('Search setup', `<select class="select" id="flt-setup" data-filter="setup_id">${opts([['', 'Any setup'], ...(j.setups || [])], f.setup_id)}</select>`)}`)}
+      ${group('Match', `
+        ${field('Fit up to', `<select class="select" id="flt-max" data-filter="max_fit">${opts(fitCaps, f.max_fit)}</select>`)}
+        ${field('Domain', `<select class="select" id="flt-domain" data-filter="domain" title="Jobs outside your domain are hidden at discovery and never ranked (Settings → Domain filter)">${opts([['matching', `Matching (${j.domain_counts?.matching ?? 0})`], ['not_matching', `Not matching (${j.domain_counts?.not_matching ?? 0})`], ['all', 'Any domain']], f.domain || 'matching')}</select>`)}
+        ${field('Description', `<select class="select" id="flt-description" data-filter="description">${opts([['all', 'Any description'], ...(j.description_states || []).map(([k, name, n]) => [k, `${name} (${n})`])], f.description)}</select>`)}`)}
+      ${group('Must mention', `<div class="filter-wide">${tagBox('flt', 'keywords', f.keywords || [], 'Python, Lead/Principal… then Enter', 6)}<div class="xs faint mt6">Jobs must mention all of them; use / for either</div></div>`)}
+      ${group('Quick toggles', `${toggle('has_salary', 'Salary listed', 'Only jobs whose posting states a salary')}${toggle('hide_agencies', 'Hide staffing agencies')}${toggle('hide_reposts', 'Hide reposts')}${toggle('include_applied', 'Show applied', 'Jobs you already applied to are hidden from Discovery; the Applied stage always shows them')}`)}
     </div>` : ''}
-    ${active.length ? `<div class="filter-chips" aria-label="Active filters">${active.map(a => `<span class="chip grey">${esc(a.text)}<button type="button" aria-label="Remove filter ${attr(a.text)}" data-act="clear-filter" data-keys="${a.keys.join(',')}">×</button></span>`).join('')}<a href="#" class="xs" data-act="reset-filters">Clear all</a></div>` : ''}
+    ${active.length ? `<div class="filter-chips" aria-label="Active filters">${active.map(a => `<span class="chip">${esc(a.text)}<button type="button" aria-label="Remove filter ${attr(a.text)}" data-act="clear-filter" data-keys="${a.keys.join(',')}">×</button></span>`).join('')}<a href="#" class="xs" data-act="reset-filters">Clear all</a></div>` : ''}
   </div>`;
+}
+
+function listingCheckButton() {
+  const run = S.listingRun;
+  return `<span title="Re-reads all your postings not read in the last hour, least recently checked first, and deletes the ones whose page says they are gone or closed. Approved and applied jobs are kept, and a page that cannot be read deletes nothing.">${btn(run ? `Checking ${Math.min(run.checked, run.due)} of ${run.due}…` : label('listingCheck', 'Check listings', 'Starting…'), 'listing-check', {}, 'sm ghost', !!run || isBusy('listingCheck'))}</span>`;
+}
+const LISTING_POLL_MS = 3000, LISTING_POLL_IDLE = 5, LISTING_POLL_MAX = 1200;  // an hour at most: the check goes on regardless
+async function pollListingCheck(tries = 0) {
+  const run = S.listingRun;
+  if (!run) return;
+  let finished = false, lost = tries >= LISTING_POLL_MAX;
+  try {
+    const seen = await api(`/api/jobs/listing-check/status?since=${encodeURIComponent(run.since)}`);
+    run.idle = seen.running || seen.checked !== run.checked ? 0 : (run.idle || 0) + 1;
+    run.checked = seen.checked;
+    if (seen.removed !== run.removed) { run.removed = seen.removed; load(); }
+    // A posting whose check failed outright is never counted, so a run that stopped moving has ended too.
+    finished = seen.checked >= run.due || run.idle >= LISTING_POLL_IDLE;
+  } catch { lost = true; }
+  if (!finished && !lost) { render(); setTimeout(() => pollListingCheck(tries + 1), LISTING_POLL_MS); return; }
+  S.listingRun = null;
+  toast(!finished ? 'The listing check goes on in the background · refresh later to see the result'
+    : run.checked < run.due ? `Listing check stopped at ${run.checked} of ${run.due}${run.removed ? ` · ${run.removed} removed` : ''} · sites are rate limiting, so press it again later for the rest`
+    : run.removed ? `Listing check done · ${run.removed} dead posting${run.removed === 1 ? '' : 's'} removed` : 'Listing check done · no dead postings found');
+  load();
 }
 
 function renderTable() {
@@ -970,7 +1003,7 @@ function renderTable() {
       ${resumeSelect('bulk-resume', '', { placeholder: 'Use resume…', disabled: isBusy('bulkResume'), fill: false })}
       <span class="grow"></span>${btn('Clear selection', 'clear-selection', {}, 'sm ghost')}
     </div>` : ''}
-    <div class="row between wrap" style="padding:9px 14px;border-bottom:1px solid var(--line2);background:#fbfbfe"><span class="small muted">${j.total ? `Showing ${start}–${Math.min(j.page * j.per_page, j.total)} of ${j.total} jobs` : 'No matches'}</span><span class="small muted">Page ${j.page} of ${j.pages} · ${j.total + (j.applied_hidden || 0) === j.total_all ? 'no filters applied' : `${j.total_all - j.total - (j.applied_hidden || 0)} hidden by filters`}${j.applied_hidden ? ` · ${j.applied_hidden} applied job${j.applied_hidden === 1 ? '' : 's'} hidden` : ''}</span></div>
+    <div class="row between wrap" style="padding:9px 14px;border-bottom:1px solid var(--line2);background:#fbfbfe"><span class="row gap8 wrap"><span class="small muted">${j.total ? `Showing ${start}–${Math.min(j.page * j.per_page, j.total)} of ${j.total} jobs` : 'No matches'}</span>${listingCheckButton()}</span><span class="small muted">Page ${j.page} of ${j.pages} · ${j.total + (j.applied_hidden || 0) === j.total_all ? 'no filters applied' : `${j.total_all - j.total - (j.applied_hidden || 0)} hidden by filters`}${j.applied_hidden ? ` · ${j.applied_hidden} applied job${j.applied_hidden === 1 ? '' : 's'} hidden` : ''}</span></div>
     ${allOnPage && j.total > j.items.length && S.checked.size < j.total ? `<div class="banner" style="border-radius:0;border-width:0 0 1px">All ${j.items.length} on this page are selected. <a href="#" data-act="select-all-matching">${isBusy('selectAll') ? 'Selecting…' : `Select all ${j.total} matching jobs`}</a></div>` : ''}
     ${S.checked.size && S.checked.size >= j.total && j.total > j.items.length ? `<div class="banner" style="border-radius:0;border-width:0 0 1px">All ${S.checked.size} matching jobs are selected. <a href="#" data-act="clear-selection">Clear selection</a></div>` : ''}
     <div class="jgrid jhead"><input type="checkbox" data-act="check-all" ${allOnPage ? 'checked' : ''} aria-label="Select page"><span>OPPORTUNITY</span><span class="tr">FIT</span><span>STAGE</span><span>SOURCE</span><span class="tr">POSTED</span></div>
@@ -2059,7 +2092,9 @@ function renderJobModal() {
   else tab = `<div style="padding:20px 22px">${textareaF('jobnotes', j.id, j.notes, 'placeholder="Anything worth remembering about this role…" style="min-height:160px"')}${btn(label('jobnotes', 'Save notes', 'Saving…'), 'save-job-notes', { id: j.id }, 'primary sm mt10', isBusy('jobnotes'))}</div>`;
   return `<div class="overlay" data-act="overlay-close"><div class="modal" role="dialog" aria-label="Job detail" data-scroll-key="job-modal-${j.id}">
     <div class="modal-head"><div class="row top-align gap16 wrap"><div class="avatar lg">${esc(initials(j.company))}</div>
-      <div style="flex:1 1 240px;min-width:0"><div style="font-size:21px;font-weight:600;letter-spacing:-.02em">${esc(j.title)}</div><div class="muted mt4" style="font-size:13.5px">${esc(j.company)}${j.location ? ' · ' + esc(j.location) : ''} · ${esc(j.board)} · ${postedTxt(j) ? `<span class="ink2">${esc(postedTxt(j))}</span>` : '<span class="faint" title="The job board did not give a posting date">posting date not listed</span>'} · found ${esc(j.posted)}</div></div>
+      <div style="flex:1 1 240px;min-width:0">${S.titleEdit === j.id
+        ? `<div class="job-title-edit">${inputF('jobtitle', j.id, j.title, 'aria-label="Job title" maxlength="300"')}${btn(label('titlesave' + j.id, 'Save', 'Saving…'), 'save-job-title', { id: j.id }, 'primary sm', isBusy('titlesave' + j.id))}${btn('Cancel', 'cancel-job-title', { id: j.id }, 'sm')}</div>`
+        : `<div class="job-title"><span>${esc(j.title)}</span><button type="button" class="job-title-btn" data-act="edit-job-title" data-id="${j.id}" aria-label="Edit job title" title="Edit job title">✎</button></div>`}<div class="muted mt4" style="font-size:13.5px">${esc(j.company)}${j.location ? ' · ' + esc(j.location) : ''} · ${esc(j.board)} · ${postedTxt(j) ? `<span class="ink2">${esc(postedTxt(j))}</span>` : '<span class="faint" title="The job board did not give a posting date">posting date not listed</span>'} · found ${esc(j.posted)}</div></div>
       <div class="row gap8 wrap"><div class="scorebox sm"><div class="n">${fitTxt(j.fit)}</div><div class="l">FIT</div></div>
         ${j.url ? `<a class="btn" href="${attr(j.url)}" target="_blank" rel="noopener">Open posting ↗</a>` : ''}
         ${['approved', 'applied'].includes(j.status) ? btn('Open apply kit', 'modal-kit', { id: j.id }, 'primary')
@@ -2244,7 +2279,7 @@ function queueTailoring(ids, mode, regenerate, busyKey, onQueued, extra = {}) {
 
 /* ───────────── actions ───────────── */
 async function openJob(id) {
-  S.jobOpen = Number(id); S.jobTab = 'description'; render();
+  S.jobOpen = Number(id); S.jobTab = 'description'; S.titleEdit = null; render();
   try {
     [D.jobModal] = await Promise.all([api(`/api/jobs/${id}`), loadResumeChoices()]);
     if (recoveryActive(D.jobModal.description_recovery)) watchRecovery(id);
@@ -2536,6 +2571,26 @@ const A = {
     return D.gateway;
   }, g => g.gateway_enabled ? 'Workers now use the LiteLLM gateway' : `Workers now call ${g.direct_label} directly`);
   },
+  'edit-job-title': el => {
+    const id = el.dataset.id;
+    S.titleEdit = Number(id); render();
+    const input = document.getElementById(`jobtitle-${id}`);
+    input?.focus(); input?.select();
+  },
+  'cancel-job-title': el => {
+    const id = el.dataset.id;
+    S.titleEdit = null; if (S.forms.jobtitle) delete S.forms.jobtitle[id];
+    render();
+    document.querySelector('[data-act="edit-job-title"]')?.focus();
+  },
+  'save-job-title': el => busy('titlesave' + el.dataset.id, async () => {
+    const id = el.dataset.id;
+    const out = await api(`/api/jobs/${id}/title`, { method: 'PUT', body: { title: fv('jobtitle', id, D.jobModal?.title || '') } });
+    S.titleEdit = null; if (S.forms.jobtitle) delete S.forms.jobtitle[id];
+    if (D.jobModal?.id === Number(id)) D.jobModal = { ...D.jobModal, title: out.job.title };
+    load();  // the lists behind the modal show the title too
+    return out;
+  }, 'Job title saved'),
   'edit-job-description': el => { S.jobTab = 'description'; S.descEdit = Number(el.dataset.id); render(); },
   'cancel-job-description': el => {
     S.descEdit = null; if (S.forms.jobdesc) delete S.forms.jobdesc[el.dataset.id];
@@ -2984,6 +3039,11 @@ const A = {
       return out;
     }, out => `Removed ${out.removed.length} from ranking${out.skipped.length ? ` · ${out.skipped.length} not removed: ${out.skipped[0].reason}` : ''}`);
   },
+  'listing-check': () => busy('listingCheck', async () => {
+    const out = await api('/api/jobs/listing-check', { method: 'POST' });
+    if (out.due) { S.listingRun = { due: out.due, since: out.since, checked: 0, removed: 0 }; setTimeout(pollListingCheck, LISTING_POLL_MS); }
+    return out;
+  }, out => out.due ? `Checking ${out.due} posting${out.due === 1 ? '' : 's'}` : 'Every posting was checked in the last hour'),
   'rank-batch': () => busy('rankBatch', async () => {
     const out = await api('/api/jobs/rank-batch', { method: 'POST' });
     if (!out.queued.length && !out.skipped.length) throw new Error('Every job is already ranked');
@@ -3394,7 +3454,11 @@ function commitTag(el, redraw = true) {
 document.addEventListener('keydown', e => {
   const el = e.target;
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); A.palette(); return; }
+  // In the job title box, Enter saves and Escape leaves the edit, not the whole modal.
+  if (el.dataset?.form === 'jobtitle' && e.key === 'Enter') { e.preventDefault(); A['save-job-title']({ dataset: { id: el.dataset.field } }); return; }
+  if (el.dataset?.form === 'jobtitle' && e.key === 'Escape') { A['cancel-job-title']({ dataset: { id: el.dataset.field } }); return; }
   if (e.key === 'Escape' && S.datePop) { S.datePop = false; render(); document.getElementById('flt-date')?.focus(); return; }
+  if (e.key === 'Escape' && S.moreFilters && document.getElementById('flt-more') && !S.paletteOpen && !S.jobOpen && !S.kitJob && !S.boardReview) { S.moreFilters = false; render(); document.querySelector('[data-act="toggle-more-filters"]')?.focus(); return; }
   if (e.key === 'Escape') { if (S.boardReview && !S.paletteOpen && !S.jobOpen && !S.kitJob) { S.boardReview = null; render(); return; } if (S.paletteOpen || S.jobOpen || S.kitJob) { S.paletteOpen = false; S.jobOpen = null; S.kitJob = null; render(); } return; }
   if (el.dataset && el.dataset.tag) {
     if (e.key === 'Enter' || (e.key === ',' && el.dataset.split !== 'newline')) { e.preventDefault(); if (el.value.trim()) commitTag(el); return; }

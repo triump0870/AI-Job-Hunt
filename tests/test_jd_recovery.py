@@ -1006,30 +1006,57 @@ def _no_tasks(*job_ids: int) -> None:
         db.commit()
 
 
-def test_the_bulk_api_queues_every_job_with_no_description(owner, server):
-    client = TestClient(web_app)
-    empty = new_job(owner, server.url("posting.html"), description="")
-    blank = new_job(owner, server.url("posting.html") + "?2", description="   ")
-    described = new_job(owner, server.url("posting.html") + "?3", description=page("posting"))
-    _no_tasks(empty, blank, described)
-    out = client.post("/api/jobs/recover-descriptions")
-    assert out.status_code == 202 and out.json()["queued"] == 2
-    assert server.hits == [], "the request itself never fetches the page"
-    assert task_of(empty).reason == "user_request" and task_of(blank).status == "PENDING"
-    assert task_of(described) is None
+@pytest.fixture
+def own_account():
+    """An account of its own: other test files leave jobs with no description on the shared test user."""
+    with SessionLocal() as db:
+        user = User(email=f"{uuid.uuid4().hex}@jobhunt.test", password_hash="!")
+        db.add(user)
+        db.commit()
+        user_id = user.id
+    yield user_id
+    _clean(user_id)
+    with SessionLocal() as db:
+        db.execute(delete(User).where(User.id == user_id))
+        db.commit()
 
 
-def test_the_bulk_api_tries_a_blocked_job_again_and_never_queues_one_twice(owner, server):
-    client = TestClient(web_app)
-    job_id = new_job(owner, server.url("login.html"), description="")
+def bulk(user_id: int, **options) -> dict[str, int]:
+    with SessionLocal() as db:
+        db.info["user_id"] = user_id
+        return jd_recovery.enqueue_missing(db, **options)
+
+
+NOTHING_LEFT_OUT = {"already_queued": 0, "hidden_by_domain": 0, "held_for_review": 0, "set_aside": 0, "no_url": 0,
+                    "over_limit": 0}
+
+
+def test_the_bulk_api_queues_a_job_with_no_description(owner, server):
+    job_id = new_job(owner, server.url("posting.html"), description="")
     _no_tasks(job_id)
-    assert client.post("/api/jobs/recover-descriptions").json()["queued"] == 1
-    again = client.post("/api/jobs/recover-descriptions").json()
-    assert again["queued"] == 0 and again["already_queued"] == 1
+    out = TestClient(web_app).post("/api/jobs/recover-descriptions")
+    assert out.status_code == 202 and out.json()["queued"] >= 1
+    assert server.hits == [], "the request itself never fetches the page"
+    assert task_of(job_id).reason == "user_request" and task_of(job_id).status == "PENDING"
+
+
+def test_bulk_recovery_queues_only_jobs_with_no_description(own_account, server):
+    empty = new_job(own_account, server.url("posting.html"), description="")
+    blank = new_job(own_account, server.url("posting.html") + "?2", description="   ")
+    described = new_job(own_account, server.url("posting.html") + "?3", description=page("posting"))
+    _no_tasks(empty, blank, described)
+    assert bulk(own_account) == {"queued": 2, **NOTHING_LEFT_OUT}
+    assert task_of(empty).status == task_of(blank).status == "PENDING" and task_of(described) is None
+
+
+def test_bulk_recovery_tries_a_blocked_job_again_and_never_queues_one_twice(own_account, server):
+    job_id = new_job(own_account, server.url("login.html"), description="")
+    _no_tasks(job_id)
+    assert bulk(own_account)["queued"] == 1
+    assert bulk(own_account) == {"queued": 0, **NOTHING_LEFT_OUT, "already_queued": 1}
     run_recovery(FakeBrowser())
     assert task_of(job_id).status == "BLOCKED"
-    assert client.post("/api/jobs/recover-descriptions").json()["queued"] == 1
-    assert task_of(job_id).status == "PENDING"
+    assert bulk(own_account)["queued"] == 1 and task_of(job_id).status == "PENDING"
 
 
 @pytest.mark.parametrize("fields,reason", [
@@ -1037,48 +1064,33 @@ def test_the_bulk_api_tries_a_blocked_job_again_and_never_queues_one_twice(owner
     ({"domain_match": "REVIEW"}, "held_for_review"), ({"status": "dismissed"}, "set_aside"),
     ({"status": "archived"}, "set_aside"), ({"company": "Skipped Inc"}, "set_aside"),
     ({"url": "", "source_url": ""}, "no_url")])
-def test_the_bulk_api_spends_nothing_on_a_job_left_out(owner, server, fields, reason):
+def test_bulk_recovery_spends_nothing_on_a_job_left_out(own_account, server, fields, reason):
     fields = dict(fields)
-    job_id = new_job(owner, fields.pop("url", server.url("posting.html")), description="", **fields)
+    job_id = new_job(own_account, fields.pop("url", server.url("posting.html")), description="", **fields)
     _no_tasks(job_id)
-    with SessionLocal() as db:
-        db.info["user_id"] = owner
-        out = jd_recovery.enqueue_missing(db, excluded_companies={"skipped inc"})
-    assert out[reason] >= 1 and task_of(job_id) is None  # other files may leave jobs of this user behind
+    assert bulk(own_account, excluded_companies={"skipped inc"}) == {"queued": 0, **NOTHING_LEFT_OUT, reason: 1}
+    assert task_of(job_id) is None
 
 
-def test_the_bulk_api_keeps_a_job_the_domain_check_kept(owner, server):
-    job_id = new_job(owner, server.url("posting.html"), description="", domain_match="KEPT")
+def test_bulk_recovery_keeps_a_job_the_domain_check_kept(own_account, server):
+    job_id = new_job(own_account, server.url("posting.html"), description="", domain_match="KEPT")
     _no_tasks(job_id)
-    assert TestClient(web_app).post("/api/jobs/recover-descriptions").json()["queued"] == 1
+    assert bulk(own_account)["queued"] == 1
 
 
-def test_the_bulk_api_queues_a_bounded_number_newest_first(owner, server):
-    ids = [new_job(owner, server.url("posting.html") + f"?{n}", description="") for n in range(3)]
+def test_bulk_recovery_queues_a_bounded_number_newest_first(own_account, server):
+    ids = [new_job(own_account, server.url("posting.html") + f"?{n}", description="") for n in range(3)]
     _no_tasks(*ids)
-    with SessionLocal() as db:
-        db.info["user_id"] = owner
-        out = jd_recovery.enqueue_missing(db, limit=2)
-    assert out["queued"] == 2 and out["over_limit"] == 1
+    assert bulk(own_account, limit=2) == {"queued": 2, **NOTHING_LEFT_OUT, "over_limit": 1}
     assert task_of(ids[0]) is None and task_of(ids[2]) is not None
 
 
-def test_the_bulk_api_leaves_another_accounts_jobs_alone(owner, server):
-    with SessionLocal() as db:
-        other = User(email=f"{uuid.uuid4().hex}@jobhunt.test", password_hash="!")
-        db.add(other)
-        db.commit()
-        other_id = other.id
-    try:
-        theirs = new_job(other_id, server.url("posting.html"), description="")
-        _no_tasks(theirs)
-        assert TestClient(web_app).post("/api/jobs/recover-descriptions").json()["queued"] == 0
-        assert task_of(theirs) is None
-    finally:
-        _clean(other_id)
-        with SessionLocal() as db:
-            db.execute(delete(User).where(User.id == other_id))
-            db.commit()
+def test_bulk_recovery_leaves_another_accounts_jobs_alone(own_account, owner, server):
+    theirs = new_job(own_account, server.url("posting.html"), description="")
+    _no_tasks(theirs)
+    TestClient(web_app).post("/api/jobs/recover-descriptions").raise_for_status()  # signed in as `owner`
+    assert task_of(theirs) is None
+    assert bulk(own_account)["queued"] == 1, "its owner still can"
 
 
 def test_the_manual_api_leaves_a_usable_description_alone(owner, server):

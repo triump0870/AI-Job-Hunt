@@ -40,6 +40,9 @@ RUNNER = Path(__file__).resolve().parents[3] / "sidecars" / "browser_use_runner"
 PROTOCOL = 1
 EXPECTED_BROWSER_USE = "0.1.48"
 SIGNED_SECONDS = 60
+# What the runner's `submit` refuses with before it touches the page: only these prove no click happened and may release
+# a claim. Anything else from `submit` (BROWSER_ERROR, a code added later) leaves the outcome unknown.
+REFUSED_BEFORE_CLICK = frozenset({"NOT_OPEN", "SESSION_EXPIRED", "ELEMENT_GONE", "BAD_TOKEN", "NOT_A_SUBMIT"})
 
 
 

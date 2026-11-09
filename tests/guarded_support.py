@@ -21,7 +21,8 @@ ERROR = b"""<!doctype html><html><head><title>Error</title></head><body><p>Somet
 
 class FakeATS:
     """Serves the fixture forms, counts every request, and answers POST /apply/submit with `answer`:
-    "confirm" (303 to a confirmation page), "ambiguous" (200, no form and no confirmation) or "error" (500)."""
+    "confirm" (303 to a confirmation page), "ambiguous" (200, no form and no confirmation), "off_site" (307, repeating
+    the POST on `localhost`, another host of this same server) or "error" (500)."""
 
     def __init__(self, answer: str = "confirm", pages: dict[str, bytes] | None = None) -> None:
         self.answer = answer
@@ -63,6 +64,9 @@ class FakeATS:
                         return self._send(303, b"", {"Location": "/confirmation.html"})
                     if ats.answer == "ambiguous":
                         return self._send(200, AMBIGUOUS)
+                    if ats.answer == "off_site":
+                        port = self.server.server_address[1]
+                        return self._send(307, b"", {"Location": f"http://localhost:{port}/elsewhere"})
                     return self._send(500, ERROR)
                 return self._send(200, b"ok")
 

@@ -200,8 +200,67 @@ describe('Jobs · modern filter bar', () => {
     const root = view();
     const chips = [...root.querySelectorAll('.filter-chips .chip')].map(c => c.firstChild.textContent);
     expect(chips).toEqual(['Fit ≥ 70', 'Remote', 'Setup: Backend · remote', 'Mentions python', 'Salary listed']);
-    expect(root.querySelector('[data-act="toggle-more-filters"]').textContent).toContain('More filters · 4');
+    const more = root.querySelector('[data-act="toggle-more-filters"]');
+    expect(more.textContent).toContain('More filters');
+    expect(more.querySelector('.filter-count').textContent).toBe('4');
     expect(root.querySelector('[data-act="clear-filter"][aria-label="Remove filter Remote"]').dataset.keys).toBe('work_mode');
+  });
+
+  it('tints a pill only when its filter is set, and shows no count with nothing in the panel set', () => {
+    ui.D.jobs = jobs([row(1, 80)]);
+    ui.S.filters = ui.freshFilters();
+    let root = view();
+    for (const id of ['flt-date', 'flt-min', 'flt-stage']) expect(root.querySelector(`#${id}`).classList.contains('on')).toBe(false);
+    expect(root.querySelector('[data-act="toggle-more-filters"]').classList.contains('on')).toBe(false);
+    expect(root.querySelector('.filter-count')).toBeNull();
+    ui.S.filters = { ...ui.freshFilters(), min_fit: 70, stage: 'shortlisted', within: '7d' };
+    root = view();
+    for (const id of ['flt-date', 'flt-min', 'flt-stage']) expect(root.querySelector(`#${id}`).classList.contains('on')).toBe(true);
+  });
+
+  it('keeps search, sort and Rank unranked together, apart from the filter pills', () => {
+    ui.D.jobs = jobs([row(1, 80)]);
+    const root = view();
+    const find = root.querySelector('.filter-find');
+    expect(find.querySelector('#flt-q')).not.toBeNull();
+    expect(find.querySelector('#flt-sort')).not.toBeNull();
+    expect(find.querySelector('[data-act="rank-batch"]')).not.toBeNull();
+    expect(root.querySelector('.filter-pills #flt-min')).not.toBeNull();
+  });
+
+  it('groups the panel and keeps every filter control', () => {
+    ui.D.jobs = jobs([row(1, 80)]);
+    ui.S.moreFilters = true;
+    const root = view();
+    ui.S.moreFilters = false;
+    expect([...root.querySelectorAll('#flt-more .filter-group-name')].map(n => n.textContent))
+      .toEqual(['Role', 'Source', 'Match', 'Must mention', 'Quick toggles']);
+    expect([...root.querySelectorAll('#flt-more select')].map(s => s.dataset.filter))
+      .toEqual(['location', 'work_mode', 'job_type', 'board', 'setup_id', 'max_fit', 'domain', 'description']);
+    expect(root.querySelector('#flt-more #flt-keywords')).not.toBeNull();
+  });
+
+  it('makes the quick toggles real checkboxes in pills that show their state', () => {
+    ui.D.jobs = jobs([row(1, 80)]);
+    ui.S.moreFilters = true;
+    ui.S.filters = { ...ui.freshFilters(), has_salary: true };
+    const root = view();
+    ui.S.moreFilters = false;
+    const box = id => root.querySelector(`#${id}`);
+    expect(box('flt-has-salary').type).toBe('checkbox');
+    expect(box('flt-has-salary').checked).toBe(true);
+    expect(box('flt-has-salary').closest('.filter-toggle').classList.contains('on')).toBe(true);
+    expect(box('flt-hide-agencies').dataset.filter).toBe('hide_agencies');
+    expect(box('flt-hide-agencies').closest('.filter-toggle').classList.contains('on')).toBe(false);
+  });
+
+  it('Escape closes the panel and gives focus back to its button', () => {
+    ui.D.jobs = jobs([row(1, 80)]);
+    ui.S.moreFilters = true;
+    const root = view();
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+    expect(ui.S.moreFilters).toBe(false);
+    expect(document.activeElement).toBe(root.querySelector('[data-act="toggle-more-filters"]'));
   });
 });
 
