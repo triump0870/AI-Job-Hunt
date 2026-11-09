@@ -943,8 +943,9 @@ function filterBar(j, opts) {
   </div>`;
 }
 
-function listingCheckButton() {
+function listingCheckButton(jobs) {
   const run = S.listingRun;
+  if (!run && jobs?.listing_checked_today) return '';  // the scheduled check already ran today; a run in progress keeps its progress
   return `<span title="Re-reads all your postings not read in the last hour, least recently checked first, and deletes the ones whose page says they are gone or closed. Approved and applied jobs are kept, and a page that cannot be read deletes nothing.">${btn(run ? `Checking ${Math.min(run.checked, run.due)} of ${run.due}…` : label('listingCheck', 'Check listings', 'Starting…'), 'listing-check', {}, 'sm ghost', !!run || isBusy('listingCheck'))}</span>`;
 }
 const LISTING_POLL_MS = 3000, LISTING_POLL_IDLE = 5, LISTING_POLL_MAX = 1200;  // an hour at most: the check goes on regardless
@@ -995,7 +996,7 @@ function renderTable() {
       ${resumeSelect('bulk-resume', '', { placeholder: 'Use resume…', disabled: isBusy('bulkResume'), fill: false })}
       <span class="grow"></span>${btn('Clear selection', 'clear-selection', {}, 'sm ghost')}
     </div>` : ''}
-    <div class="row between wrap" style="padding:9px 14px;border-bottom:1px solid var(--line2);background:#fbfbfe"><span class="row gap8 wrap"><span class="small muted">${j.total ? `Showing ${start}–${Math.min(j.page * j.per_page, j.total)} of ${j.total} jobs` : 'No matches'}</span>${listingCheckButton()}</span><span class="small muted">Page ${j.page} of ${j.pages} · ${j.total + (j.applied_hidden || 0) === j.total_all ? 'no filters applied' : `${j.total_all - j.total - (j.applied_hidden || 0)} hidden by filters`}${j.applied_hidden ? ` · ${j.applied_hidden} applied job${j.applied_hidden === 1 ? '' : 's'} hidden` : ''}</span></div>
+    <div class="row between wrap" style="padding:9px 14px;border-bottom:1px solid var(--line2);background:#fbfbfe"><span class="row gap8 wrap"><span class="small muted">${j.total ? `Showing ${start}–${Math.min(j.page * j.per_page, j.total)} of ${j.total} jobs` : 'No matches'}</span>${listingCheckButton(j)}</span><span class="small muted">Page ${j.page} of ${j.pages} · ${j.total + (j.applied_hidden || 0) === j.total_all ? 'no filters applied' : `${j.total_all - j.total - (j.applied_hidden || 0)} hidden by filters`}${j.applied_hidden ? ` · ${j.applied_hidden} applied job${j.applied_hidden === 1 ? '' : 's'} hidden` : ''}</span></div>
     ${allOnPage && j.total > j.items.length && S.checked.size < j.total ? `<div class="banner" style="border-radius:0;border-width:0 0 1px">All ${j.items.length} on this page are selected. <a href="#" data-act="select-all-matching">${isBusy('selectAll') ? 'Selecting…' : `Select all ${j.total} matching jobs`}</a></div>` : ''}
     ${S.checked.size && S.checked.size >= j.total && j.total > j.items.length ? `<div class="banner" style="border-radius:0;border-width:0 0 1px">All ${S.checked.size} matching jobs are selected. <a href="#" data-act="clear-selection">Clear selection</a></div>` : ''}
     <div class="jgrid jhead"><input type="checkbox" data-act="check-all" ${allOnPage ? 'checked' : ''} aria-label="Select page"><span>OPPORTUNITY</span><span class="tr">FIT</span><span>STAGE</span><span>SOURCE</span><span class="tr">POSTED</span></div>

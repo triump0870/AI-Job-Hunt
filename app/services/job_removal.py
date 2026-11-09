@@ -34,6 +34,7 @@ from app.models import (
     JobInsightTask,
     JobRankingTask,
     RemovedPosting,
+    SchedulerJob,
     TailorTask,
 )
 from app.services import jd_quality, system_log, threads
@@ -271,6 +272,17 @@ def manual_due(db: Session, owner: int, now: datetime) -> list[tuple[int, int]]:
 
 def manual_running(owner: int) -> bool:
     return owner in _manual_running
+
+
+def scheduled_check_ran_today(db: Session, owner: int, now: datetime) -> bool:
+    """A scheduled pass started today (UTC) and this account has postings read today. A pass is a bounded batch, so
+    this does not mean every posting was read: the rest stay due for the next pass. The job row is shared by all
+    accounts, hence the account's own postings: a pass that read only other accounts' does not count."""
+    day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    started = db.scalar(select(SchedulerJob.last_started_at).where(SchedulerJob.name == "listing_check"))
+    if started is None or started < day:
+        return False
+    return db.scalar(select(Job.id).where(Job.user_id == owner, Job.listing_checked_at >= day).limit(1)) is not None
 
 
 def manual_progress(db: Session, owner: int, since: datetime) -> dict[str, int]:

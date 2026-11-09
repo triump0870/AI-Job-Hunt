@@ -27,6 +27,7 @@ from app.models import (
     Resume,
     ResumeVersion,
     SavedSearch,
+    SchedulerJob,
     SearchRun,
     WorkflowTransition,
 )
@@ -508,6 +509,57 @@ def test_check_listings_moves_on_from_postings_it_just_read(user, server, client
     add(user, "AI Engineer", url=server.url("posting.html"))
     assert client.post("/api/jobs/listing-check").json()["due"] == 1
     assert client.post("/api/jobs/listing-check").json()["due"] == 0
+
+
+@pytest.fixture
+def scheduled_pass():
+    """Set when the listing_check job last started, and put the shared row back afterwards."""
+    with SessionLocal() as db:
+        row = db.get(SchedulerJob, "listing_check")
+        before = row.last_started_at if row else None
+
+    def started(at):
+        with SessionLocal() as db:
+            db.merge(SchedulerJob(name="listing_check", last_started_at=at))
+            db.commit()
+
+    yield started
+    started(before)
+
+
+def mark_read(job_id: int, at) -> None:
+    with SessionLocal() as db:
+        db.execute(update(Job).where(Job.id == job_id).values(listing_checked_at=at))
+        db.commit()
+
+
+def test_a_scheduled_pass_today_that_read_this_account_hides_the_button(user, client, scheduled_pass):
+    now = job_removal.utcnow()
+    job = add(user, "AI Engineer", url="https://example.com/a")
+    mark_read(job, now)
+    scheduled_pass(now)
+    assert client.get("/api/jobs/search").json()["listing_checked_today"] is True
+
+
+def test_the_button_stays_until_a_scheduled_pass_read_this_account_today(user, client, scheduled_pass):
+    now = job_removal.utcnow()
+    yesterday = now - timedelta(days=1)
+    job = add(user, "AI Engineer", url="https://example.com/a")
+
+    def shown() -> bool:
+        return client.get("/api/jobs/search").json()["listing_checked_today"] is False
+
+    scheduled_pass(yesterday)
+    mark_read(job, yesterday)
+    assert shown(), "nothing happened today"
+    mark_read(job, now)
+    assert shown(), "a check the person ran does not count as the scheduled one"
+    scheduled_pass(now)
+    mark_read(job, yesterday)
+    assert shown(), "today's pass did not reach this account's postings"
+    other = add(make_user(SessionLocal), "AI Engineer", url="https://example.com/b")
+    mark_read(other, now)
+    assert shown(), "another account's postings say nothing about this one's"
 
 
 def test_check_listings_refuses_a_double_press_and_a_server_that_keeps_removed_postings(user, client, monkeypatch):

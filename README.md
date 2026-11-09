@@ -3434,7 +3434,9 @@ counts (deleted, kept, live, unknown, browser_used) are in Monitoring → Schedu
 **Check listings** on the Discovery table runs the same check for your own account right away: every due
 posting, least recently checked first, skipping postings read in the last hour. It runs in the background after the
 request answers, and the same rules decide what is deleted. When a site rate limits the check, it stops (posting
-fetches share one cooldown): the postings it did not read stay due, for the next press or scheduled pass.
+fetches share one cooldown): the postings it did not read stay due, for the next press or scheduled pass. The button
+is hidden for the rest of the day (UTC) once a scheduled pass has read some of your postings that day. Each pass is a
+bounded batch, so postings it did not reach stay due for the next pass.
 
 ```env
 AUTO_DELETE_REMOVED_JOBS=true
