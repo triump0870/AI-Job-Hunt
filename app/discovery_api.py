@@ -17,7 +17,13 @@ from app.auth import get_user_db
 from app.models import Job, Resume, SavedSearch, SearchRun
 from app.models import now as utcnow
 from app.scheduler_hooks import run_soon
-from app.services import discovery, domain_match, feedback_learning, resume_matching
+from app.services import (
+    discovery,
+    domain_classifier,
+    domain_match,
+    feedback_learning,
+    resume_matching,
+)
 from app.services.user_settings import lock_settings_row, settings_for
 
 router = APIRouter()
@@ -87,7 +93,7 @@ def _domain_view(db: Session) -> dict:
                                  - set(rules.domain_excludes) - set(rules.skill_excludes)),
             "defaults": {"exclude_terms": list(domain_match.DEFAULT_DOMAIN_EXCLUDES),
                          "skill_excludes": list(domain_match.DEFAULT_SKILL_EXCLUDES)},
-            "has_hidden_jobs": hidden}
+            "has_hidden_jobs": hidden, "classifier_mode": domain_classifier.mode()}
 
 
 @router.get("/api/settings/domain")
@@ -136,6 +142,36 @@ def learned_rule(payload: LearnedIn, db: Session = Depends(get_user_db)):
     _save_domain(db, learned=learned, **changes)
     db.commit()
     return _domain_view(db)
+
+
+class ReviewIn(BaseModel):
+    ids: list[int] = Field(min_length=1, max_length=200)
+    matches: bool
+
+
+@router.get("/api/discovery/review")
+def review_list(db: Session = Depends(get_user_db)):
+    """Jobs the domain check left ambiguous, waiting for the person. Nothing is spent on them until they choose."""
+    return domain_classifier.review_jobs(db, _user(db))
+
+
+@router.post("/api/discovery/review")
+def review_decide(payload: ReviewIn, db: Session = Depends(get_user_db)):
+    """The person's choice: matching jobs go on to the detailed match, the others are hidden (Keep brings them back)."""
+    out = domain_classifier.resolve_review(db, _user(db), payload.ids, payload.matches, actor=f"user:{_user(db)}")
+    db.commit()
+    return out
+
+
+@router.post("/api/jobs/domain/recheck")
+def recheck(db: Session = Depends(get_user_db)):
+    """Put jobs hidden by a rule through the hybrid pipeline. It queues model calls, so it runs only when a person asks.
+    Jobs they kept, jobs in a place their search did not cover and jobs the classifier hid stay as they are."""
+    if domain_classifier.mode() != domain_classifier.ON:
+        raise HTTPException(409, "The AI check is not on (DOMAIN_CLASSIFIER_MODE)")
+    out = domain_classifier.recheck(db, _user(db), actor=f"user:{_user(db)}")
+    db.commit()
+    return out
 
 
 @router.post("/api/jobs/domain/reapply")

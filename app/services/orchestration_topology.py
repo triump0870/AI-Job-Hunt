@@ -115,22 +115,27 @@ NODES: tuple[Node, ...] = (
          "imports are normalized and deduplicated in code.", "pipeline", (0, 0),
          external=(ExternalMatch("APIFY"), ExternalMatch("JOB_BOARD")), states=("DISCOVERED",),
          monitoring_tab="apify", screen="discovery"),
-    Node("domain_filter", "Domain filter", (DET,), "Deterministic domain match (app.services.domain_match): hides "
-         "postings outside your roles and skills before any model sees them. Never a model.", "pipeline", (1, 0),
+    Node("domain_filter", "Domain filter", (DET,), "Deterministic domain match (app.services.domain_match): hides only "
+         "what its rules can settle, before any model sees it. No model is called here.", "pipeline", (1, 0),
          states=("NORMALIZED",), screen="discovery"),
+    Node("domain_classifier", "Domain check", (AI, ASYNC), "A fast model reads jobs the rules could not settle "
+         "(app.services.domain_classifier, DOMAIN_CLASSIFIER_MODE). MATCH and UNCERTAIN go on; code keeps a NO_MATCH only "
+         "when its evidence holds, and a failed check never hides a job.", "pipeline", (2, 0),
+         workers=("DOMAIN_CLASSIFIER",), llm_stages=("DOMAIN_CLASSIFIER",), optional_ai=True, monitoring_tab="llm",
+         workers_tab="classification", screen="discovery"),
     Node("resume_match", "Resume match", (DET,), "Chooses which of your resumes a job is ranked and tailored "
-         "against: the saved search's pin, else tag matching (app.services.resume_matching).", "pipeline", (2, 0),
+         "against: the saved search's pin, else tag matching (app.services.resume_matching).", "pipeline", (3, 0),
          screen="discovery"),
     Node("jd_recovery", "JD recovery", (ASYNC, EXT, BROWSER, AI), "Reads a posting's description from its URL when "
          "the board sent none: HTTP first, the shared browser second, a model only to pick blocks on an ambiguous "
-         "page.", "pipeline", (3, 0), workers=("JD_RECOVERY",), llm_stages=("JD_RECOVERY",),
+         "page.", "pipeline", (4, 0), workers=("JD_RECOVERY",), llm_stages=("JD_RECOVERY",),
          external=(ExternalMatch("WEB", "jd_recovery"),), optional_ai=True, monitoring_tab="external", workers_tab="recovery",
          screen="discovery"),
     Node("jd_parser", "JD parser", (AI, ASYNC), "Parses the posting into structured requirements with evidence "
-         "sentences.", "pipeline", (4, 0), workers=("JD_PARSER",), llm_stages=("JD_PARSER",),
+         "sentences.", "pipeline", (5, 0), workers=("JD_PARSER",), llm_stages=("JD_PARSER",),
          monitoring_tab="llm", workers_tab="parsing", screen="discovery"),
     Node("ranker", "Ranker", (AI, ASYNC), "Scores fit against verified evidence; Python, not the model, decides "
-         "QUALIFIED or ARCHIVED.", "pipeline", (5, 0), workers=("RANKER",), llm_stages=("RANKER",),
+         "QUALIFIED or ARCHIVED.", "pipeline", (6, 0), workers=("RANKER",), llm_stages=("RANKER",),
          states=("FILTERED", "RANK_PENDING", "RANKING", "RANKED"), monitoring_tab="llm", screen="discovery",
          workers_tab="ranking"),
     # ── packet: row 1, right to left ──
@@ -159,7 +164,7 @@ NODES: tuple[Node, ...] = (
          states=("FOLLOWUP_DUE", "FOLLOWED_UP"), monitoring_tab="llm", screen="tracker"),
     # ── outcomes ──
     Node("archived", "Archived", (OUTCOME,), "Archived by the ranking policy (below your fit floor or a fatal gap).",
-         "outcome", (6, 0), states=("ARCHIVED",), screen="discovery"),
+         "outcome", (7, 0), states=("ARCHIVED",), screen="discovery"),
     Node("interview", "Interview", (HUMAN,), "Screening, interviews and take-homes, as the tracker records them.",
          "outcome", (1, 2), states=("INTERVIEW",), screen="tracker"),
     Node("outcome", "Offer / rejected", (OUTCOME,), "Where an application ended: offer, rejection or closed.",
@@ -249,6 +254,10 @@ NODES: tuple[Node, ...] = (
 
 EDGES: tuple[Edge, ...] = (
     Edge("discovery", "domain_filter", "imported", measure="jobs created (jobs.discovered_at)", timed=True),
+    Edge("domain_filter", "domain_classifier", "unsettled", measure="tasks queued for the model "
+         "(job_classification_tasks route ASK)"),
+    Edge("domain_classifier", "resume_match", "match or uncertain", measure="tasks that let the job through "
+         "(job_classification_tasks classification MATCH or UNCERTAIN)"),
     Edge("domain_filter", "resume_match", "kept", measure="jobs the filter kept (jobs.domain_checked_at, "
          "domain_match MATCH or KEPT)"),
     Edge("resume_match", "jd_recovery", "no description", measure="recovery tasks created "

@@ -301,11 +301,37 @@ class Settings(BaseSettings):
     domain_filter_enabled: bool = True
     # A title term or company learned from the person's dismissals needs this many dismissed jobs behind it.
     learn_min_dismissals: int = 3
+    # Hybrid domain classification (app.services.domain_classifier). DOMAIN_CLASSIFIER_MODE: off (default; the
+    # deterministic filter alone, exactly as before), shadow (the old filter still decides; verdicts are only recorded
+    # for comparison, and model calls need a daily limit above 0) or on (only unambiguous rules hide a job without the
+    # model; see scripts/domain_classifier_eval.py before turning this on).
+    domain_classifier_mode: str = "off"
+    domain_classifier_interval_minutes: int = 2
+    domain_classifier_batch_size: int = 40
+    domain_classifier_concurrency: int = 4
+    domain_classifier_lease_seconds: int = 300
+    domain_classifier_max_attempts: int = 3
+    domain_classifier_retry_seconds: int = 60
+    domain_classifier_cache_days: int = 30
+    domain_classifier_shadow_daily_limit: int = 0
+    # Model calls per account and day in mode on (0 = no limit). Jobs over it wait as PENDING, unhidden and unranked,
+    # and are queued as the day's count falls; a provider outage or a big import can no longer become a ranking surge.
+    domain_classifier_daily_limit: int = 2000
+    # A job waiting for the person's review longer than this goes on like any other UNCERTAIN job (0 = never).
+    domain_classifier_review_days: int = 7
     # Shared headless browser (app.infrastructure.browser). Optional: HTTP recovery works without it.
     playwright_enabled: bool = True
     playwright_browser: str = "chromium"
     # PLAYWRIGHT_HEADLESS=false opens a visible window for local debugging of extraction selectors.
     playwright_headless: bool = True
+    # Hosts (comma separated, subdomains included) whose postings JD recovery reads in a visible window, for sites that
+    # refuse the headless browser but serve an ordinary one. Plain Chromium: no spoofing, and a challenge stays BLOCKED.
+    # Visible pages open one at a time, at least this many seconds apart. Local installs only: it needs a display.
+    playwright_visible_hosts: str = ""
+    playwright_visible_min_interval_seconds: int = 10
+    # Those hosts are read by the browser-use runner. True lets Playwright's visible window read them when the runner
+    # could not; False (the default) leaves a runner failure as the result, and Playwright never opens these hosts.
+    playwright_visible_window_fallback: bool = False
     playwright_navigation_timeout_seconds: int = 45
     playwright_page_timeout_seconds: int = 60
     playwright_max_concurrency: int = 2

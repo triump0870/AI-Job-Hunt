@@ -20,11 +20,24 @@ bug upstream must still not be able to submit an application:
     window handed to a person (takeover with writes), which behaves like a normal browser. A top-level navigation
     outside the allowed hosts is aborted while Job Hunt OS drives, and private addresses are always refused unless
     the caller allows them (tests).
+  * Playwright's routing sees only the first request of an HTTP redirect (it lets the following hops through itself),
+    so a browser-level CDP Fetch session (`_guard_redirects`) holds every request of the browser and applies the same
+    rules to each hop before it is sent, in every page, popup, frame and worker. Server redirects may also stay on the
+    route's `redirect_domains` (one ATS moving a form between its own hosts). A hop it refuses fails with
+    ERR_BLOCKED_BY_CLIENT; `goto` reports that as URL_NOT_ALLOWED.
   * A click on a submit-like element (type=submit, a form button without a type, or a Submit/Apply/Send label inside
     a form) is refused unless it is `submit` / `login_submit` with that token. Nothing evaluates script a caller
-    sent: the only scripts are the constants below, which read the page.
+    sent: the only scripts are the constants below, which read the page (and CLICK_JS, the signed click's one way in).
+  * A signed click is exactly one click (`_signed_click`), not browser-use's `_click_element_node`: that one clicks
+    again by script whenever waiting after its click fails (an answer slower than its 1.5 s, a page that never fires
+    `load`), and raises for a page it dislikes after the form was sent. Once the click may have happened `submit`
+    answers normally, with `click_error` if something failed: the site's evidence decides, nothing is retried.
   * Uploads only from the run's own folder. Password fields only through `login_fill`, and only on the login domain.
   * Nothing is logged but command names and error classes (stderr); values never are.
+
+Limits: this is Chromium's CDP, and it rests on `redirectedRequestId` marking a hop: the real-Chromium tests fail if a
+browser or Playwright upgrade changes that. A host name is checked by what it resolves to at that moment, for a hop as
+for a first request; the browser resolves it again itself, so DNS rebinding is not covered by either.
 """
 from __future__ import annotations
 
@@ -43,11 +56,16 @@ from urllib.parse import urlparse
 os.environ["ANONYMIZED_TELEMETRY"] = "false"
 os.environ.setdefault("BROWSER_USE_LOGGING_LEVEL", "result")
 LOAD_WAIT_MS = 8000  # how long observe waits for a page's `load` event before reading it as it is
+CLICK_CHECK_MS = 1500  # how long a signed click waits for its control to be clickable before clicking it by script
+CLICK_WAIT_MS = 15000  # how long a signed click waits for the navigation it started to begin (a slow site's answer)
 
 PROTOCOL = 1
 MAX_ELEMENTS = 200
 MAX_TEXT = 6000
 MAX_HTML = 400_000
+MAX_PAGE_HTML = 3_000_000  # page_html: a whole posting page, as JD recovery reads it (its own limit is the same)
+SETTLE_MAX_SECONDS, SETTLE_POLL_SECONDS = 8.0, 0.5
+BODY_LENGTH_JS = "() => (document.body && document.body.innerText || '').length"
 SUBMIT_WORDS = ("submit", "apply", "send", "finish", "complete", "confirm")
 
 # Read-only page scripts (constants; nothing a caller sends is ever evaluated).
@@ -148,6 +166,8 @@ RESTORE_STORAGE_JS = """(items) => {
   for (const item of items) { window.localStorage.setItem(String(item.name), String(item.value)); }
   return items.length;
 }"""
+# The signed click, on a control Playwright cannot reach (covered by a banner, off-screen). Never sent after a real click.
+CLICK_JS = "(el) => el.click()"
 FILE_NAMES_JS = "(el) => Array.from(el.files || []).map(f => f.name)"
 FILE_SIZES_JS = "(el) => Array.from(el.files || []).map(f => f.size)"
 # A challenge widget a person must answer, per frame: a visible checkbox iframe of reCAPTCHA (v2 / Enterprise), hCaptcha
@@ -257,6 +277,8 @@ class Runner:
         self.key = b""
         self.allowed: set[str] = set()
         self.allow_private = False
+        self.redirect_domains: tuple[str, ...] = ()  # where a server redirect may land besides the allowed hosts
+        self.redirect_guard = None  # the browser-level CDP session that sees redirect hops (_guard_redirects)
         self.upload_dir = ""
         self.armed: tuple[str, str, float] | None = None  # (kind, domain, until)
         self.uploading_until = 0.0  # a file was just attached: the page may send it (XHR/fetch upload) until then
@@ -287,12 +309,14 @@ class Runner:
         self.key = bytes.fromhex(args["hmac_key"])
         self.allowed = {h.lower().strip(".") for h in args.get("allowed_hosts") or [] if h}
         self.allow_private = bool(args.get("allow_private"))
+        self.redirect_domains = tuple(h.lower().strip(".") for h in args.get("redirect_domains") or [] if h)
         self.upload_dir = os.path.realpath(args["upload_dir"])
         self.deadline = time.monotonic() + float(args.get("session_seconds") or 300)
         headless = bool(args.get("headless", True))
         self.pw = await async_playwright().start()
         # Plain Chromium: no --remote-debugging-port, no anti-detection flags (unlike browser-use's own launcher).
         self.chromium = await self.pw.chromium.launch(headless=headless)
+        await self._guard_redirects()  # before any context exists: no request leaves without it
         self.bu_browser = Browser(BrowserConfig(headless=headless))
         self.bu_browser.playwright, self.bu_browser.playwright_browser = self.pw, self.chromium
         config = BrowserContextConfig(allowed_domains=sorted(self.allowed) or None, highlight_elements=False,
@@ -318,40 +342,88 @@ class Runner:
     async def _guard(self, route: Any) -> None:
         request = route.request
         try:
-            host = _host(request.url)
             top = request.is_navigation_request() and request.frame.parent_frame is None and \
                 request.url.startswith(("http:", "https:"))
-            person = self.takeover and self.takeover_writes
-            if top and self.allowed and host not in self.allowed and not person:
-                self.navigation_blocked += 1
+            if await self._may_send(request.url, request.method, top=top, navigation=request.is_navigation_request(),
+                                    upload=lambda: self._upload(request)):
+                await route.continue_()
+            else:
                 await route.abort("blockedbyclient")
-                return
-            # The page may not make the browser reach internal services: any request by name or literal address,
-            # and every navigation (a frame's too) by the addresses its host resolves to.
-            if not self.allow_private and (_private(host) or (
-                    request.is_navigation_request() and await _resolves_private(host))):
-                self.navigation_blocked += 1
-                await route.abort("blockedbyclient")
-                return
-            if request.method.upper() != "GET":
-                armed = self.armed is not None and time.monotonic() < self.armed[2] and (
-                    self.armed[0] == "SUBMIT" or self.armed[1] == host)  # a submit lets the page send (captcha too)
-                upload = not (armed or person) and self._upload(request)
-                if not (armed or person or upload):
-                    self.blocked += 1
-                    await route.abort("blockedbyclient")
-                    return
-                self.uploads_started += upload
-            await route.continue_()
         except Exception:  # noqa: BLE001  a page closing mid-request is normal
             pass
 
-    def _upload(self, request: Any) -> bool:
-        """The upload a file selection starts: an XHR/fetch PUT, or a multipart POST, shortly after `upload`."""
-        if time.monotonic() > self.uploading_until or request.resource_type not in ("xhr", "fetch"):
+    async def _may_send(self, url: str, method: str, *, top: bool, navigation: bool, upload: Any,
+                        redirect: bool = False) -> bool:
+        """The rules every request meets, its first hop (_guard) and each redirect hop (_on_paused) alike."""
+        host = _host(url)
+        person = self.takeover and self.takeover_writes
+        if top and self.allowed and host not in self.allowed and not person and not (
+                redirect and any(host == d or host.endswith("." + d) for d in self.redirect_domains)):
+            self.navigation_blocked += 1
             return False
-        kind = (request.headers.get("content-type") or "").lower()
-        return request.method.upper() == "PUT" or kind.startswith("multipart/form-data")
+        # The page may not make the browser reach internal services: any request by name or literal address,
+        # and every navigation (a frame's too) by the addresses its host resolves to.
+        if not self.allow_private and (_private(host) or (navigation and await _resolves_private(host))):
+            self.navigation_blocked += 1
+            return False
+        if method.upper() != "GET":
+            armed = self.armed is not None and time.monotonic() < self.armed[2] and (
+                self.armed[0] == "SUBMIT" or self.armed[1] == host)  # a submit lets the page send (captcha too)
+            uploading = not (armed or person) and upload()
+            if not (armed or person or uploading):
+                self.blocked += 1
+                return False
+            if not redirect:  # a hop of an upload already counted is the same upload
+                self.uploads_started += uploading
+        return True
+
+    async def _guard_redirects(self) -> None:
+        """Hold every request of this browser at a browser-level CDP Fetch session, to judge redirect hops before they
+        are sent: Playwright's routing is not called for them. At the browser level (not per page) it covers popups and
+        service workers too, with no moment between a target's creation and its coverage. Everything else is released
+        at once and still meets `_guard`. A failure here fails `open`: no session runs without it."""
+        session = await self.chromium.new_browser_cdp_session()
+        self.redirect_guard = session
+        session.on("Fetch.requestPaused", lambda event: self._on_paused(session, event))
+        await session.send("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]})
+
+    async def _on_paused(self, session: Any, event: dict[str, Any]) -> None:
+        allow = True
+        if event.get("redirectedRequestId"):
+            try:
+                allow = await self._hop_allowed(session, event)
+            except Exception as exc:  # noqa: BLE001  a hop that cannot be judged is not sent
+                allow = False
+                log(f"redirect check failed: {type(exc).__name__}")
+        try:
+            if allow:
+                await session.send("Fetch.continueRequest", {"requestId": event["requestId"]})
+            else:
+                await session.send("Fetch.failRequest", {"requestId": event["requestId"],
+                                                         "errorReason": "BlockedByClient"})
+        except Exception:  # noqa: BLE001  a page closing mid-request is normal
+            pass
+
+    async def _hop_allowed(self, session: Any, event: dict[str, Any]) -> bool:
+        request = event["request"]
+        url, method, kind = str(request["url"]), str(request["method"]), str(event.get("resourceType") or "")
+        navigation = kind == "Document"
+        top = False
+        if navigation and url.startswith(("http:", "https:")):  # a page's target id is its top frame's id
+            targets = (await session.send("Target.getTargets")).get("targetInfos") or []
+            top = any(t.get("type") == "page" and t.get("targetId") == event.get("frameId") for t in targets)
+        headers = {str(k).lower(): str(v) for k, v in (request.get("headers") or {}).items()}
+        return await self._may_send(url, method, top=top, navigation=navigation, redirect=True,
+                                    upload=lambda: self._upload_like(method, kind.lower(), headers.get("content-type")))
+
+    def _upload(self, request: Any) -> bool:
+        return self._upload_like(request.method, request.resource_type, request.headers.get("content-type"))
+
+    def _upload_like(self, method: str, resource_type: str, content_type: str | None) -> bool:
+        """The upload a file selection starts: an XHR/fetch PUT, or a multipart POST, shortly after `upload`."""
+        if time.monotonic() > self.uploading_until or resource_type not in ("xhr", "fetch"):
+            return False
+        return method.upper() == "PUT" or (content_type or "").lower().startswith("multipart/form-data")
 
     def _on_response(self, response: Any) -> None:
         try:
@@ -382,7 +454,16 @@ class Runner:
         if not self.allow_private and await _resolves_private(host):
             raise Refused("URL_NOT_ALLOWED", "Private addresses are not allowed")
         page = await self._page()
-        response = await page.goto(url, wait_until="domcontentloaded")
+        try:
+            response = await page.goto(url, wait_until="domcontentloaded")
+        except Exception as exc:
+            if "ERR_BLOCKED_BY_CLIENT" in str(exc):  # a redirect the guard stopped, before its request was sent
+                try:  # the browser's error page is still landing: the next command must not read the page mid-way
+                    await page.wait_for_url(lambda now: now.startswith("chrome-error:"), timeout=3000)
+                except Exception:  # noqa: BLE001
+                    pass
+                raise Refused("URL_NOT_ALLOWED", "That address redirects off this application's allowed hosts") from exc
+            raise
         try:
             await page.wait_for_load_state("load", timeout=8000)
         except Exception:  # noqa: BLE001
@@ -396,6 +477,22 @@ class Runner:
                 "title": await page.title()}
 
     # ───────────── reading ─────────────
+
+    async def page_html(self, args: dict[str, Any]) -> dict[str, Any]:
+        """The rendered page as it is, once its text stops growing (bounded), for JD recovery. Touches no element."""
+        page = await self._page()
+        previous, waited = -1, 0.0
+        while waited < SETTLE_MAX_SECONDS:
+            try:
+                length = await page.evaluate(BODY_LENGTH_JS)
+            except Exception:  # noqa: BLE001  navigating again (a client-side redirect): let it land
+                length = -2
+            if length == previous and length > 0:
+                break
+            previous = length
+            await asyncio.sleep(SETTLE_POLL_SECONDS)
+            waited += SETTLE_POLL_SECONDS
+        return {"url": page.url, "title": await page.title(), "html": (await page.content())[:MAX_PAGE_HTML]}
 
     async def _elements(self, page: Any) -> dict[int, Any]:
         """The page's interactive elements (browser-use's DOM indexing), read without `BrowserContext.get_state`: that
@@ -692,13 +789,27 @@ class Runner:
         self._verify(args.get("token") or "", kind, element["key"], domain)
         if kind == "SUBMIT" and not element.get("submit_like"):
             raise Refused("NOT_A_SUBMIT", "The signed element is not the form's submit control")
-        if kind == "LOGIN" and not await (await self._handle(element)).evaluate(LOGIN_FORM_JS):
+        handle = await self._handle(element)
+        if kind == "LOGIN" and not await handle.evaluate(LOGIN_FORM_JS):
             raise Refused("NOT_A_LOGIN", "The signed element is not in the form that holds the password field")
         self.responses = []
         self.armed = (kind, domain, time.monotonic() + 30)
         started = time.monotonic()
+        problem = None
         try:
-            await self.ctx._click_element_node(element["node"])
+            try:  # `trial` only checks the control can be clicked: nothing reaches the page
+                await handle.click(trial=True, timeout=CLICK_CHECK_MS)
+                reachable = True
+            except Exception:  # noqa: BLE001
+                reachable = False
+            try:  # from here on the click may have happened, whatever is raised: it is never made a second time
+                if reachable:
+                    await handle.click(timeout=CLICK_WAIT_MS)
+                else:
+                    await handle.evaluate(CLICK_JS)
+            except Exception as exc:  # noqa: BLE001
+                problem = type(exc).__name__
+                log(f"signed click: {problem}")
             for state in ("load", "networkidle"):
                 try:
                     await page.wait_for_load_state(state, timeout=15000)
@@ -706,7 +817,9 @@ class Runner:
                     pass
         finally:
             self.armed = None
-        return {"clicked": True, "seconds": round(time.monotonic() - started, 2)}
+        if kind == "LOGIN" and (problem or page.url.startswith("chrome-error:")):
+            raise Refused("LOGIN_NOT_SENT", "The login did not reach a page of the site")  # a person may log in again
+        return {"clicked": problem is None, "click_error": problem, "seconds": round(time.monotonic() - started, 2)}
 
     async def submit(self, args: dict[str, Any]) -> dict[str, Any]:
         return await self._signed_click(args, "SUBMIT")
@@ -772,11 +885,11 @@ class Runner:
                     await result
             except Exception:  # noqa: BLE001
                 pass
-        self.ctx = self.chromium = self.pw = None
+        self.ctx = self.chromium = self.pw = self.redirect_guard = None
         return {"closed": True}
 
 
-COMMANDS = ("health", "open", "goto", "observe", "read", "fill", "select", "check", "upload", "click", "choose",
+COMMANDS = ("health", "open", "goto", "page_html", "observe", "read", "fill", "select", "check", "upload", "click", "choose",
             "point", "unpoint", "scroll",
             "login_fill", "login_submit", "submit", "evidence", "challenge", "set_takeover", "storage_state", "close")
 

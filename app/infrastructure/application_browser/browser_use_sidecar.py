@@ -25,11 +25,13 @@ import json
 import logging
 import os
 import secrets
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from app.settings import get_settings
 
@@ -38,6 +40,9 @@ RUNNER = Path(__file__).resolve().parents[3] / "sidecars" / "browser_use_runner"
 PROTOCOL = 1
 EXPECTED_BROWSER_USE = "0.1.48"
 SIGNED_SECONDS = 60
+# What the runner's `submit` refuses with before it touches the page: only these prove no click happened and may release
+# a claim. Anything else from `submit` (BROWSER_ERROR, a code added later) leaves the outcome unknown.
+REFUSED_BEFORE_CLICK = frozenset({"NOT_OPEN", "SESSION_EXPIRED", "ELEMENT_GONE", "BAD_TOKEN", "NOT_A_SUBMIT"})
 
 
 
@@ -213,7 +218,7 @@ class SidecarManager:
 
     async def start(self, *, user_id: int, task_id: int, job_id: int | None, allowed_hosts: list[str],
                     upload_dir: str, storage_state: dict[str, Any] | None = None, headless: bool | None = None,
-                    allow_private: bool = False) -> SidecarSession:
+                    allow_private: bool = False, redirect_domains: list[str] | None = None) -> SidecarSession:
         if not configured():
             raise SidecarUnavailable("The browser-use backend is not configured (BROWSER_USE_WEBUI_ENABLED, "
                                      "BROWSER_USE_PYTHON)")
@@ -231,7 +236,8 @@ class SidecarManager:
             if health.get("protocol") != PROTOCOL:
                 raise SidecarUnavailable("The browser-use runner speaks another protocol version")
             await session.call("open", timeout=90, session=session.session_id, hmac_key=session.hmac_key.hex(),
-                               allowed_hosts=allowed_hosts, allow_private=allow_private, upload_dir=upload_dir,
+                               allowed_hosts=allowed_hosts, redirect_domains=redirect_domains or [],
+                               allow_private=allow_private, upload_dir=upload_dir,
                                headless=headless, storage_state=storage_state or {},
                                session_seconds=settings.browser_use_timeout_seconds)
         except BaseException:
@@ -315,6 +321,55 @@ def set_sidecars(manager: SidecarManager | None) -> None:
     """Replace the process's manager (tests); None goes back to the real one."""
     global _manager
     _manager = manager
+
+
+@dataclass
+class RunnerPage:
+    url: str
+    final_url: str
+    status: int | None
+    title: str
+    html: str
+
+
+async def read_page(url: str, *, user_id: int, job_id: int | None, allow_private: bool = False,
+                    headless: bool = False) -> RunnerPage:
+    """Read one public page through a runner of its own, for JD recovery: no element is touched, nothing but GET leaves
+    the page (the runner's guard), and navigation stays on the URL's own host.
+
+    Deliberately not a SidecarManager session: those are keyed by application execution, and starting one closes the
+    session already under that key, which may be a person's window. Nothing is shared with an application run: its own
+    process, Chromium and temporary profile, an empty folder, no saved login. Closed before this returns.
+    Raises SidecarUnavailable (off, not installed, died, too slow) or SidecarRefused (the runner or the page said no)."""
+    if not configured():
+        raise SidecarUnavailable("The browser-use backend is not configured (BROWSER_USE_WEBUI_ENABLED, "
+                                 "BROWSER_USE_PYTHON)")
+    settings = get_settings()
+    host = (urlparse(url).hostname or "").lower().strip(".")
+    with tempfile.TemporaryDirectory(prefix="jobhunt-page-") as folder:
+        process = await asyncio.create_subprocess_exec(
+            settings.browser_use_python, "-I", str(RUNNER), stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL, env=_environment(), cwd=folder,
+            limit=8 * 1024 * 1024)
+        session = SidecarSession(user_id=user_id, task_id=0, job_id=job_id, process=process, headless=headless)
+        try:
+            health_ = await session.call("health", timeout=60)
+            if health_.get("protocol") != PROTOCOL:
+                raise SidecarUnavailable("The browser-use runner speaks another protocol version")
+            await session.call("open", timeout=90, session=session.session_id, hmac_key=session.hmac_key.hex(),
+                               allowed_hosts=[host], allow_private=allow_private, upload_dir=folder, headless=headless,
+                               storage_state={}, session_seconds=settings.browser_use_timeout_seconds)
+            loaded = await session.call("goto", url=url)
+            page = await session.call("page_html")
+            final_url = str(page.get("url") or loaded.get("final_url") or url)
+            # The runner's guards stop a redirect to another host before it is sent. This is the last check on the page
+            # itself: if one ended on another host anyway (a script navigating, say), its content is not used.
+            if (urlparse(final_url).hostname or "").lower().strip(".") != host:
+                raise SidecarRefused("URL_NOT_ALLOWED", "The page redirected to another host")
+            return RunnerPage(url=url, final_url=final_url, status=loaded.get("status"),
+                              title=str(page.get("title") or ""), html=str(page.get("html") or ""))
+        finally:
+            await session.close()
 
 
 async def health() -> dict[str, Any]:

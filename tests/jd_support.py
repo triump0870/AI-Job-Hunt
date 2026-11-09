@@ -102,6 +102,7 @@ class FakeBrowser(BrowserService):
         self.error = error
         self.final_url = final_url
         self.calls: list[str] = []
+        self.visible_calls: list[bool] = []
         self.released = 0
 
     async def start(self) -> None:
@@ -133,8 +134,9 @@ class FakeBrowser(BrowserService):
     async def release_idle(self) -> None:
         self.released += 1
 
-    async def fetch_rendered_page(self, url: str, *, wait_for=(), metadata=None) -> RenderedPage:
+    async def fetch_rendered_page(self, url: str, *, wait_for=(), metadata=None, visible=False) -> RenderedPage:
         self.calls.append(url)
+        self.visible_calls.append(visible)
         if self.error is not None:
             raise self.error
         key = next((k for k in self.pages if url.endswith(k)), None)
@@ -221,6 +223,14 @@ class FakeContext:
         self.closed = True
 
 
+class FakeCDPSession:
+    def on(self, event: str, handler: Any) -> None:
+        pass
+
+    async def send(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        return {}
+
+
 class FakeBrowserProcess:
     def __init__(self, runtime: FakeRuntime):
         self.runtime, self.connected, self.handlers = runtime, True, {}
@@ -230,6 +240,9 @@ class FakeBrowserProcess:
 
     def is_connected(self) -> bool:
         return self.connected
+
+    async def new_browser_cdp_session(self) -> FakeCDPSession:
+        return FakeCDPSession()
 
     async def new_context(self, **options: Any) -> FakeContext:
         context = FakeContext(self.runtime, options)

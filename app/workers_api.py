@@ -94,6 +94,12 @@ def worker(kind: str, request: Request, range: str = Query("7d", pattern="^(toda
         from app.services import job_description
 
         out["metrics"] = job_description.metrics(db, user.id, begin, finish)
+    elif spec.kind == "classification":
+        from app.services import domain_classifier
+
+        out["metrics"] = domain_classifier.metrics(db, user.id, begin, finish)
+        out["mode"] = domain_classifier.mode()
+        out["comparison"] = domain_classifier.compare(db, user.id)
     elif spec.kind == "recovery":
         from app.services import jd_recovery
 

@@ -45,6 +45,7 @@ from app.scheduler_hooks import run_soon
 from app.services import (
     approval,
     ats_keywords,
+    domain_match,
     evidence_tags,
     feedback_learning,
     ranker,
@@ -357,8 +358,7 @@ def get_job(db: Session, job_id: int) -> Job:
 # ───────────────────────────── summary / overview / today ─────────────────────────────
 
 def triage_query(db: Session):
-    query = select(Job).where(Job.triaged_at.is_(None), Job.status.in_(QUEUE_STATUSES),
-                              Job.domain_match.is_distinct_from("NOT_MATCHING"))
+    query = select(Job).where(Job.triaged_at.is_(None), Job.status.in_(QUEUE_STATUSES), domain_match.not_held())
     excluded = excluded_companies(db)
     if excluded:
         query = query.where(func.lower(Job.company).not_in(excluded))
@@ -1037,12 +1037,16 @@ def bulk_delete(payload: BulkIdsIn, db: Session = Depends(get_user_db)):
     for jobs the domain filter had already hidden: clearing those out says nothing new."""
     deleted, protected = 0, []
     owner = None
+    # Clearing out many jobs at once is tidying, not a judgement on each of them (AGENTS.md: Discovery quality).
+    from app.services import domain_classifier
+
+    cleanup = domain_classifier.mode() == domain_classifier.ON and len(payload.ids) > 3
     for job in db.scalars(select(Job).where(Job.id.in_(payload.ids))).all():
         if job.status in PROTECTED_STATUSES and not payload.include_submitted:
             protected.append(job.id)
             continue
         if job.domain_match != "NOT_MATCHING":
-            feedback_learning.record(db, job, "DELETED")
+            feedback_learning.record(db, job, cleanup and "BULK_DELETED" or "DELETED")
             owner = job.user_id
         delete_job(db, job)
         deleted += 1
@@ -1088,6 +1092,8 @@ def bulk_parse(payload: BulkIdsIn, request: Request, background: BackgroundTasks
         state = job_description.description_state(job, statuses.get(job_id)) if job else None
         why = ("not found" if job is None
                else "hidden: not matching your domain" if job.domain_match == "NOT_MATCHING"
+               else "waiting for the AI check" if job.domain_match == "PENDING"
+               else "waiting for your review" if job.domain_match == "REVIEW"
                else "no description" if state == "NO_DESCRIPTION"
                else "already parsed" if state == "PARSED"
                else "already parsing" if state == "PARSING"
@@ -1103,6 +1109,32 @@ def bulk_parse(payload: BulkIdsIn, request: Request, background: BackgroundTasks
     if queued:
         run_soon(background, request.app, "jd_parsing")
     return {"queued": queued, "skipped": skipped}
+
+
+@router.post("/api/jobs/listing-check", status_code=202)
+def listing_check_start(background: BackgroundTasks, db: Session = Depends(get_user_db)):
+    """Queue a check of every posting of this account that is due. Returns at once; poll the status route below."""
+    from app.db import SessionLocal
+    from app.services import job_removal
+
+    if not get_settings().auto_delete_removed_jobs:
+        raise HTTPException(409, "Removed postings are kept on this server (AUTO_DELETE_REMOVED_JOBS=false)")
+    owner = db.info["user_id"]
+    if job_removal.manual_running(owner):
+        raise HTTPException(409, "A listing check is already running")
+    now = job_removal.utcnow()
+    due = job_removal.manual_due(db, owner, now)
+    if due:
+        background.add_task(job_removal.check_account, SessionLocal, owner, due, now)
+    return {"due": len(due), "since": now.isoformat()}
+
+
+@router.get("/api/jobs/listing-check/status")
+def listing_check_status(since: datetime, db: Session = Depends(get_user_db)):
+    from app.services import job_removal
+
+    owner = db.info["user_id"]
+    return {**job_removal.manual_progress(db, owner, since), "running": job_removal.manual_running(owner)}
 
 
 @router.get("/api/jobs/{job_id}")
@@ -1371,6 +1403,27 @@ def save_job_description(job_id: int, payload: JobDescriptionIn, request: Reques
     db.commit()
     run_soon(background, request.app, "ranking")
     return {"job": job_card(job), "ranking_queued": why is None, "ranking_skipped": why}
+
+
+class JobTitleIn(BaseModel):
+    title: str = Field(max_length=300)
+
+
+@router.put("/api/jobs/{job_id}/title")
+def save_job_title(job_id: int, payload: JobTitleIn, db: Session = Depends(get_user_db)):
+    """Correct a job's title by hand (boards can send a URL or a placeholder). It queues no ranking, so it costs no
+    model call, and it leaves dedupe_key alone: the posting's identity for duplicates and claims does not change."""
+    from app.services import job_description  # local import, as save_job_description does
+
+    job = job_description.lock_job(db, job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    title = " ".join(payload.title.split())
+    if not title or title.lower() in ranker.PLACEHOLDER_TITLES:
+        raise HTTPException(422, "Enter the job's title")
+    job.title = title
+    db.commit()
+    return {"job": job_card(job)}
 
 
 class CustomActorIn(BaseModel):

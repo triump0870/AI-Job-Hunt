@@ -2,6 +2,7 @@
 
     jd_parser          recorded JD parser outputs → the contract, `job_description.validated` and `ground`
     qualification      `domain_match.assess`, `search_scope.assess`, `ranker.hard_filter_reason`
+    domain_classifier  the old `domain_match.assess` against `domain_match.triage` + `domain_classifier.decide`
     rag                scripts/rag_eval.py (Recall@k, Precision@k, leaks) on its own benchmark
     unsupported_claims scripts/preparation_eval.py's evidence checks (`tailoring_results.validate_tailored_resume`)
     ats_answers        `answer_resolver.plan` against a synthetic profile and knowledge bank
@@ -146,6 +147,82 @@ def qualification(ds: Dataset, ctx: dict[str, Any]) -> SuiteResult:
     return SuiteResult("qualification", ds.identity(), {
         "cases": n, "accuracy": _rate(sum(c["ok"] for c in cases), n), "false_hide": false_hide,
         "missed_hide": missed_hide}, cases)
+
+
+# ───────────── domain classifier ─────────────
+
+def domain_classifier(ds: Dataset, ctx: dict[str, Any]) -> SuiteResult:
+    """The old filter and the hybrid over the same labelled jobs: rules, then each job's recorded model answer through
+    the real evidence gate. Recall comes first: a false negative is a job the person never sees. Cost is in tokens, from
+    the fixture's stated averages, because a recorded answer has no provider cost; scripts/domain_classifier_eval.py
+    measures real tokens, cost and latency against a live model."""
+    from app.prompts.contracts import DomainClassificationResult
+    from app.services import domain_classifier as dc
+    from app.services import domain_match as dm
+
+    rules = dm.Rules(**ds.fixture["rules"])
+    tally = {name: {"tp": 0, "fp": 0, "fn": 0, "tn": 0} for name in ("legacy", "hybrid")}
+    cases: list[dict[str, Any]] = []
+    asked = ungrounded = confidence = rule_hides_relevant = review = review_relevant = 0
+    for ex in ds.examples:
+        job = _Job(**ex.inputs["job"])
+        signals = tuple(ex.inputs.get("scope_signals") or ())
+        legacy = dm.assess(job, rules).match and not signals
+        triaged = dm.triage(job, rules, signals)
+        verdict, gate = None, None
+        if triaged.route == dm.HARD:
+            hybrid = False
+            rule_hides_relevant += bool(ex.outputs["relevant"])
+        elif triaged.route == dm.POSITIVE:
+            hybrid = True
+        else:
+            asked += 1
+            recorded = ex.inputs.get("recorded_output") or {"classification": "UNCERTAIN", "reason": "No answer recorded"}
+            answer = DomainClassificationResult.model_validate(recorded)
+            confidence += "confidence" in answer.model_dump()
+            posting = dc.posting_window(job.description)
+            decision = dc.decide(answer, title=job.title, posting=posting, rules=rules, full_text=dc.job_skill_text(job))
+            verdict, gate, hybrid = decision.classification, decision.gate_code, decision.classification != dc.NO_MATCH
+            if dc.settle(decision, title=job.title, skills=decision.job_skills, rules=rules,
+                         title_only=not posting) == dc.REVIEW_JOB:
+                # The person sees it and decides: not lost to the search, though it costs them a look.
+                review += 1
+                review_relevant += bool(ex.outputs["relevant"])
+            shown = dc._squash(f"{job.title}\n{posting}")
+            ungrounded += (not hybrid) and not all(dc._squash(p) in shown for p in answer.irrelevance_evidence)
+        relevant = ex.outputs["relevant"]
+        for name, kept in (("legacy", legacy), ("hybrid", hybrid)):
+            cell = ("tp" if relevant else "fp") if kept else ("fn" if relevant else "tn")
+            tally[name][cell] += 1
+        cases.append({"key": ex.key, "ok": hybrid or not relevant,
+                      "outputs": {"relevant": relevant, "legacy_kept": legacy, "hybrid_kept": hybrid, "route": triaged.route,
+                                  "classification": verdict, "gate_code": gate}})
+    n = len(ds.examples)
+    tokens_call, tokens_down = ds.fixture["tokens_per_call"], ds.fixture["tokens_downstream"]
+
+    def rates(name: str) -> dict[str, Any]:
+        t = tally[name]
+        forwarded = t["tp"] + t["fp"]
+        return {f"{name}_recall": _rate(t["tp"], t["tp"] + t["fn"]),
+                f"{name}_false_negative_rate": _rate(t["fn"], t["tp"] + t["fn"]),
+                f"{name}_precision": _rate(t["tp"], forwarded), f"{name}_forwarded": forwarded,
+                f"{name}_hidden": t["fn"] + t["tn"]}
+    hybrid_t, legacy_t = tally["hybrid"], tally["legacy"]
+    hybrid_tokens = asked * tokens_call + (hybrid_t["tp"] + hybrid_t["fp"]) * tokens_down
+    legacy_tokens = (legacy_t["tp"] + legacy_t["fp"]) * tokens_down
+    return SuiteResult("domain_classifier", ds.identity(), {
+        "cases": n, **rates("legacy"), **rates("hybrid"),
+        "false_hide": hybrid_t["fn"], "recall": _rate(hybrid_t["tp"], hybrid_t["tp"] + hybrid_t["fn"]),
+        "no_match_precision": _rate(hybrid_t["tn"], hybrid_t["tn"] + hybrid_t["fn"]),
+        "fnr_not_worse": int((_rate(hybrid_t["fn"], hybrid_t["tp"] + hybrid_t["fn"]) or 0)
+                             <= (_rate(legacy_t["fn"], legacy_t["tp"] + legacy_t["fn"]) or 0)),
+        "irrelevant_filtered": _rate(hybrid_t["tn"], hybrid_t["tn"] + hybrid_t["fp"]),
+        "rule_hides_relevant": rule_hides_relevant, "ungrounded_no_match": ungrounded, "confidence_used": confidence,
+        "needs_review": review, "needs_review_relevant": review_relevant, "review_rate": _rate(review, n),
+        "model_call_rate": _rate(asked, n), "model_calls": asked, "hybrid_tokens": hybrid_tokens,
+        "legacy_tokens": legacy_tokens,
+        "extra_tokens_per_relevant_found": round((hybrid_tokens - legacy_tokens) / max(1, hybrid_t["tp"] - legacy_t["tp"]))},
+        cases)
 
 
 # ───────────── browser actions ─────────────
@@ -300,7 +377,7 @@ def unsupported_claims(ds: Dataset, ctx: dict[str, Any]) -> SuiteResult:
 
 
 SUITES: dict[str, Callable[[Dataset, dict[str, Any]], SuiteResult]] = {
-    "jd_parser": jd_parser, "qualification": qualification, "rag": rag, "unsupported_claims": unsupported_claims,
+    "jd_parser": jd_parser, "qualification": qualification, "domain_classifier": domain_classifier, "rag": rag, "unsupported_claims": unsupported_claims,
     "ats_answers": ats_answers, "browser_actions": browser_actions, "confirmation": confirmation,
     "human_corrections": human_corrections, "resume_extraction": resume_extraction,
 }

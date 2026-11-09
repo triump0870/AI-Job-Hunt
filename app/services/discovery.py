@@ -2,6 +2,8 @@
 
     new job (Apify/Hunter sync, Lever/Greenhouse import)
       → domain filter (app.services.domain_match): not matching → hidden, nothing else happens
+        (DOMAIN_CLASSIFIER_MODE=on: only unambiguous rules hide; the rest waits for app.services.domain_classifier, which
+        continues below through domain_match.forward. shadow: the same is only recorded, for comparison.)
       → search scope (app.services.search_scope): not the run's roles, skills or place → hidden the same way
       → resume: the saved search's pinned resume, else the best-tagged resume (app.services.resume_matching), else
         none (the account's active resume, at use time)
@@ -21,7 +23,14 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.models import Job, Resume, SavedSearch, SearchRun
-from app.services import domain_match, jd_recovery, job_description, resume_matching, search_scope
+from app.services import (
+    domain_classifier,
+    domain_match,
+    jd_recovery,
+    job_description,
+    resume_matching,
+    search_scope,
+)
 
 # Jobs whose resume never moves again: what was sent stays what was sent.
 SETTLED_STATUSES = ("approved", "applied")
@@ -58,10 +67,13 @@ def choose_resume(db: Session, job: Job, search_run_id: int | None = None) -> No
 def admit(db: Session, job: Job, *, search_run_id: int | None = None,
           rules_cache: dict[int, domain_match.Rules] | None = None) -> str:
     """Decide what a just-created (flushed) job needs. Returns created or not_matching. Does not commit."""
+    if job.source != "manual":
+        domain_classifier.observe(db, job, search_run_id, rules_cache)  # shadow mode: recorded, the job is not touched
     if job.source == "manual":
         job.domain_match, job.domain_reason = domain_match.KEPT, "Added by you"
-    elif not domain_match.screen(db, job, rules_cache, actor="discovery"):
-        return "not_matching"
+    elif not domain_match.screen(db, job, rules_cache, actor="discovery", search_run_id=search_run_id):
+        # Waiting for the classifier is not hidden: it was created, and its verdict decides what happens next.
+        return "created" if job.domain_match == domain_match.PENDING else "not_matching"
     elif not search_scope.screen(db, job, search_run_id, actor="discovery"):
         return "not_matching"  # a role, skill or place its own search did not ask for
     choose_resume(db, job, search_run_id)

@@ -294,7 +294,7 @@ function renderAutoTailorSettings(b, execution) {
       <p class="settings-help">${minimum ? `A job the ranking qualifies with a fit score of ${minimum} or more` : 'Every job the ranking qualifies'} goes into the tailoring queue. It starts at once when a tailoring slot is free (up to ${esc(slots)} at a time), otherwise it waits and starts as soon as one frees up. Jobs already waiting in the Tailor queue are not included, and a job whose tailoring you cancel is never queued again.</p>`
     : '<p class="settings-help">Off: qualified jobs wait in the Tailor queue until you start them.</p>'}`);
 }
-/* Domain filter (app.services.domain_match): deterministic, no model. Hidden jobs are in Discovery → Not matching. */
+/* Domain filter (app.services.domain_match, domain_classifier). Hidden jobs are in Discovery → Not matching. */
 const LEARNED_ACTIONS = { active: [['disable', 'Disable'], ['promote', 'Always exclude'], ['delete', 'Forget']], disabled: [['enable', 'Enable'], ['delete', 'Forget']] };
 function renderDomainSettings() {
   const d = D.domain;
@@ -302,11 +302,11 @@ function renderDomainSettings() {
   if (!d) return '<p class="settings-help">The domain filter could not be loaded.</p>';
   const chipList = list => list.length ? `<div class="row wrap gap6">${list.map(t => pill(t, 'plain')).join('')}</div>` : '<span class="settings-help">Nothing yet.</span>';
   const learned = (d.learned || []).filter(e => !(e.user_disabled && e.status === 'disabled' && e.forgotten));
-  const rules = learned.length ? learned.map(e => `<div class="lrow" style="align-items:flex-start"><div class="grow"><div class="row gap6 wrap"><span class="small b">${esc(e.term)}</span>${pill(e.kind === 'company' ? 'Company' : 'Title', 'plain')}${pill(e.status === 'active' ? 'Active' : 'Off', e.status === 'active' ? 'warn' : 'muted')}</div>
+  const rules = learned.length ? learned.map(e => `<div class="lrow" style="align-items:flex-start"><div class="grow"><div class="row gap6 wrap"><span class="small b">${esc(e.term)}</span>${pill(e.kind === 'company' ? 'Company' : 'Title', 'plain')}${pill(e.status === 'active' ? (d.classifier_mode === 'on' && e.kind !== 'company' ? 'Asks AI' : 'Active') : 'Off', e.status === 'active' ? 'warn' : 'muted')}</div>
       <div class="xs muted mt4">Dismissed ${e.evidence}×${e.positive ? ` · kept ${e.positive}×` : ''}${e.examples?.length ? ` · e.g. ${esc(e.examples.join(' · '))}` : ''}</div></div>
       <div class="row gap6">${(LEARNED_ACTIONS[e.status] || []).map(([action, text]) => btn(text, 'domain-learned', { term: e.term, kind: e.kind, action }, 'sm')).join('')}</div></div>`).join('')
-    : '<p class="settings-help">Nothing learned yet. After you dismiss, reject or delete several similar jobs, their common title words (or company) appear here and similar new jobs are hidden.</p>';
-  return `${settingsGroup('Filter', 'Discovery hides jobs outside your domain before any description is fetched or any model is used. Hidden jobs are listed in Discovery → table → “Not matching”, where you can keep one.',
+    : `<p class="settings-help">Nothing learned yet. After you dismiss, reject or delete several similar jobs, their common title words (or company) appear here and ${d.classifier_mode === 'on' ? 'similar new jobs get the AI check' : 'similar new jobs are hidden'}.</p>`;
+  return `${settingsGroup('Filter', d.classifier_mode === 'on' ? 'Rules hide only what is unambiguous. A fast AI check reads the rest before anything expensive runs, and hides a job only when its evidence holds. Hidden jobs are listed in Discovery → table → “Not matching”, where you can keep one.' : 'Discovery hides jobs outside your domain before any description is fetched or any model is used. Hidden jobs are listed in Discovery → table → “Not matching”, where you can keep one.',
     `<div class="col gap10">${checkF('domain', 'enabled', d.enabled, 'Hide jobs outside my domain at discovery')}${checkF('domain', 'learn_from_feedback', d.learn_from_feedback, 'Learn from the jobs I dismiss, reject or delete')}
       ${d.server_enabled ? '' : '<p class="settings-help">The server has the domain filter turned off (DOMAIN_FILTER_ENABLED=false).</p>'}</div>`)}
   ${settingsGroup('Outside my domain', 'A job whose title names one of these is hidden — unless it also names one of your include terms.', tagBox('domain', 'exclude_terms', fv('domain', 'exclude_terms', d.exclude_terms), 'Add an area, e.g. sales…', 200))}
@@ -315,6 +315,7 @@ function renderDomainSettings() {
   ${settingsGroup('From your profile', 'Read from your target roles, headline, resume and saved searches. A term used here is never excluded.', `<div class="col gap8"><div class="xs muted">Role words</div>${chipList(d.derived.role_words)}<div class="xs muted">Your skills</div>${chipList(d.derived.skills)}${d.overridden.length ? `<div class="xs muted">Excludes cancelled by your profile</div>${chipList(d.overridden)}` : ''}</div>`)}
   ${settingsGroup('Learned from your choices', 'Deterministic counts of what you dismissed; keeping a job pushes back.', `<div class="col">${rules}</div>`)}
   ${settingsGroup('Existing jobs', 'After changing the lists, check the jobs that are not ranked yet again. Jobs you kept are never touched.', btn(label('domainReapply', 'Apply to existing jobs', 'Checking…'), 'domain-reapply', {}, 'soft', isBusy('domainReapply')))}
+  ${d.classifier_mode === 'on' ? settingsGroup('Re-check hidden jobs', 'Puts jobs a rule hid through the AI check, which uses your model for each one. Jobs you kept, jobs in a place your search did not cover and jobs the AI check hid stay as they are.', btn(label('domainRecheck', 'Re-check hidden jobs', 'Queuing…'), 'domain-recheck', {}, 'soft', isBusy('domainRecheck'))) : ''}
   ${settingsFooter('domain')}`;
 }
 // Auto submit (app.services.submission) and ATS logins (app.services.ats_auth). Passwords are write-only.

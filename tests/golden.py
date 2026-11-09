@@ -20,6 +20,7 @@ from app.prompts import (
     build_browser_navigation_prompt,
     build_company_insights_prompt,
     build_cover_letter_prompt,
+    build_domain_classifier_prompt,
     build_followup_prompt,
     build_inbox_classification_prompt,
     build_interview_insights_prompt,
@@ -52,6 +53,9 @@ def build(fixture: dict[str, Any]) -> Prompt:
     base, given = shared(), fixture["input"]
     profile, job, evidence = SimpleNamespace(**base["profile"]), SimpleNamespace(**base["job"]), base["evidence"]
     name = fixture["prompt"]
+    if name == "domain_classifier":
+        return build_domain_classifier_prompt(given["candidate"], SimpleNamespace(title=given["title"], company=given["company"]),
+                                              given["posting"])
     if name == "ranking":
         return build_ranking_prompt(candidate_profile=profile, resume=given["resume"], evidence=evidence, job=job)
     if name == "tailoring":

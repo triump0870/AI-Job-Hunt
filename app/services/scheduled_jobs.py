@@ -30,6 +30,7 @@ from app import scheduler_hooks
 from app.models import (
     Application,
     Job,
+    JobClassificationTask,
     JobDescriptionFetchTask,
     JobDescriptionParseTask,
     JobInsightTask,
@@ -41,6 +42,7 @@ from app.models import (
 from app.services import (
     ai_advisor,
     auto_tailor,
+    domain_classifier,
     external_monitoring,
     jd_recovery,
     job_description,
@@ -362,6 +364,39 @@ async def resume_parse(ctx: JobContext) -> dict[str, Any]:
     return summary
 
 
+def _prepare_domain_classifier(ctx: JobContext) -> dict[str, Any] | str:
+    with ctx.sessions() as db:
+        if not _is_postgres(db):
+            return "The domain classifier needs PostgreSQL (FOR UPDATE SKIP LOCKED)"
+        return {"recovered": domain_classifier.recover_expired(db), "swept": domain_classifier.sweep(db)}
+
+
+def _claim_domain_classifier(ctx: JobContext, limit: int) -> list[domain_classifier.ClassifyClaim]:
+    with ctx.sessions() as db:
+        return domain_classifier.claim(db, worker_id=ctx.worker_id, limit=limit)
+
+
+async def domain_classifier_job(ctx: JobContext) -> dict[str, Any]:
+    """Read the jobs the rules could not settle, `domain_classifier_concurrency` model calls at a time, one request per
+    job. Runs in mode on, in shadow, and once more after being turned off, to release jobs still waiting."""
+    details = await threads.run_io(_prepare_domain_classifier, ctx)
+    if isinstance(details, str):
+        return skipped(details)
+    claimed, outcomes = await run_live(
+        concurrency="domain_classifier_concurrency", batch="domain_classifier_batch_size",
+        claim=lambda n: _claim_domain_classifier(ctx, n),
+        process=lambda c: threads.run_work(domain_classifier.process, ctx.sessions, c),
+        heartbeat=renew(ctx.sessions, JobClassificationTask, get_settings().domain_classifier_lease_seconds))
+    summary = {"claimed": claimed, **{name: outcomes.get(name, 0) for name in domain_classifier.OUTCOMES}, **details}
+    if not claimed and not details["swept"]:
+        return skipped("No jobs waiting for the domain check", **summary)
+    from app import scheduler_hooks
+
+    for job in ("jd_recovery", "jd_parsing", "ranking", "qualification"):
+        scheduler_hooks.nudge(job)  # what it let through may go on now (a hint only)
+    return summary
+
+
 async def jd_parsing(ctx: JobContext) -> dict[str, Any]:
     """Parse up to `jd_parse_batch_size` descriptions, `jd_parse_concurrency` model calls at a time (both live)."""
     if not get_settings().jd_parse_enabled:
@@ -656,7 +691,8 @@ def cleanup(ctx: JobContext) -> dict[str, Any]:
         external = external_monitoring.prune(db, ctx.now)
         external["captured_cleared"] = external_monitoring.clear_captured(db, ctx.now)
         logs = system_log.prune(db, ctx.now)
-        retention = {"telemetry": telemetry, "external_api": external, "system_logs": logs}
+        retention = {"telemetry": telemetry, "external_api": external, "system_logs": logs,
+                     "domain_classifier_cache": domain_classifier.purge_cache(db, ctx.now)}
     if get_settings().agent_graphs_enabled:  # graph checkpoints (app.agents); LangGraph is not loaded otherwise
         from app.agents import runtime as agent_runtime
 
@@ -1003,6 +1039,9 @@ JOBS: list[JobSpec] = [
             "Imports datasets of Apify runs that finished."),
     JobSpec("ranking", "Job ranking", "ranking_interval_minutes", ranking,
             "Filters and queues new jobs, then ranks a bounded batch of ranking tasks, a few at a time."),
+    JobSpec("domain_classifier", "Domain check", "domain_classifier_interval_minutes", domain_classifier_job,
+            "Reads jobs the rules could not settle with a fast model (DOMAIN_CLASSIFIER_MODE), before anything expensive "
+            "is spent on them. Only a confirmed NO_MATCH hides a job."),
     JobSpec("jd_parsing", "Job description parsing", "jd_parse_interval_minutes", jd_parsing,
             "Parses job descriptions into structured requirements, each tied to the sentence it came from."),
     JobSpec("resume_parse", "Resume parsing", "resume_parse_interval_minutes", resume_parse,

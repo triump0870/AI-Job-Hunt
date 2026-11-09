@@ -50,6 +50,11 @@ WORKERS: dict[str, Worker] = {w.worker_type: w for w in (
     # Fallback only: picks the description out of blocks of a page that deterministic extraction could not settle.
     Worker("JD_RECOVERY", "JD Recovery", ("job_description_recovery",), True, 8192, "TIER", FAST,
            description="Identifies which blocks of a fetched posting page are the job description (never writes it)"),
+    # A cheap first read of jobs the deterministic rules could not settle (app.services.domain_classifier), before any
+    # expensive matching. Recommends only: code checks a NO_MATCH's evidence, and MATCH and UNCERTAIN both go on.
+    Worker("DOMAIN_CLASSIFIER", "Domain Classifier", ("domain_classifier",), True, 4096, "TIER", FAST,
+           description="Reads a posting's work and skills against yours, to spare a full resume match on clearly "
+                       "different jobs (never scores or ranks)"),
     Worker("RANKER", "Ranker", ("ranking",), True, 8192, "TIER", PRIMARY_REASONING, "rank",
            description="Scores how well a job fits the candidate"),
     Worker("RESUME_MATCHER", "Resume Matcher", (), True, 8192, "TIER", PRIMARY_REASONING,
@@ -97,7 +102,7 @@ EMBEDDING_WORKERS = tuple(w.worker_type for w in WORKERS.values() if w.capabilit
 WORKER_BY_PROMPT = {prompt: w.worker_type for w in WORKERS.values() for prompt in w.prompts}
 # The Monitoring stage (llm_request_logs.stage) each worker's requests have always been recorded under.
 MONITORING_STAGE = {"RESUME_PARSER": "RESUME_PARSER", "EVIDENCE_EXTRACTION": "RESUME_PARSER", "RANKER": "RANKER",
-                    "JD_PARSER": "JD_PARSER", "JD_RECOVERY": "JD_RECOVERY",
+                    "JD_PARSER": "JD_PARSER", "JD_RECOVERY": "JD_RECOVERY", "DOMAIN_CLASSIFIER": "DOMAIN_CLASSIFIER",
                     "TAILOR": "TAILOR", "REVIEWER": "REVIEWER", "APPLICATION_ANSWER": "APPLICATION",
                     "FOLLOWUP": "FOLLOW_UP", "INBOX_CLASSIFIER": "INBOX", "COMPANY_INSIGHTS": "COMPANY_INSIGHTS",
                     "INTERVIEW_INSIGHTS": "INTERVIEW_INSIGHTS",

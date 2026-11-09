@@ -61,6 +61,8 @@ class User(Base):
     knowledge_answers: Mapped[list[KnowledgeAnswer]] = relationship(back_populates="user", passive_deletes=True)
     evidence: Mapped[list[Evidence]] = relationship(back_populates="user", passive_deletes=True)
     jobs: Mapped[list[Job]] = relationship(back_populates="user", passive_deletes=True)
+    job_classification_tasks: Mapped[list[JobClassificationTask]] = relationship(back_populates="user", passive_deletes=True)
+    job_classification_cache: Mapped[list[JobClassificationCache]] = relationship(back_populates="user", passive_deletes=True)
     search_runs: Mapped[list[SearchRun]] = relationship(back_populates="user", passive_deletes=True)
     search_profiles: Mapped[list[SearchProfile]] = relationship(back_populates="user", passive_deletes=True)
     saved_searches: Mapped[list[SavedSearch]] = relationship(back_populates="user", passive_deletes=True)
@@ -518,6 +520,8 @@ class SavedSearch(Base):
 JD_STATUSES = ("RAW", "NORMALIZED", "PARSED", "NEEDS_REVIEW", "MANUALLY_CORRECTED")
 JD_PARSE_STATUSES = ("PENDING", "PROCESSING", "COMPLETED", "FAILED")
 ACTIVE_JD_PARSE_STATUSES = ("PENDING", "PROCESSING")
+JOB_CLASSIFICATION_STATUSES = ("PENDING", "PROCESSING", "COMPLETED", "FAILED", "SKIPPED")
+ACTIVE_JOB_CLASSIFICATION_STATUSES = ("PENDING", "PROCESSING")
 REQUIREMENT_TYPES = ("SKILL", "EXPERIENCE", "RESPONSIBILITY", "LEADERSHIP", "EDUCATION", "LOCATION",
                      "WORK_AUTHORIZATION", "VISA", "COMPENSATION", "DOMAIN", "SENIORITY", "OTHER")
 REQUIREMENT_LEVELS = ("REQUIRED", "PREFERRED", "INFORMATIONAL", "UNKNOWN")
@@ -607,8 +611,9 @@ class Job(Base):
     description_final_url: Mapped[str | None] = mapped_column(String(1200), nullable=True)
     description_fetched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     description_recovery_task_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # Domain filter (app.services.domain_match): MATCH, NOT_MATCHING (hidden, never recovered, parsed or ranked) or
-    # KEPT (the person kept it anyway; never re-assessed). NULL = not assessed yet.
+    # Domain filter (app.services.domain_match): MATCH, NOT_MATCHING (hidden, never recovered, parsed or ranked),
+    # KEPT (the person kept it anyway; never re-assessed) or PENDING (waiting for app.services.domain_classifier: held,
+    # like a hidden job, from every worker). NULL = not assessed yet.
     domain_match: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
     domain_reason: Mapped[str | None] = mapped_column(String(300), nullable=True)
     domain_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -772,6 +777,82 @@ class JobStructuredDataChange(Base):
 
     job: Mapped[Job] = relationship()
     user: Mapped[User] = relationship(back_populates="job_structured_changes")
+
+
+class JobClassificationTask(Base):
+    """One queued read of a job by the domain classifier, and afterwards the record of why it was kept or hidden.
+
+    At most one active task per job (uq_job_classification_tasks_active_job). `mode` is ON (its verdict moves the job)
+    or SHADOW (recorded for comparison, the job is never touched). `model_classification` is the model's answer,
+    `classification` what code made of it, and `gate_code` why they differ. Metadata only: no prompt or posting text.
+    """
+
+    __tablename__ = "job_classification_tasks"
+    __table_args__ = (
+        CheckConstraint(f"status IN ({_values(JOB_CLASSIFICATION_STATUSES)})", name="ck_job_classification_tasks_status"),
+        CheckConstraint("attempt_count >= 0", name="ck_job_classification_tasks_attempt_count"),
+        Index("uq_job_classification_tasks_active_job", "job_id", unique=True,
+              postgresql_where=text(f"status IN ({_values(ACTIVE_JOB_CLASSIFICATION_STATUSES)})"),
+              sqlite_where=text(f"status IN ({_values(ACTIVE_JOB_CLASSIFICATION_STATUSES)})")),
+        Index("ix_job_classification_tasks_claim", "status", "next_attempt_at"),
+        Index("ix_job_classification_tasks_user_created", "user_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("job_classification_tasks")
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("jobs.id", ondelete="CASCADE", name="fk_job_classification_tasks_job_id"), index=True)
+    status: Mapped[str] = mapped_column(String(20), default="PENDING")
+    mode: Mapped[str] = mapped_column(String(10), default="ON")
+    reason: Mapped[str] = mapped_column(String(40), default="new")  # new | recheck | description_changed | user_request
+    route: Mapped[str] = mapped_column(String(20), default="ASK")  # HARD | POSITIVE | ASK
+    signals: Mapped[list[str]] = mapped_column(JSON, default=list)  # the doubts that sent it to the model
+    title_only: Mapped[bool] = mapped_column(Boolean, default=False)
+    legacy_match: Mapped[bool | None] = mapped_column(Boolean, nullable=True)  # what the old filter says (comparison)
+    legacy_reason: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    model_classification: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    classification: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    explanation: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    matched_skills: Mapped[list[str]] = mapped_column(JSON, default=list)
+    irrelevance_evidence: Mapped[list[str]] = mapped_column(JSON, default=list)
+    gate_code: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    cache_hit: Mapped[bool] = mapped_column(Boolean, default=False)
+    prompt_version: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    locked_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    lock_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lock_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    run_now_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    user: Mapped[User] = relationship(back_populates="job_classification_tasks")
+
+
+class JobClassificationCache(Base):
+    """The model's answer for one candidate × posting window × prompt version, so a repost or a duplicate costs nothing.
+
+    Per account, kept after the job is deleted, and read back through the evidence gate like a fresh answer. The key is
+    a hash, and no prompt or posting text is stored."""
+
+    __tablename__ = "job_classification_cache"
+    __table_args__ = (UniqueConstraint("user_id", "cache_key", name="uq_job_classification_cache_user_key"),
+                      Index("ix_job_classification_cache_expires", "expires_at"))
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("job_classification_cache")
+    cache_key: Mapped[str] = mapped_column(String(64))
+    answer: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    prompt_version: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    hits: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+
+    user: Mapped[User] = relationship(back_populates="job_classification_cache")
 
 
 class JobDescriptionParseTask(Base):
@@ -1093,7 +1174,9 @@ class RemovedPosting(Base):
     user: Mapped[User] = relationship(back_populates="removed_postings")
 
 
-FEEDBACK_ACTIONS = ("DISMISSED", "REJECTED", "DELETED", "SHORTLISTED", "TAILORED", "APPROVED", "APPLIED", "KEPT")
+# BULK_DELETED: a cleanup of many jobs at once. Remembered, but it says nothing about the person's taste (never learned).
+FEEDBACK_ACTIONS = ("DISMISSED", "REJECTED", "DELETED", "SHORTLISTED", "TAILORED", "APPROVED", "APPLIED", "KEPT",
+                    "BULK_DELETED")
 NEGATIVE_FEEDBACK = ("DISMISSED", "REJECTED", "DELETED")
 
 
@@ -1695,7 +1778,7 @@ class JobRankingTask(Base):
 
 
 LLM_STAGES = ("RANKER", "TAILOR", "REVIEWER", "RESUME_PARSER", "JD_PARSER", "JD_RECOVERY", "APPLICATION", "FOLLOW_UP",
-              "INBOX", "COMPANY_INSIGHTS", "INTERVIEW_INSIGHTS", "ADVISOR", "BROWSER_NAVIGATION", "OTHER")
+              "INBOX", "COMPANY_INSIGHTS", "INTERVIEW_INSIGHTS", "ADVISOR", "BROWSER_NAVIGATION", "DOMAIN_CLASSIFIER", "OTHER")
 LLM_ERROR_TYPES = ("TIMEOUT", "RATE_LIMIT", "INVALID_JSON", "SCHEMA_VALIDATION", "PROVIDER_ERROR", "CONTEXT_OVERFLOW",
                    "CONFIGURATION", "OTHER")
 OPTIMIZATION_TASK_STATUSES = ("PENDING", "PROCESSING", "COMPLETED", "FAILED")

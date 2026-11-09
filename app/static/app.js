@@ -197,7 +197,7 @@ function readHash() {
   if (screen === 'workers' && WK_TABS.some(([id]) => id === sub)) wkState().tab = sub;
   if (screen === 'settings') S.settingsSection = settingsSection(sub);
   if (screen === 'knowledge') S.knowledgeSection = knowledgeSection(sub);
-  if (screen === 'discovery' && ['triage', 'table', 'setup'].includes(sub)) S.discMode = sub;
+  if (screen === 'discovery' && ['triage', 'table', 'review', 'setup'].includes(sub)) S.discMode = sub;
   if (screen === 'today' && ['focus', 'run'].includes(sub)) S.todayVariant = sub;
 }
 function go(screen, extra = {}) {
@@ -222,6 +222,8 @@ const LOADERS = {
   async overview() { [D.overview, D.gateway] = await Promise.all([api('/api/workspace/overview'), api('/api/settings/ai/gateway').catch(() => null)]); },
   async today() { D.today = await api('/api/workspace/today'); },
   async discovery() {
+    D.review = await api('/api/discovery/review').catch(() => null);
+    if (S.discMode === 'review') return;
     if (S.discMode === 'triage') await loadQueue();
     else if (S.discMode === 'table') await loadTable();
     else await loadSetup();
@@ -360,6 +362,13 @@ function rankQueuedMsg(out) {
   const n = out.queued.length;
   return `${n ? `Queued ${n} job${n === 1 ? '' : 's'} for ranking` : 'Nothing new to rank'}${out.skipped.length ? ` · ${out.skipped.length} skipped` : ''}${out.blocked ? ` · waiting: ${out.blocked}` : ''}`;
 }
+function recoverQueuedMsg(out) {
+  const n = out.queued;
+  const notes = [[out.already_queued, 'already queued'], [out.hidden_by_domain, 'hidden by your domain filter left out'],
+    [out.held_for_review, 'waiting on the domain check left out'], [out.set_aside, 'you set aside left out'], [out.no_url, 'with no posting URL left out'],
+    [out.over_limit, 'more: click again once these finish']].filter(([count]) => count).map(([count, text]) => `${count} ${text}`);
+  return [n ? `Queued ${n} job${n === 1 ? ' to read from its posting' : 's to read from their postings'}` : 'Nothing new to fetch', ...notes].join(' · ');
+}
 async function afterPull(results) {
   const ok = results.filter(r => r.ok && r.id);
   if (ok[0]) S.runSel = ok[0].id;
@@ -429,7 +438,7 @@ function renderTop() {
   let seg = '';
   if (S.screen === 'today') seg = [['focus', 'Command centre'], ['run', 'Run sheet']].map(([id, t]) => `<button class="${S.todayVariant === id ? 'on' : ''}" data-act="variant" data-kind="today" data-id="${id}">${t}</button>`).join('');
   if (S.screen === 'tailor') seg = [['single', 'One job'], ['bulk', 'Bulk tailor']].map(([id, t]) => `<button class="${S.tailorMode === id ? 'on' : ''}" data-act="variant" data-kind="tailor" data-id="${id}">${t}</button>`).join('');
-  if (S.screen === 'discovery') seg = [['triage', 'Triage queue'], ['table', 'Table + detail'], ['setup', 'Search setup']].map(([id, t]) => `<button class="${S.discMode === id ? 'on' : ''}" data-act="variant" data-kind="discovery" data-id="${id}">${t}</button>`).join('');
+  if (S.screen === 'discovery') seg = [['triage', 'Triage queue'], ['table', 'Table + detail'], ...(D.review?.total || S.discMode === 'review' ? [['review', `Needs review${D.review?.total ? ` ${D.review.total}` : ''}`]] : []), ['setup', 'Search setup']].map(([id, t]) => `<button class="${S.discMode === id ? 'on' : ''}" data-act="variant" data-kind="discovery" data-id="${id}">${t}</button>`).join('');
   return `<div class="top-row"><div><h1>${esc(title)}</h1><div class="sub">${esc(sub)}</div></div>
     <div class="row gap8 wrap">${seg ? `<div class="seg">${seg}</div>` : ''}
       <button class="btn" data-act="palette">Search · ⌘K</button>
@@ -606,8 +615,31 @@ function renderRunSheet(t) {
 }
 
 /* ───────────── discovery ───────────── */
+function domainCheckNote(job) {
+  if (job.domain_match === 'REVIEW') return `<div class="banner warn mb12" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="grow"><b>Needs your review.</b> ${esc((job.domain_reason || '').replace('Needs your review: ', ''))} Nothing is spent on it until you choose.</span>${btn('It matches', 'review-decide', { ids: String(job.id), matches: '1' }, 'sm soft')}${btn('Not a match', 'review-decide', { ids: String(job.id), matches: '0' }, 'sm')}</div>`;
+  if (job.domain_match === 'PENDING') return `<div class="xs muted mb12">${esc(job.domain_reason || 'Waiting for the AI check')}: it runs before anything else is spent on this job.</div>`;
+  return (job.domain_reason || '').startsWith('AI check') ? `<div class="xs muted mb12">${esc(job.domain_reason)}</div>` : '';
+}
+function renderReview() {
+  const r = D.review || { total: 0, jobs: [] };
+  const picked = S.reviewChecked || (S.reviewChecked = new Set());
+  if (!r.jobs.length) return '<div class="card"><p class="settings-help">Nothing needs your review. Jobs the domain check cannot settle wait here, and nothing is spent on them until you choose.</p></div>';
+  const ids = [...picked].filter(id => r.jobs.some(j => j.id === id));
+  const bulk = ids.length ? `${btn(label('reviewYes', `These ${ids.length} match`, 'Saving…'), 'review-decide', { ids: ids.join(','), matches: '1' }, 'primary sm', isBusy('reviewYes'))}${btn(label('reviewNo', `Remove these ${ids.length}`, 'Saving…'), 'review-decide', { ids: ids.join(','), matches: '0' }, 'sm', isBusy('reviewNo'))}` : '<span class="xs muted">Select jobs to decide several at once</span>';
+  return `<div class="card flush"><div class="row gap10 wrap" style="padding:14px 18px;align-items:center;border-bottom:1px solid var(--line2)">
+      <input type="checkbox" data-act="review-all" ${ids.length === r.jobs.length ? 'checked' : ''} aria-label="Select all"><div class="grow"><b>${r.total} job${r.total === 1 ? '' : 's'} could go either way</b><div class="xs muted">The rules and the AI check could not settle these, so you decide. Jobs that match go on to the detailed match; removed ones move to Not matching.</div></div>
+      <div class="row gap8 wrap">${bulk}</div></div>
+    ${r.jobs.map(j => `<div class="row gap10" style="padding:14px 18px;align-items:flex-start;border-bottom:1px solid var(--line2)">
+      <input type="checkbox" data-act="review-check" data-id="${j.id}" ${picked.has(j.id) ? 'checked' : ''} aria-label="Select" style="margin-top:3px"><div class="grow" style="min-width:0">
+        <div class="small b">${j.url ? `<a href="${attr(j.url)}" target="_blank" rel="noopener">${esc(j.title)}</a>` : esc(j.title)}</div><div class="xs muted">${esc([j.company, j.location].filter(Boolean).join(' · '))}</div>
+        ${j.reason ? `<div class="small mt4">${esc(j.reason)}</div>` : ''}
+        <div class="row gap6 wrap mt6">${j.your_skills_found.length ? j.your_skills_found.slice(0, 10).map(s => pill(s, 'good')).join('') : '<span class="xs muted">None of your skills found in the posting</span>'}${j.points_against.slice(0, 2).map(p => pill(p, 'warn')).join('')}</div>
+        ${j.summary ? `<div class="xs muted mt6 pretty">${esc(j.summary)}…</div>` : ''}</div>
+      <div class="row gap6" style="flex:none">${btn('It matches', 'review-decide', { ids: String(j.id), matches: '1' }, 'sm soft')}${btn('Remove', 'review-decide', { ids: String(j.id), matches: '0' }, 'sm')}</div></div>`).join('')}</div>`;
+}
 function renderDiscovery() {
   const banner = S.polling ? `<div class="banner mb14"><span class="dot" style="background:var(--brand)"></span><span class="grow">${esc(S.polling.text)}</span></div>` : '';
+  if (S.discMode === 'review') return banner + renderReview();
   if (S.discMode === 'table') return banner + renderTable();
   if (S.discMode === 'setup') return banner + renderSetup();
   return banner + renderTriage();
@@ -880,34 +912,68 @@ function filterBar(j, opts) {
   const f = S.filters, active = activeFilters(j), moreCount = active.filter(a => a.more).length;
   const hasDate = DATE_KEYS.some(k => f[k]);
   const fitCaps = [[0, 'Any'], [49, 'Below 50'], [69, 'Below 70'], [79, 'Below 80']];
-  const check = (key, text, title = '') => `<label class="check small" ${title ? `title="${attr(title)}"` : ''}><input type="checkbox" id="flt-${key.replace(/_/g, '-')}" data-filter="${key}" ${f[key] ? 'checked' : ''}>${text}</label>`;
+  // A real checkbox inside a pill, so the shared data-filter handler and the keyboard work as on any checkbox.
+  const toggle = (key, text, title = '') => `<label class="filter-toggle ${f[key] ? 'on' : ''}" ${title ? `title="${attr(title)}"` : ''}><input type="checkbox" id="flt-${key.replace(/_/g, '-')}" data-filter="${key}" ${f[key] ? 'checked' : ''}><span class="filter-toggle-mark" aria-hidden="true">✓</span>${text}</label>`;
   const field = (text, control) => `<label class="field xs">${text}${control}</label>`;
+  const group = (name, body) => `<div class="filter-group" role="group" aria-label="${attr(name)}"><div class="filter-group-name">${esc(name)}</div><div class="filter-group-body">${body}</div></div>`;
+  const stage = f.stage || 'all';
   return `<div class="filterbar">
-    <div class="toolbar">
-      <input class="input grow" style="min-width:180px" id="flt-q" data-filter="q" value="${attr(f.q)}" placeholder="Search title, company or location…" aria-label="Search jobs">
-      <button type="button" class="btn sm datebtn ${hasDate ? 'on' : ''}" id="flt-date" data-act="date-pop" aria-expanded="${S.datePop}" aria-controls="flt-date-panel"><span aria-hidden="true">◷</span>${esc(dateLabel(f))}<span class="faint" aria-hidden="true">${S.datePop ? '▴' : '▾'}</span></button>
-      <select class="select" id="flt-min" data-filter="min_fit" aria-label="Minimum fit">${opts([[0, 'Any fit'], [50, 'Fit ≥ 50'], [70, 'Fit ≥ 70'], [80, 'Fit ≥ 80']], f.min_fit)}</select>
-      <select class="select" id="flt-stage" data-filter="stage" aria-label="Stage">${opts([['all', 'All stages'], ['unranked', 'Unranked'], ...['discovered', 'shortlisted', 'maybe', 'archived', 'dismissed', 'tailored', 'needs_retailor', 'pending_approval', 'approved', 'applied'].map(s => [s, statusTitle(s)])], f.stage)}</select>
+    <div class="toolbar filter-find">
+      <input class="input grow filter-search" id="flt-q" data-filter="q" value="${attr(f.q)}" placeholder="Search title, company or location…" aria-label="Search jobs">
       <select class="select" id="flt-sort" data-filter="sort" aria-label="Sort">${opts([['fit', 'Sort: best fit'], ['new', 'Sort: newest found'], ['posted', 'Sort: newest posted'], ['company', 'Sort: company']], f.sort)}</select>
-      <button type="button" class="btn sm ${S.moreFilters || moreCount ? 'soft' : ''}" data-act="toggle-more-filters" aria-expanded="${S.moreFilters}" aria-controls="flt-more">More filters${moreCount ? ` · ${moreCount}` : ''} <span aria-hidden="true">${S.moreFilters ? '▴' : '▾'}</span></button>
-      <span class="grow"></span>
+      ${S.checked.size || f.description !== 'NO_DESCRIPTION' ? '' : `<span title="Reads every job with no description from its posting. Jobs your domain filter hides are left out.">${btn(label('recoverDescriptions', 'Fetch missing descriptions', 'Queueing…'), 'recover-descriptions', {}, 'sm', isBusy('recoverDescriptions'))}</span>`}
       ${S.checked.size ? '' : btn(label('rankBatch', 'Rank unranked', 'Queueing…'), 'rank-batch', {}, 'sm', isBusy('rankBatch'))}
+    </div>
+    <div class="filter-pills">
+      <button type="button" class="filter-pill ${hasDate ? 'on' : ''}" id="flt-date" data-act="date-pop" aria-expanded="${S.datePop}" aria-controls="flt-date-panel"><span aria-hidden="true">◷</span>${esc(dateLabel(f))}<span class="filter-caret" aria-hidden="true">${S.datePop ? '▴' : '▾'}</span></button>
+      <select class="select filter-pill ${f.min_fit ? 'on' : ''}" id="flt-min" data-filter="min_fit" aria-label="Minimum fit">${opts([[0, 'Any fit'], [50, 'Fit ≥ 50'], [70, 'Fit ≥ 70'], [80, 'Fit ≥ 80']], f.min_fit)}</select>
+      <select class="select filter-pill ${stage !== 'all' ? 'on' : ''}" id="flt-stage" data-filter="stage" aria-label="Stage">${opts([['all', 'All stages'], ['unranked', 'Unranked'], ...['discovered', 'shortlisted', 'maybe', 'archived', 'dismissed', 'tailored', 'needs_retailor', 'pending_approval', 'approved', 'applied'].map(s => [s, statusTitle(s)])], f.stage)}</select>
+      <span class="grow"></span>
+      <button type="button" class="filter-pill ${S.moreFilters || moreCount ? 'on' : ''}" data-act="toggle-more-filters" aria-expanded="${S.moreFilters}" aria-controls="flt-more">More filters${moreCount ? `<span class="filter-count" aria-label="${moreCount} active">${moreCount}</span>` : ''}<span class="filter-caret" aria-hidden="true">${S.moreFilters ? '▴' : '▾'}</span></button>
     </div>
     ${S.datePop ? datePopover(f) : ''}
     ${S.moreFilters ? `<div class="filter-more" id="flt-more">
-      ${field('Board', `<select class="select" id="flt-board" data-filter="board">${opts([['all', 'All boards'], ...(j.boards || []).map(b => [b, b])], f.board)}</select>`)}
-      ${field('Location', `<select class="select" id="flt-location" data-filter="location">${opts(locationOptions(j.locations || []), f.location)}</select>`)}
-      ${field('Work mode', `<select class="select" id="flt-work-mode" data-filter="work_mode" title="As the board states it: a job that does not say remote or hybrid is “not stated”">${opts([['all', 'Any work mode'], ...Object.entries(WORK_MODE_NAMES).map(([k, t]) => [k, `${t} (${j.work_modes?.[k] ?? 0})`])], f.work_mode)}</select>`)}
-      ${field('Job type', `<select class="select" id="flt-job-type" data-filter="job_type">${opts([['all', 'Any job type'], ...(j.job_types || []).map(t => [t, titleCase(t)])], f.job_type)}</select>`)}
-      ${field('Fit up to', `<select class="select" id="flt-max" data-filter="max_fit">${opts(fitCaps, f.max_fit)}</select>`)}
-      ${field('Search setup', `<select class="select" id="flt-setup" data-filter="setup_id">${opts([['', 'Any setup'], ...(j.setups || [])], f.setup_id)}</select>`)}
-      ${field('Domain', `<select class="select" id="flt-domain" data-filter="domain" title="Jobs outside your domain are hidden at discovery and never ranked (Settings → Domain filter)">${opts([['matching', `Matching (${j.domain_counts?.matching ?? 0})`], ['not_matching', `Not matching (${j.domain_counts?.not_matching ?? 0})`], ['all', 'Any domain']], f.domain || 'matching')}</select>`)}
-      ${field('Description', `<select class="select" id="flt-description" data-filter="description">${opts([['all', 'Any description'], ...(j.description_states || []).map(([k, name, n]) => [k, `${name} (${n})`])], f.description)}</select>`)}
-      <div class="filter-wide"><div class="xs muted mb4">Must mention <span class="faint">· all of them; use / for either</span></div>${tagBox('flt', 'keywords', f.keywords || [], 'Python, Lead/Principal… then Enter', 6)}</div>
-      <div class="filter-wide row gap16 wrap">${check('has_salary', 'Salary listed', 'Only jobs whose posting states a salary')}${check('hide_agencies', 'Hide staffing agencies')}${check('hide_reposts', 'Hide reposts')}${check('include_applied', 'Show applied', 'Jobs you already applied to are hidden from Discovery; the Applied stage always shows them')}</div>
+      ${group('Role', `
+        ${field('Location', `<select class="select" id="flt-location" data-filter="location">${opts(locationOptions(j.locations || []), f.location)}</select>`)}
+        ${field('Work mode', `<select class="select" id="flt-work-mode" data-filter="work_mode" title="As the board states it: a job that does not say remote or hybrid is “not stated”">${opts([['all', 'Any work mode'], ...Object.entries(WORK_MODE_NAMES).map(([k, t]) => [k, `${t} (${j.work_modes?.[k] ?? 0})`])], f.work_mode)}</select>`)}
+        ${field('Job type', `<select class="select" id="flt-job-type" data-filter="job_type">${opts([['all', 'Any job type'], ...(j.job_types || []).map(t => [t, titleCase(t)])], f.job_type)}</select>`)}`)}
+      ${group('Source', `
+        ${field('Board', `<select class="select" id="flt-board" data-filter="board">${opts([['all', 'All boards'], ...(j.boards || []).map(b => [b, b])], f.board)}</select>`)}
+        ${field('Search setup', `<select class="select" id="flt-setup" data-filter="setup_id">${opts([['', 'Any setup'], ...(j.setups || [])], f.setup_id)}</select>`)}`)}
+      ${group('Match', `
+        ${field('Fit up to', `<select class="select" id="flt-max" data-filter="max_fit">${opts(fitCaps, f.max_fit)}</select>`)}
+        ${field('Domain', `<select class="select" id="flt-domain" data-filter="domain" title="Jobs outside your domain are hidden at discovery and never ranked (Settings → Domain filter)">${opts([['matching', `Matching (${j.domain_counts?.matching ?? 0})`], ['not_matching', `Not matching (${j.domain_counts?.not_matching ?? 0})`], ['all', 'Any domain']], f.domain || 'matching')}</select>`)}
+        ${field('Description', `<select class="select" id="flt-description" data-filter="description">${opts([['all', 'Any description'], ...(j.description_states || []).map(([k, name, n]) => [k, `${name} (${n})`])], f.description)}</select>`)}`)}
+      ${group('Must mention', `<div class="filter-wide">${tagBox('flt', 'keywords', f.keywords || [], 'Python, Lead/Principal… then Enter', 6)}<div class="xs faint mt6">Jobs must mention all of them; use / for either</div></div>`)}
+      ${group('Quick toggles', `${toggle('has_salary', 'Salary listed', 'Only jobs whose posting states a salary')}${toggle('hide_agencies', 'Hide staffing agencies')}${toggle('hide_reposts', 'Hide reposts')}${toggle('include_applied', 'Show applied', 'Jobs you already applied to are hidden from Discovery; the Applied stage always shows them')}`)}
     </div>` : ''}
-    ${active.length ? `<div class="filter-chips" aria-label="Active filters">${active.map(a => `<span class="chip grey">${esc(a.text)}<button type="button" aria-label="Remove filter ${attr(a.text)}" data-act="clear-filter" data-keys="${a.keys.join(',')}">×</button></span>`).join('')}<a href="#" class="xs" data-act="reset-filters">Clear all</a></div>` : ''}
+    ${active.length ? `<div class="filter-chips" aria-label="Active filters">${active.map(a => `<span class="chip">${esc(a.text)}<button type="button" aria-label="Remove filter ${attr(a.text)}" data-act="clear-filter" data-keys="${a.keys.join(',')}">×</button></span>`).join('')}<a href="#" class="xs" data-act="reset-filters">Clear all</a></div>` : ''}
   </div>`;
+}
+
+function listingCheckButton() {
+  const run = S.listingRun;
+  return `<span title="Re-reads all your postings not read in the last hour, least recently checked first, and deletes the ones whose page says they are gone or closed. Approved and applied jobs are kept, and a page that cannot be read deletes nothing.">${btn(run ? `Checking ${Math.min(run.checked, run.due)} of ${run.due}…` : label('listingCheck', 'Check listings', 'Starting…'), 'listing-check', {}, 'sm ghost', !!run || isBusy('listingCheck'))}</span>`;
+}
+const LISTING_POLL_MS = 3000, LISTING_POLL_IDLE = 5, LISTING_POLL_MAX = 1200;  // an hour at most: the check goes on regardless
+async function pollListingCheck(tries = 0) {
+  const run = S.listingRun;
+  if (!run) return;
+  let finished = false, lost = tries >= LISTING_POLL_MAX;
+  try {
+    const seen = await api(`/api/jobs/listing-check/status?since=${encodeURIComponent(run.since)}`);
+    run.idle = seen.running || seen.checked !== run.checked ? 0 : (run.idle || 0) + 1;
+    run.checked = seen.checked;
+    if (seen.removed !== run.removed) { run.removed = seen.removed; load(); }
+    // A posting whose check failed outright is never counted, so a run that stopped moving has ended too.
+    finished = seen.checked >= run.due || run.idle >= LISTING_POLL_IDLE;
+  } catch { lost = true; }
+  if (!finished && !lost) { render(); setTimeout(() => pollListingCheck(tries + 1), LISTING_POLL_MS); return; }
+  S.listingRun = null;
+  toast(!finished ? 'The listing check goes on in the background · refresh later to see the result'
+    : run.checked < run.due ? `Listing check stopped at ${run.checked} of ${run.due}${run.removed ? ` · ${run.removed} removed` : ''} · sites are rate limiting, so press it again later for the rest`
+    : run.removed ? `Listing check done · ${run.removed} dead posting${run.removed === 1 ? '' : 's'} removed` : 'Listing check done · no dead postings found');
+  load();
 }
 
 function renderTable() {
@@ -937,14 +1003,14 @@ function renderTable() {
       ${resumeSelect('bulk-resume', '', { placeholder: 'Use resume…', disabled: isBusy('bulkResume'), fill: false })}
       <span class="grow"></span>${btn('Clear selection', 'clear-selection', {}, 'sm ghost')}
     </div>` : ''}
-    <div class="row between wrap" style="padding:9px 14px;border-bottom:1px solid var(--line2);background:#fbfbfe"><span class="small muted">${j.total ? `Showing ${start}–${Math.min(j.page * j.per_page, j.total)} of ${j.total} jobs` : 'No matches'}</span><span class="small muted">Page ${j.page} of ${j.pages} · ${j.total + (j.applied_hidden || 0) === j.total_all ? 'no filters applied' : `${j.total_all - j.total - (j.applied_hidden || 0)} hidden by filters`}${j.applied_hidden ? ` · ${j.applied_hidden} applied job${j.applied_hidden === 1 ? '' : 's'} hidden` : ''}</span></div>
+    <div class="row between wrap" style="padding:9px 14px;border-bottom:1px solid var(--line2);background:#fbfbfe"><span class="row gap8 wrap"><span class="small muted">${j.total ? `Showing ${start}–${Math.min(j.page * j.per_page, j.total)} of ${j.total} jobs` : 'No matches'}</span>${listingCheckButton()}</span><span class="small muted">Page ${j.page} of ${j.pages} · ${j.total + (j.applied_hidden || 0) === j.total_all ? 'no filters applied' : `${j.total_all - j.total - (j.applied_hidden || 0)} hidden by filters`}${j.applied_hidden ? ` · ${j.applied_hidden} applied job${j.applied_hidden === 1 ? '' : 's'} hidden` : ''}</span></div>
     ${allOnPage && j.total > j.items.length && S.checked.size < j.total ? `<div class="banner" style="border-radius:0;border-width:0 0 1px">All ${j.items.length} on this page are selected. <a href="#" data-act="select-all-matching">${isBusy('selectAll') ? 'Selecting…' : `Select all ${j.total} matching jobs`}</a></div>` : ''}
     ${S.checked.size && S.checked.size >= j.total && j.total > j.items.length ? `<div class="banner" style="border-radius:0;border-width:0 0 1px">All ${S.checked.size} matching jobs are selected. <a href="#" data-act="clear-selection">Clear selection</a></div>` : ''}
     <div class="jgrid jhead"><input type="checkbox" data-act="check-all" ${allOnPage ? 'checked' : ''} aria-label="Select page"><span>OPPORTUNITY</span><span class="tr">FIT</span><span>STAGE</span><span>SOURCE</span><span class="tr">POSTED</span></div>
     ${j.items.map(r => `<div class="jgrid jrow ${r.id === S.selJob ? 'sel' : ''}" data-act="select-job" data-id="${r.id}">
       <input type="checkbox" data-act="check" data-id="${r.id}" ${S.checked.has(r.id) ? 'checked' : ''} aria-label="Select">
       <div style="min-width:0"><div class="b ellipsis" style="font-size:13.5px">${esc(r.title)}</div><div class="xs muted ellipsis">${esc(r.company)}${r.location ? ' · ' + esc(r.location) : ''}</div></div>
-      <div class="tr mono bb ${fitCls(r.fit)}" style="font-size:13.5px">${fitTxt(r.fit)}</div><div class="col gap4" style="align-items:flex-start">${r.domain_match === 'NOT_MATCHING' ? `<span title="${attr(r.domain_reason || 'Outside your domain')}">${pill('Not matching', 'warn')}</span>` : statusPill(r.status)}${descBadge(r.description_state)}</div><div class="xs muted">${esc(r.board)}</div><div class="tr xs ${r.posted_ago || r.posted_raw ? 'muted' : 'faint'}" title="${attr(`found ${r.posted}`)}">${esc(r.posted_ago || r.posted_raw || `found ${r.posted}`)}</div></div>`).join('')}
+      <div class="tr mono bb ${fitCls(r.fit)}" style="font-size:13.5px">${fitTxt(r.fit)}</div><div class="col gap4" style="align-items:flex-start">${r.domain_match === 'NOT_MATCHING' ? `<span title="${attr(r.domain_reason || 'Outside your domain')}">${pill('Not matching', 'warn')}</span>` : r.domain_match === 'PENDING' ? pill('AI check', 'muted') : r.domain_match === 'REVIEW' ? pill('Needs review', 'warn') : statusPill(r.status)}${descBadge(r.description_state)}</div><div class="xs muted">${esc(r.board)}</div><div class="tr xs ${r.posted_ago || r.posted_raw ? 'muted' : 'faint'}" title="${attr(`found ${r.posted}`)}">${esc(r.posted_ago || r.posted_raw || `found ${r.posted}`)}</div></div>`).join('')}
     ${!j.total ? `<div class="empty small muted">No jobs match these filters. <a href="#" data-act="reset-filters">Reset</a> to see all ${j.total_all}.</div>` : ''}
     <div class="row wrap gap10 pager" style="padding:12px 14px;background:#fbfbfe"><div class="row gap6"><span class="small muted">Rows</span><select class="select" style="margin:0;width:auto;padding:6px 8px" id="flt-per" data-filter="per_page">${opts([[10, 10], [25, 25], [50, 50]], f.per_page)}</select></div><div class="grow"></div>
       ${btn('← Prev', 'page', { page: j.page - 1 }, 'sm', j.page <= 1)}${pages.map(p => btn(String(p), 'page', { page: p }, 'sm ' + (p === j.page ? 'on' : ''))).join('')}${btn('Next →', 'page', { page: j.page + 1 }, 'sm', j.page >= j.pages)}</div>
@@ -952,7 +1018,7 @@ function renderTable() {
   <section class="card pad18 c-side sticky-panel">${sel ? `
     <div class="row top-align between gap10"><div class="grow"><div style="font-size:17px;font-weight:600">${esc(sel.title)}</div><div class="base muted mt4">${esc(sel.company)}${sel.location ? ' · ' + esc(sel.location) : ''}</div></div><div class="mono bb ${fitCls(sel.fit)}" style="font-size:24px">${fitTxt(sel.fit)}</div></div>
     <div class="row gap6 wrap" style="margin:14px 0">${statusPill(sel.status)}${pill(sel.board + ' · found ' + sel.posted, 'plain', 'lg')}${postedTxt(sel) ? pill(postedTxt(sel), 'plain', 'lg') : ''}${pill(`${sel.matches.length} matched`, 'good', 'lg')}${pill(`${sel.gaps.length + sel.missing.length} gaps`, 'warn', 'lg')}</div>
-    ${sel.domain_match === 'NOT_MATCHING' ? `<div class="banner warn mb12" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="grow"><b>Hidden: not matching.</b> ${esc(sel.domain_reason || 'Outside your domain')}. It is not ranked, so no model is used on it.</span>${btn(label('keep' + sel.id, 'Keep this job', 'Keeping…'), 'domain-keep', { id: sel.id }, 'sm soft', isBusy('keep' + sel.id))}</div>` : ''}
+    ${sel.domain_match === 'NOT_MATCHING' ? `<div class="banner warn mb12" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="grow"><b>Hidden: not matching.</b> ${esc(sel.domain_reason || 'Outside your domain')}. It is not ranked further.</span>${btn(label('keep' + sel.id, 'Keep this job', 'Keeping…'), 'domain-keep', { id: sel.id }, 'sm soft', isBusy('keep' + sel.id))}</div>` : domainCheckNote(sel)}
     <div class="base pretty" style="color:var(--ink3);line-height:1.6;border-top:1px solid var(--line2);padding-top:14px">${esc(sel.summary || (sel.description || '').slice(0, 420) || 'No description captured.')}</div>
     <div class="mt12"><div class="row gap8" style="align-items:center;min-width:0"><span class="xs muted" style="white-space:nowrap">Resume used</span>${resumeSelect('job-resume', sel.resume_choice_id, { id: sel.id, choice: sel.resume_choice })}</div>${sel.resume_choice === 'AUTO' ? '<div class="xs faint mt4">Matched by resume tags</div>' : ''}</div>
     <div class="row gap8 mt16">${['tailored', 'needs_retailor', 'approved', 'applied', 'pending_approval'].includes(sel.status) ? btn(sel.status === 'needs_retailor' ? 'Re-tailor' : 'Open packet', 'go', { screen: sel.status === 'applied' ? 'tracker' : sel.status === 'approved' ? 'approvals' : 'tailor', job: sel.id }, 'primary grow') : sel.needs_description ? `<span class="grow" title="Ranking needs the job description">${btn('Add description', 'open-job', { id: sel.id }, 'primary grow')}</span>`
@@ -2035,7 +2101,9 @@ function renderJobModal() {
   else tab = `<div style="padding:20px 22px">${textareaF('jobnotes', j.id, j.notes, 'placeholder="Anything worth remembering about this role…" style="min-height:160px"')}${btn(label('jobnotes', 'Save notes', 'Saving…'), 'save-job-notes', { id: j.id }, 'primary sm mt10', isBusy('jobnotes'))}</div>`;
   return `<div class="overlay" data-act="overlay-close"><div class="modal" role="dialog" aria-label="Job detail" data-scroll-key="job-modal-${j.id}">
     <div class="modal-head"><div class="row top-align gap16 wrap"><div class="avatar lg">${esc(initials(j.company))}</div>
-      <div style="flex:1 1 240px;min-width:0"><div style="font-size:21px;font-weight:600;letter-spacing:-.02em">${esc(j.title)}</div><div class="muted mt4" style="font-size:13.5px">${esc(j.company)}${j.location ? ' · ' + esc(j.location) : ''} · ${esc(j.board)} · ${postedTxt(j) ? `<span class="ink2">${esc(postedTxt(j))}</span>` : '<span class="faint" title="The job board did not give a posting date">posting date not listed</span>'} · found ${esc(j.posted)}</div></div>
+      <div style="flex:1 1 240px;min-width:0">${S.titleEdit === j.id
+        ? `<div class="job-title-edit">${inputF('jobtitle', j.id, j.title, 'aria-label="Job title" maxlength="300"')}${btn(label('titlesave' + j.id, 'Save', 'Saving…'), 'save-job-title', { id: j.id }, 'primary sm', isBusy('titlesave' + j.id))}${btn('Cancel', 'cancel-job-title', { id: j.id }, 'sm')}</div>`
+        : `<div class="job-title"><span>${esc(j.title)}</span><button type="button" class="job-title-btn" data-act="edit-job-title" data-id="${j.id}" aria-label="Edit job title" title="Edit job title">✎</button></div>`}<div class="muted mt4" style="font-size:13.5px">${esc(j.company)}${j.location ? ' · ' + esc(j.location) : ''} · ${esc(j.board)} · ${postedTxt(j) ? `<span class="ink2">${esc(postedTxt(j))}</span>` : '<span class="faint" title="The job board did not give a posting date">posting date not listed</span>'} · found ${esc(j.posted)}</div></div>
       <div class="row gap8 wrap"><div class="scorebox sm"><div class="n">${fitTxt(j.fit)}</div><div class="l">FIT</div></div>
         ${j.url ? `<a class="btn" href="${attr(j.url)}" target="_blank" rel="noopener">Open posting ↗</a>` : ''}
         ${['approved', 'applied'].includes(j.status) ? btn('Open apply kit', 'modal-kit', { id: j.id }, 'primary')
@@ -2047,7 +2115,7 @@ function renderJobModal() {
       <div class="wizard">${j.wizard.map((w, i) => `<div class="${w.done ? 'done' : i === hereIdx ? 'here' : ''}"><div class="row gap6"><span class="m">${w.done ? '✓' : i + 1}</span><span class="small b" style="color:${w.done ? 'var(--ink)' : i === hereIdx ? 'var(--brand-ink)' : 'var(--faint)'}">${w.label}</span></div><div class="xs muted mt4">${esc(i === hereIdx && !w.done ? 'next step' : w.meta)}</div></div>`).join('')}</div></div>
     ${rejectionBanner(j)}
     ${pipelineBanner(j)}
-    ${j.domain_match === 'NOT_MATCHING' ? `<div class="banner warn" style="margin:0 24px;display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="grow"><b>Hidden: not matching.</b> ${esc(j.domain_reason || 'Outside your domain')} — not ranked, no model used.</span>${btn(label('keep' + j.id, 'Keep this job', 'Keeping…'), 'domain-keep', { id: j.id }, 'sm soft', isBusy('keep' + j.id))}</div>` : ''}
+    ${j.domain_match === 'NOT_MATCHING' ? `<div class="banner warn" style="margin:0 24px;display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="grow"><b>Hidden: not matching.</b> ${esc(j.domain_reason || 'Outside your domain')} — not ranked further.</span>${btn(label('keep' + j.id, 'Keep this job', 'Keeping…'), 'domain-keep', { id: j.id }, 'sm soft', isBusy('keep' + j.id))}</div>` : domainCheckNote(j)}
     <div class="split gap16" style="padding:18px 24px 24px">
       <section class="card flush" style="flex:1 1 420px;min-width:0"><div class="tabs under">${[['description', 'Description'], ['structured', 'Structured JD'], ['requirements', 'Requirements map'], ['insights', 'Insights'], ['notes', 'Notes']].map(([id, t]) => `<button class="${S.jobTab === id ? 'on' : ''}" data-act="job-tab" data-id="${id}">${t}</button>`).join('')}</div>${tab}</section>
       <div class="col gap14" style="flex:1 1 280px;min-width:0">
@@ -2220,7 +2288,7 @@ function queueTailoring(ids, mode, regenerate, busyKey, onQueued, extra = {}) {
 
 /* ───────────── actions ───────────── */
 async function openJob(id) {
-  S.jobOpen = Number(id); S.jobTab = 'description'; render();
+  S.jobOpen = Number(id); S.jobTab = 'description'; S.titleEdit = null; render();
   try {
     [D.jobModal] = await Promise.all([api(`/api/jobs/${id}`), loadResumeChoices()]);
     if (recoveryActive(D.jobModal.description_recovery)) watchRecovery(id);
@@ -2512,6 +2580,26 @@ const A = {
     return D.gateway;
   }, g => g.gateway_enabled ? 'Workers now use the LiteLLM gateway' : `Workers now call ${g.direct_label} directly`);
   },
+  'edit-job-title': el => {
+    const id = el.dataset.id;
+    S.titleEdit = Number(id); render();
+    const input = document.getElementById(`jobtitle-${id}`);
+    input?.focus(); input?.select();
+  },
+  'cancel-job-title': el => {
+    const id = el.dataset.id;
+    S.titleEdit = null; if (S.forms.jobtitle) delete S.forms.jobtitle[id];
+    render();
+    document.querySelector('[data-act="edit-job-title"]')?.focus();
+  },
+  'save-job-title': el => busy('titlesave' + el.dataset.id, async () => {
+    const id = el.dataset.id;
+    const out = await api(`/api/jobs/${id}/title`, { method: 'PUT', body: { title: fv('jobtitle', id, D.jobModal?.title || '') } });
+    S.titleEdit = null; if (S.forms.jobtitle) delete S.forms.jobtitle[id];
+    if (D.jobModal?.id === Number(id)) D.jobModal = { ...D.jobModal, title: out.job.title };
+    load();  // the lists behind the modal show the title too
+    return out;
+  }, 'Job title saved'),
   'edit-job-description': el => { S.jobTab = 'description'; S.descEdit = Number(el.dataset.id); render(); },
   'cancel-job-description': el => {
     S.descEdit = null; if (S.forms.jobdesc) delete S.forms.jobdesc[el.dataset.id];
@@ -2538,6 +2626,18 @@ const A = {
   }, action => ({ disable: 'Rule turned off', enable: 'Rule turned on', promote: 'Added to your permanent excludes', delete: 'Rule forgotten' }[action])),
   'domain-reapply': () => busy('domainReapply', () => api('/api/jobs/domain/reapply', { method: 'POST' }),
     out => `Checked ${out.checked} unranked job${out.checked === 1 ? '' : 's'} · ${out.hidden} hidden · ${out.restored} back in the queue`),
+  'domain-recheck': () => busy('domainRecheck', () => api('/api/jobs/domain/recheck', { method: 'POST' }),
+    out => `Checked ${out.checked} hidden job${out.checked === 1 ? '' : 's'} · ${out.queued} sent to the AI check · ${out.restored} back in the queue · ${out.still_hidden} still hidden`),
+  'review-check': el => { const picked = S.reviewChecked || (S.reviewChecked = new Set()), id = Number(el.dataset.id); picked.has(id) ? picked.delete(id) : picked.add(id); render(); },
+  'review-all': () => { const all = (D.review?.jobs || []).map(j => j.id), picked = S.reviewChecked || new Set(); S.reviewChecked = new Set(all.every(id => picked.has(id)) ? [] : all); render(); },
+  'review-decide': el => busy(el.dataset.matches === '1' ? 'reviewYes' : 'reviewNo', async () => {
+    const ids = el.dataset.ids.split(',').map(Number), matches = el.dataset.matches === '1';
+    const out = await api('/api/discovery/review', { method: 'POST', body: { ids, matches } });
+    ids.forEach(id => S.reviewChecked?.delete(id));
+    if (S.jobOpen) D.jobModal = await api(`/api/jobs/${S.jobOpen}`).catch(() => D.jobModal);
+    await load();
+    return out;
+  }, out => `${out.done.length} job${out.done.length === 1 ? '' : 's'} ${out.matches ? 'sent on to the detailed match' : 'moved to Not matching'}`),
   'show-not-matching': (el, e) => { e.preventDefault(); S.filters = { ...S.filters, domain: 'not_matching', page: 1 }; go('discovery', { discMode: 'table' }); },
   'rtag-edit': el => {
     S.tagEdit = `${el.dataset.kind}:${el.dataset.id}`;
@@ -2948,12 +3048,22 @@ const A = {
       return out;
     }, out => `Removed ${out.removed.length} from ranking${out.skipped.length ? ` · ${out.skipped.length} not removed: ${out.skipped[0].reason}` : ''}`);
   },
+  'listing-check': () => busy('listingCheck', async () => {
+    const out = await api('/api/jobs/listing-check', { method: 'POST' });
+    if (out.due) { S.listingRun = { due: out.due, since: out.since, checked: 0, removed: 0 }; setTimeout(pollListingCheck, LISTING_POLL_MS); }
+    return out;
+  }, out => out.due ? `Checking ${out.due} posting${out.due === 1 ? '' : 's'}` : 'Every posting was checked in the last hour'),
   'rank-batch': () => busy('rankBatch', async () => {
     const out = await api('/api/jobs/rank-batch', { method: 'POST' });
     if (!out.queued.length && !out.skipped.length) throw new Error('Every job is already ranked');
     await load(); watchRanking(out.queued);
     return out;
   }, rankQueuedMsg),
+  'recover-descriptions': () => busy('recoverDescriptions', async () => {
+    const out = await api('/api/jobs/recover-descriptions', { method: 'POST' });
+    await load();
+    return out;
+  }, recoverQueuedMsg),
   // tailor
   'pick-tailor': el => go('tailor', { tailorJob: Number(el.value) }),
   'tailor-tab': el => { S.tailorTab = el.dataset.id; S.editing = null; render(); },
@@ -3368,7 +3478,11 @@ function commitTag(el, redraw = true) {
 document.addEventListener('keydown', e => {
   const el = e.target;
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); A.palette(); return; }
+  // In the job title box, Enter saves and Escape leaves the edit, not the whole modal.
+  if (el.dataset?.form === 'jobtitle' && e.key === 'Enter') { e.preventDefault(); A['save-job-title']({ dataset: { id: el.dataset.field } }); return; }
+  if (el.dataset?.form === 'jobtitle' && e.key === 'Escape') { A['cancel-job-title']({ dataset: { id: el.dataset.field } }); return; }
   if (e.key === 'Escape' && S.datePop) { S.datePop = false; render(); document.getElementById('flt-date')?.focus(); return; }
+  if (e.key === 'Escape' && S.moreFilters && document.getElementById('flt-more') && !S.paletteOpen && !S.jobOpen && !S.kitJob && !S.boardReview) { S.moreFilters = false; render(); document.querySelector('[data-act="toggle-more-filters"]')?.focus(); return; }
   if (e.key === 'Escape') { if (S.boardReview && !S.paletteOpen && !S.jobOpen && !S.kitJob) { S.boardReview = null; render(); return; } if (S.paletteOpen || S.jobOpen || S.kitJob) { S.paletteOpen = false; S.jobOpen = null; S.kitJob = null; render(); } return; }
   if (el.dataset && el.dataset.tag) {
     if (e.key === 'Enter' || (e.key === ',' && el.dataset.split !== 'newline')) { e.preventDefault(); if (el.value.trim()) commitTag(el); return; }

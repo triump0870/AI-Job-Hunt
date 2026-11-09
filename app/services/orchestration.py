@@ -50,6 +50,7 @@ from app.models import (
     FollowUp,
     Job,
     JobDescriptionFetchTask,
+    JobClassificationTask,
     JobDescriptionParseTask,
     JobInsightTask,
     JobPreparationTask,
@@ -412,6 +413,8 @@ TASK_TABLES = (
     TaskTable("application_execution", ApplicationExecutionTask, ("PENDING",), ("PROCESSING",), ("FAILED",), (),
               ("COMPLETED",), ApplicationExecutionTask.attempt_count, ApplicationExecutionTask.started_at,
               ApplicationExecutionTask.completed_at),
+    TaskTable("domain_classifier", JobClassificationTask, ("PENDING",), ("PROCESSING",), ("FAILED",), (), ("COMPLETED",),
+              JobClassificationTask.attempt_count, JobClassificationTask.started_at, JobClassificationTask.completed_at),
     TaskTable("jd_recovery", JobDescriptionFetchTask, ("PENDING",), ("PROCESSING",), ("FAILED",), ("BLOCKED",),
               ("COMPLETED",), JobDescriptionFetchTask.attempt_count, JobDescriptionFetchTask.started_at,
               JobDescriptionFetchTask.completed_at),
@@ -427,7 +430,7 @@ TASK_TABLES = (
 TASK_BY_NODE = {t.node_id: t for t in TASK_TABLES}
 # The Running workers kind (app.services.worker_settings) behind each task table, for its attempt limit.
 WORKER_KIND_BY_NODE = {"qualification": "qualification", "preparation": "preparation",
-                       "application_execution": "application", "jd_recovery": "recovery", "jd_parser": "parsing", "company_insights": "insights",
+                       "application_execution": "application", "domain_classifier": "classification", "jd_recovery": "recovery", "jd_parser": "parsing", "company_insights": "insights",
                        "ranker": "ranking"}
 
 
@@ -705,6 +708,13 @@ def _fact_rows(db: Session, scope: Scope, edge: topo.Edge) -> list[tuple[int | N
         q = select(Job.id, Job.discovered_at, Job.discovered_at, Job.domain_checked_at).where(
             Job.discovered_at >= s, Job.discovered_at <= e)
         return [tuple(r) for r in db.execute(_owned(q, Job.user_id, u).limit(lim)).all()]
+    if key in ("domain_filter__domain_classifier", "domain_classifier__resume_match"):
+        t = JobClassificationTask
+        q = select(t.job_id, t.created_at, t.created_at, t.completed_at).where(t.created_at >= s, t.created_at <= e,
+                                                                               t.route == "ASK", t.mode == "ON")
+        if key == "domain_classifier__resume_match":
+            q = q.where(t.classification.in_(("MATCH", "UNCERTAIN")))
+        return [(r[0], r[1], None, None) for r in db.execute(_owned(q, t.user_id, u).limit(lim)).all()]
     if key == "domain_filter__resume_match":
         q = select(Job.id, Job.domain_checked_at, Job.domain_checked_at, Job.domain_checked_at).where(
             Job.domain_checked_at >= s, Job.domain_checked_at <= e, Job.domain_match.in_(("MATCH", "KEPT")))
@@ -1095,7 +1105,7 @@ def _build_history(db: Session, scope: Scope, node: topo.Node) -> dict[str, Any]
 
 # ───────────── jobs: where a packet is and how it got there ─────────────
 
-PATH = ("discovery", "domain_filter", "resume_match", "jd_recovery", "jd_parser", "ranker", "archived", "tailor",
+PATH = ("discovery", "domain_filter", "domain_classifier", "resume_match", "jd_recovery", "jd_parser", "ranker", "archived", "tailor",
         "reviewer", "approval", "application", "application_inbox", "follow_up", "interview", "outcome")
 # Shown only when the job went there.
 BRANCH_NODES = ("archived", "follow_up", "interview", "outcome")
@@ -1189,6 +1199,10 @@ def locate(f: JobFacts) -> Position:
     if job.domain_match == "NOT_MATCHING":
         return Position("domain_filter", "BLOCKED", job.domain_checked_at, reason=job.domain_reason or
                         "Hidden by the domain filter", terminal=True)
+    if job.domain_match == "PENDING":
+        return Position("domain_classifier", "QUEUED", job.domain_checked_at, reason=job.domain_reason)
+    if job.domain_match == "REVIEW":
+        return Position("domain_classifier", "AWAITING_HUMAN", job.domain_checked_at, reason=job.domain_reason)
     tailor = _active(f.tailor_tasks, ("queued", "running"))
     if tailor is not None:
         if tailor.status == "queued":
@@ -1308,6 +1322,9 @@ def _history_steps(f: JobFacts) -> dict[str, dict[str, Any] | None]:
     elif job.domain_match in ("MATCH", "KEPT"):
         steps["domain_filter"] = _step("domain_filter", "COMPLETED", done_at=job.domain_checked_at,
                                        detail=job.domain_reason)
+    elif job.domain_match in ("PENDING", "REVIEW"):
+        steps["domain_filter"] = _step("domain_filter", "COMPLETED", done_at=job.domain_checked_at,
+                                       detail="Its rules could not settle this job")
     else:
         steps["domain_filter"] = None
     steps["resume_match"] = _step("resume_match", "COMPLETED", detail=f"Resume #{job.resume_id}"
@@ -1503,7 +1520,7 @@ def live(db: Session, scope: Scope) -> dict[str, Any]:
                          "activity": activity, "since": _iso(since), "elapsed_seconds": _seconds(since, now),
                          "attempt": attempt, "max_attempts": limit, "task": task, "task_id": task_id}
 
-    own = {kind: worker_settings.get(db, owner, kind, "max_attempts") for kind in ("recovery", "parsing", "ranking",
+    own = {kind: worker_settings.get(db, owner, kind, "max_attempts") for kind in ("classification", "recovery", "parsing", "ranking",
                                                                                   "insights", "tailoring",
                                                                                   "qualification", "preparation",
                                                                                   "application")}

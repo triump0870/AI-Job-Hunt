@@ -3,7 +3,7 @@
 These tests drive the real InstrumentedClient against httpx.MockTransport, so what they exercise is the same
 code path production uses. No test calls a logging function: that is the point of the design.
 """
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -16,6 +16,7 @@ from app.settings import get_settings
 from tests.conftest import ensure_test_user
 
 SECRET_TOKEN = "apify_api_supersecrettoken123"
+OPENROUTER_RESET_MS = int((datetime.now(UTC) + timedelta(minutes=30)).timestamp() * 1000)
 
 
 def utcnow():
@@ -55,6 +56,8 @@ def responder(request: httpx.Request) -> httpx.Response:
         raise RuntimeError("the SDK exploded")
     if path.endswith("/limited"):
         return httpx.Response(429, headers={"x-ratelimit-remaining": "0", "retry-after": "45"}, json={"error": "slow down"})
+    if path.endswith("/limited-forwarded"):  # OpenRouter's reset in milliseconds, as the LiteLLM proxy forwards it
+        return httpx.Response(429, headers={"llm_provider-x-ratelimit-reset": str(OPENROUTER_RESET_MS)}, json={"error": "slow"})
     if path.endswith("/missing"):
         return httpx.Response(404, json={"error": "no such actor"})
     if path.endswith("/broken"):
@@ -157,6 +160,32 @@ def test_a_rate_limit_records_what_the_provider_said_about_it(owner):
     row = only()
     assert row.rate_limit_remaining == 0
     assert row.rate_limit_reset_at is not None and row.rate_limit_reset_at > utcnow()
+
+
+def test_an_epoch_reset_forwarded_by_litellm_is_recorded_as_that_moment(owner):
+    """It used to be read as seconds from now, which overflowed and lost the row and the cooldown together."""
+    with client(user_id=owner) as http:
+        http.get("https://api.apify.com/v2/limited-forwarded")
+    row = only()
+    assert row.http_status_code == 429
+    assert row.rate_limit_reset_at == datetime.fromtimestamp(OPENROUTER_RESET_MS / 1000, UTC).replace(tzinfo=None)
+    with SessionLocal() as db:
+        assert db.scalar(select(ProviderCooldown)) is not None
+
+
+@pytest.mark.parametrize("header", ["x-ratelimit-reset", "llm_provider-x-ratelimit-reset"])
+@pytest.mark.parametrize("value", ["1e300", "inf", "-inf", "nan", "soon"])
+def test_a_reset_that_is_not_a_date_is_unknown_and_never_raises(header, value):
+    at = utcnow()
+    reset = external_api._reset_at(httpx.Headers({header: value}), at, status=429)
+    assert reset is None or reset == at
+
+
+@pytest.mark.parametrize(("value", "seconds"), [("45", 45), ("2m59.56s", 179.56), ("120ms", 0.12)])
+def test_a_forwarded_duration_still_counts_from_now(value, seconds):
+    at = utcnow()
+    assert external_api._reset_at(httpx.Headers({"llm_provider-x-ratelimit-reset": value}), at, status=429) == \
+        at + timedelta(seconds=seconds)
 
 
 def test_a_failure_also_becomes_a_log_line(owner):

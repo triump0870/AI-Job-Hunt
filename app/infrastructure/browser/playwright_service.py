@@ -12,9 +12,15 @@ Lifecycle:
 
 The service belongs to the event loop it started in. A new loop (a `python -m app.cron` run) gets a fresh browser.
 
-Security: pages never receive application data — no extra headers, no cookies, no init scripts. Navigation requests
-are checked against app.services.url_safety, so a redirect or subrequest cannot reach a private address. Resource
-blocking is an independent, opt-in performance setting; normal contexts preserve modern page behaviour.
+Security: pages never receive application data — no extra headers, no cookies, no init scripts. Requests are checked
+against app.services.url_safety, so a subrequest or navigation cannot reach a private address. Playwright's routing
+sees only the first request of an HTTP redirect, so a browser-level CDP Fetch session (`_guard_redirects`) applies the
+same check to every redirect hop, in every page, popup, frame and worker, before the hop is sent. Resource blocking is an independent, opt-in performance setting; normal contexts preserve
+modern page behaviour.
+
+Limits: this is Chromium's CDP, and it rests on `redirectedRequestId` marking a hop: the real-Chromium tests fail if a
+browser or Playwright upgrade changes that. A host name is checked by what it resolves to at that moment, for a hop as
+for a first request; the browser resolves it again itself, so DNS rebinding is not covered by either.
 """
 from __future__ import annotations
 
@@ -24,7 +30,8 @@ import logging
 import os
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -125,7 +132,8 @@ class PlaywrightBrowserService(BrowserService):
     def __init__(self, *, enabled: bool = True, browser: str = "chromium", headless: bool = True,
                  navigation_timeout_seconds: float = 45, page_timeout_seconds: float = 60, max_concurrency: int = 2,
                  keep_running: bool = True, allow_private_hosts: bool = False, record_telemetry: bool = True,
-                 block_nonessential_resources: bool = False, debug_artifacts: bool = False):
+                 block_nonessential_resources: bool = False, debug_artifacts: bool = False,
+                 visible_min_interval_seconds: float = 0):
         self.enabled = enabled
         self.browser_name = (browser or "chromium").lower()
         self.headless = headless
@@ -137,8 +145,12 @@ class PlaywrightBrowserService(BrowserService):
         self.record_telemetry = record_telemetry
         self.block_nonessential_resources = block_nonessential_resources
         self.debug_artifacts = debug_artifacts
+        self.visible_min_interval = max(0.0, float(visible_min_interval_seconds))
+        self._visible_lock: asyncio.Lock | None = None
+        self._visible_last: float | None = None
         self._playwright: Any = None
         self._browser: Any = None
+        self._redirect_guard: Any = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._lock: asyncio.Lock | None = None
         self._semaphore: asyncio.Semaphore | None = None
@@ -158,7 +170,8 @@ class PlaywrightBrowserService(BrowserService):
                    max_concurrency=s.playwright_max_concurrency, keep_running=s.playwright_keep_browser_running,
                    allow_private_hosts=s.jd_fetch_allow_private_hosts,
                    block_nonessential_resources=s.playwright_block_nonessential_resources,
-                   debug_artifacts=s.playwright_debug_artifacts)
+                   debug_artifacts=s.playwright_debug_artifacts,
+                   visible_min_interval_seconds=s.playwright_visible_min_interval_seconds)
 
     # ───────────── availability ─────────────
 
@@ -209,10 +222,18 @@ class PlaywrightBrowserService(BrowserService):
             self._loop = loop
             self._lock = asyncio.Lock()
             self._semaphore = asyncio.Semaphore(self.max_concurrency)
+            self._visible_lock = asyncio.Lock()
 
     def _fail(self, code: str, message: str) -> BrowserUnavailable:
         self.last_error = {"code": code, "message": message, "at": _utcnow().isoformat()}
         return BrowserUnavailable(code, message)
+
+    def _start_failure(self, exc: Exception) -> BrowserUnavailable:
+        text = str(exc)
+        if "Executable doesn't exist" in text or "playwright install" in text:
+            return self._fail(CHROMIUM_MISSING, "Chromium executable missing: run "
+                                                "`python -m playwright install chromium`")
+        return self._fail(BROWSER_START_FAILED, f"Chromium could not start ({type(exc).__name__})")
 
     async def start(self) -> None:
         self._bind_loop()
@@ -229,14 +250,11 @@ class PlaywrightBrowserService(BrowserService):
 
                 self._playwright = await async_playwright().start()
                 self._browser = await self._playwright.chromium.launch(headless=self.headless)
+                # a browser that cannot have it does not start
+                self._redirect_guard = await self._guard_redirects(self._browser)
             except Exception as exc:
                 await self._discard()
-                text = str(exc)
-                if "Executable doesn't exist" in text or "playwright install" in text:
-                    raise self._fail(CHROMIUM_MISSING, "Chromium executable missing: run "
-                                                       "`python -m playwright install chromium`") from exc
-                raise self._fail(BROWSER_START_FAILED,
-                                 f"Chromium could not start ({type(exc).__name__})") from exc
+                raise self._start_failure(exc) from exc
             self.launches += 1
             self.last_error = None
             self._browser.on("disconnected", self._on_disconnected)
@@ -252,7 +270,7 @@ class PlaywrightBrowserService(BrowserService):
     async def _discard(self) -> None:
         """Close whatever is left of a previous browser. Never raises."""
         browser, runtime = self._browser, self._playwright
-        self._browser = self._playwright = None
+        self._browser = self._playwright = self._redirect_guard = None
         self._contexts = set()
         if browser is not None:
             with contextlib.suppress(Exception):
@@ -293,36 +311,112 @@ class PlaywrightBrowserService(BrowserService):
             if self.block_nonessential_resources and request.resource_type in SKIPPED_RESOURCES:
                 await route.abort("blockedbyclient")
                 return
-            from app.services.url_safety import UnsafeURL, check_public_url, obviously_private
-
-            if not self.allow_private_hosts and obviously_private(request.url):
+            if await self._may_reach(request.url, navigation=request.is_navigation_request()):
+                await route.continue_()
+            else:
                 await route.abort("blockedbyclient")  # a page may not make the browser reach internal services
-                return
-            if request.is_navigation_request():
-                try:
-                    await asyncio.to_thread(check_public_url, request.url, allow_private=self.allow_private_hosts)
-                except UnsafeURL:
-                    await route.abort("blockedbyclient")
-                    return
-            await route.continue_()
         except Exception:  # noqa: BLE001  the page closing mid-request is normal
             log.debug("request routing ended early for %s", request.url[:120])
+
+    async def _may_reach(self, url: str, *, navigation: bool) -> bool:
+        """The SSRF check every request meets, its first hop (_route) and each redirect hop (_on_paused) alike."""
+        from app.services.url_safety import UnsafeURL, check_public_url, obviously_private
+
+        if not self.allow_private_hosts and obviously_private(url):
+            return False
+        if navigation:
+            try:
+                await asyncio.to_thread(check_public_url, url, allow_private=self.allow_private_hosts)
+            except UnsafeURL:
+                return False
+        return True
+
+    async def _guard_redirects(self, browser: Any) -> Any:
+        """Hold every request of `browser` at a browser-level CDP Fetch session, to judge redirect hops before they
+        are sent: Playwright's routing is not called for them. At the browser level (not per page) it covers popups and
+        service workers too, with no moment between a target's creation and its coverage. Everything else is released
+        at once and still meets `_route`. The caller keeps the session for as long as the browser runs."""
+        session = await browser.new_browser_cdp_session()
+        session.on("Fetch.requestPaused", lambda event: self._on_paused(session, event))
+        await session.send("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]})
+        return session
+
+    async def _on_paused(self, session: Any, event: dict[str, Any]) -> None:
+        allow = True
+        if event.get("redirectedRequestId"):
+            try:
+                allow = await self._may_reach(str(event["request"]["url"]),
+                                              navigation=event.get("resourceType") == "Document")
+            except Exception:  # noqa: BLE001  a hop that cannot be judged is not sent
+                allow = False
+                log.warning("a redirect could not be checked and was stopped")
+            if not allow:
+                log.info("a redirect to %s was stopped", _host(str(event["request"].get("url"))))
+        with contextlib.suppress(Exception):  # the page closing mid-request is normal
+            if allow:
+                await session.send("Fetch.continueRequest", {"requestId": event["requestId"]})
+            else:
+                await session.send("Fetch.failRequest", {"requestId": event["requestId"],
+                                                         "errorReason": "BlockedByClient"})
 
     async def new_context(self) -> Any:
         browser = await self._ensure()
         try:
-            context = await browser.new_context(
-                accept_downloads=False, service_workers="allow", java_script_enabled=True,
-                viewport={"width": 1280, "height": 900}, locale="en-US", ignore_https_errors=False)
+            context = await self._isolated_context(browser)
         except Exception as exc:
             # A browser that died between the check and this call: forget it so the next task starts a new one.
             self._on_disconnected()
             raise NavigationFailed(BROWSER_CRASHED, f"The browser was not usable ({type(exc).__name__})") from exc
+        return await self._prepare_context(context)
+
+    async def _isolated_context(self, browser: Any) -> Any:
+        return await browser.new_context(
+            accept_downloads=False, service_workers="allow", java_script_enabled=True,
+            viewport={"width": 1280, "height": 900}, locale="en-US", ignore_https_errors=False)
+
+    async def _prepare_context(self, context: Any) -> Any:
         context.set_default_navigation_timeout(self.navigation_timeout * 1000)
         context.set_default_timeout(self.navigation_timeout * 1000)
         await context.route("**/*", self._route)
         self._contexts.add(context)
         return context
+
+    @asynccontextmanager
+    async def _visible_session(self) -> AsyncIterator[Any]:
+        """A page in a window of its own, with the same isolation and URL checks as any other page. The window and its
+        browser close with the page, so nothing stays on the person's screen between postings."""
+        runtime = browser = context = page = guard = None
+        try:
+            try:
+                from playwright.async_api import async_playwright
+
+                runtime = await async_playwright().start()
+                browser = await runtime.chromium.launch(headless=False)
+                guard = await self._guard_redirects(browser)  # a window that cannot have it does not open a page
+            except Exception as exc:
+                raise self._start_failure(exc) from exc
+            context = await self._prepare_context(await self._isolated_context(browser))
+            page = await self.new_page(context)
+            yield page
+        finally:
+            if page is not None:
+                await self.close_page(page)
+            if context is not None:
+                await self.close_context(context)
+            del guard  # it stays alive as long as the window, then goes with it
+            if browser is not None:
+                with contextlib.suppress(Exception):
+                    await browser.close()
+            if runtime is not None:
+                with contextlib.suppress(Exception):
+                    await runtime.stop()
+
+    async def _wait_for_visible_turn(self) -> None:
+        if self._visible_last is None:
+            return
+        remaining = self.visible_min_interval - (time.monotonic() - self._visible_last)
+        if remaining > 0:
+            await asyncio.sleep(remaining)
 
     async def new_page(self, context: Any) -> Any:
         page = await context.new_page()
@@ -341,7 +435,7 @@ class PlaywrightBrowserService(BrowserService):
     # ───────────── rendering a page ─────────────
 
     async def fetch_rendered_page(self, url: str, *, wait_for: Sequence[str] = (),
-                                  metadata: dict[str, Any] | None = None) -> RenderedPage:
+                                  metadata: dict[str, Any] | None = None, visible: bool = False) -> RenderedPage:
         from app.services.url_safety import UnsafeURL, check_public_url
 
         reason = self._unavailable_reason()
@@ -352,11 +446,16 @@ class PlaywrightBrowserService(BrowserService):
         except UnsafeURL as exc:
             raise NavigationFailed(BLOCKED_URL, str(exc)) from exc
         self._bind_loop()
-        assert self._semaphore is not None
+        gate = self._visible_lock if visible else self._semaphore
+        assert gate is not None
         started, clock = _utcnow(), time.monotonic()
-        async with self._semaphore:  # never more than PLAYWRIGHT_MAX_CONCURRENCY pages at once
+        async with gate:  # never more than PLAYWRIGHT_MAX_CONCURRENCY pages at once; visible ones one at a time
+            if visible:
+                await self._wait_for_visible_turn()
+                started, clock = _utcnow(), time.monotonic()
+                metadata = {**(metadata or {}), "headless": False}
             try:
-                page = await asyncio.wait_for(self._render(url, wait_for), timeout=self.page_timeout)
+                page = await asyncio.wait_for(self._render(url, wait_for, visible=visible), timeout=self.page_timeout)
             except BrowserUnavailable:
                 raise
             except NavigationFailed as exc:
@@ -368,17 +467,20 @@ class PlaywrightBrowserService(BrowserService):
                 raise failure from exc
             except Exception as exc:
                 category = classify_navigation_error(exc)
-                if category == BROWSER_CRASHED:
+                if category == BROWSER_CRASHED and not visible:  # a visible page has its own browser, already closed
                     self._on_disconnected()
                 failure = NavigationFailed(category, f"{category.lower()}: {type(exc).__name__}")
                 await self._record(url, started, clock, None, failure, metadata)
                 raise failure from exc
+            finally:
+                if visible:
+                    self._visible_last = time.monotonic()
         page.elapsed_ms = int((time.monotonic() - clock) * 1000)
         await self._record(url, started, clock, page, None, metadata)
         return page
 
-    async def _render(self, url: str, wait_for: Sequence[str]) -> RenderedPage:
-        async with self.page_session() as page:
+    async def _render(self, url: str, wait_for: Sequence[str], *, visible: bool = False) -> RenderedPage:
+        async with (self._visible_session() if visible else self.page_session()) as page:
             response = None
             try:
                 response = await page.goto(url, wait_until="domcontentloaded", timeout=self.navigation_timeout * 1000)
@@ -397,6 +499,7 @@ class PlaywrightBrowserService(BrowserService):
     async def _capture_failure(self, page: Any, response: Any) -> None:
         """Write bounded, failure-only local diagnostics. Deliberately omit HTML, headers, cookies and paths."""
         import json
+
         from app.services.redaction import redact_text, redact_url
 
         directory = Path("data/playwright-debug")

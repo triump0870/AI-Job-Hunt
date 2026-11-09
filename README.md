@@ -3326,6 +3326,39 @@ PLAYWRIGHT_HEADLESS=false PLAYWRIGHT_MAX_CONCURRENCY=1 uvicorn app.main:app --re
 A Chromium window opens for each page the recovery worker renders, which is the quickest way to see why a site's
 container is not found. The Docker image only has the headless shell, so headed mode is for local runs.
 
+### Sites that refuse the headless browser
+
+Some boards answer a headless browser with `403 Access Denied` but serve the same public page to an ordinary window.
+Naukri does this: its postings end `BLOCKED` with "The site refused access". On a local install you can have recovery
+read those hosts with the browser-use runner:
+
+```bash
+PLAYWRIGHT_VISIBLE_HOSTS=naukri.com
+PLAYWRIGHT_VISIBLE_MIN_INTERVAL_SECONDS=10
+PLAYWRIGHT_VISIBLE_WINDOW_FALLBACK=false
+```
+
+After HTTP, these hosts go to **the browser-use runner**, which needs `BROWSER_USE_WEBUI_ENABLED` and `BROWSER_USE_PYTHON`.
+It runs on the Web UI's Python install, as a runner of its own per posting: it only loads and reads the page, sends
+nothing but GET and stays on the posting's host. It shares nothing with an application run. The Web UI does not need to
+be running, and no model is involved. If the runner can't read the page, that is the result, and the headless browser is
+never tried for these hosts.
+
+`PLAYWRIGHT_VISIBLE_WINDOW_FALLBACK=true` adds **the shared browser's visible window** for when the runner could not run or
+found no description. A page that answered is not asked again in the second browser: a refusal, a challenge, a login wall
+or a removed posting is the result.
+
+Either way a plain Chromium window, with no sign-in or profile of yours, opens for each posting and closes when it has
+been read. Visits go one at a time and may take focus while the queue runs. Other sites and the daily listing check stay
+headless with `PLAYWRIGHT_ENABLED`, so leave that on unless you want them off too. Jobs already `BLOCKED` are not retried by themselves: use Retry in Running workers, or filter Jobs by **No description** and click **Fetch missing descriptions**. That queues every job with no description, up to `JD_FETCH_ENQUEUE_BATCH_SIZE` per click, and says what it left out: jobs your domain filter hides or still holds, jobs you dismissed, archived or removed, and jobs with no URL. A task's
+diagnostics say which browser read it (`backend`).
+
+It is off by default because it is your decision: it reads a site that refuses automated browsers, from your own
+address, so check the site's terms first. If the site refuses a visit or shows a challenge, that job stays `BLOCKED` and
+the host is paused for an hour (Monitoring lists the `WEB:<host>` cooldown). Queued jobs wait without using an attempt.
+Nothing tries to get past the refusal; paste the description by hand. The Docker image has no display, so there the
+page is reported as browser unavailable.
+
 Set `PLAYWRIGHT_DEBUG_ARTIFACTS=true` to keep failure-only screenshots and limited metadata under
 `data/playwright-debug/`. At most 20 screenshot/metadata pairs are retained; delete that directory when diagnosis is
 complete. Rendered HTML is deliberately not persisted because job pages can contain personal or sensitive data.
@@ -3342,8 +3375,9 @@ features (ATS form assistance, confirmation capture) reuse it:
 - navigation waits for `domcontentloaded`, then a known container and for the text to stop growing, within
   `PLAYWRIGHT_NAVIGATION_TIMEOUT_SECONDS` / `PLAYWRIGHT_PAGE_TIMEOUT_SECONDS` — never `networkidle`;
 - at most `PLAYWRIGHT_MAX_CONCURRENCY` pages at once; a crashed Chromium is started again on next use;
-- every navigation is checked against private addresses (redirects included), and pages never receive API keys,
-  credentials or environment values;
+- every navigation is checked against private addresses, and pages never receive API keys, credentials or
+  environment values. Each hop of an HTTP redirect is checked before it is sent, by a browser-level CDP `Fetch` session
+  beside Playwright's routing (which does not see redirect hops); this works on Chromium only, the only browser used;
 - closed at app shutdown and after each `python -m app.cron` run, so no Chromium process is left behind.
 
 Every page load is an External API row (provider `WEB`, service `playwright`), beside the HTTP fetches (`WEB`,
@@ -3445,6 +3479,27 @@ changing the lists, **Apply to existing jobs** re-checks the jobs not ranked yet
 ranking sweep. `GET /api/jobs/search?domain=not_matching`, `POST /api/jobs/{id}/domain-keep`,
 `POST /api/jobs/bulk-domain-keep`, `GET/PUT /api/settings/domain`, `POST /api/jobs/domain/reapply`.
 
+
+### Hybrid domain classification (`app/services/domain_classifier.py`, off by default)
+
+Word rules alone reject relevant jobs: one learned word (`data`, `machine`, `native`) can hide a role the candidate wants.
+With `DOMAIN_CLASSIFIER_MODE=on`, rules hide only what is unambiguous, and a fast model (the **Domain Classifier** worker, FAST
+tier) reads the rest before anything expensive runs. It answers `MATCH`, `UNCERTAIN` or `NO_MATCH` with a `reason` and
+`matched_skills`. `MATCH` goes on to the detailed match. Code keeps a `NO_MATCH` only when the phrases the model quotes are in
+the posting and nothing of the candidate's is in the job; no model confidence number is used anywhere. A failed check never
+hides a job.
+
+Different names of one role count as the same role ("AI Engineer" and "Artificial Intelligence Engineer", "FDE" and "Forward
+Deployed Engineer", "SDE 3" and "Senior Software Engineer", "SDE 4" and "Staff Software Engineer"), and skills are read from
+your preferences, saved searches and every resume's structured data. A job that stays ambiguous waits in **Discovery → Needs
+review**, where you choose which ones match and remove the rest. Nothing is spent on it until you do.
+
+Each job has one request, queued and bounded (Running workers → Domain check), with retries and a per-account cache. Why each
+job was kept or hidden is on its row in `job_classification_tasks` and on the job's screen. Tokens, cost and latency are in
+Monitoring under the stage `DOMAIN_CLASSIFIER`. `shadow` only records verdicts for comparison with the old filter.
+[`docs/architecture/domain-classification.md`](docs/architecture/domain-classification.md) has the rollout steps and the bar a real
+evaluation must meet before switching on.
+
 ### Learning from your choices (`app/services/feedback_learning.py`)
 
 Dismissing, rejecting or deleting a job records a feedback event (kept after the job is deleted); shortlisting,
@@ -3470,6 +3525,11 @@ the account's *Use the browser* recovery switch is on) — never after a login w
 model. A page that still shows the description but carries a closed banner ("No longer accepting applications") counts
 as closed. Each deletion is a Monitoring → Logs line (`posting_removed`) with the title, company and URL; each run's
 counts (deleted, kept, live, unknown, browser_used) are in Monitoring → Scheduler.
+
+**Check listings** on the Discovery table runs the same check for your own account right away: every due
+posting, least recently checked first, skipping postings read in the last hour. It runs in the background after the
+request answers, and the same rules decide what is deleted. When a site rate limits the check, it stops (posting
+fetches share one cooldown): the postings it did not read stay due, for the next press or scheduled pass.
 
 ```env
 AUTO_DELETE_REMOVED_JOBS=true

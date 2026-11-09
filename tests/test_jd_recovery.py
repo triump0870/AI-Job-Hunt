@@ -26,11 +26,12 @@ from app.models import (
     JobStructuredDataChange,
     ProviderCooldown,
     SystemLogEntry,
+    User,
     WorkflowTransition,
 )
 from app.services import backoff, jd_quality, jd_recovery, job_description, ranker, sources
 from app.services.lifecycle import WorkflowState as S
-from app.settings import get_settings
+from app.settings import Settings, get_settings
 from tests.conftest import ensure_test_user
 from tests.jd_support import FakeBrowser, PostingServer, navigation_failed, page
 
@@ -466,6 +467,239 @@ def test_access_denied_by_http_and_rendered_page_is_blocked(owner, server):
     assert task.diagnostics["attempt_1"]["playwright"]["kind"] == "blocked"
 
 
+# ───────────── hosts read in a visible window (PLAYWRIGHT_VISIBLE_HOSTS) ─────────────
+
+SHELL = "<html><body><div id='root'></div></body></html>"  # what such a site answers plain HTTP with
+
+
+@pytest.fixture
+def visible_host(monkeypatch):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "playwright_visible_hosts", " Example.org, 127.0.0.1 ")
+    monkeypatch.setattr(settings, "playwright_visible_min_interval_seconds", 0)
+    monkeypatch.setattr(settings, "browser_use_webui_enabled", False)  # the runner has tests of its own, below
+    monkeypatch.setattr(settings, "playwright_visible_window_fallback", True)  # off by default: see runner_only
+
+
+class FakeRunner:
+    """Stands in for browser_use_sidecar.read_page: returns a page, or raises what the real one raises."""
+
+    def __init__(self, monkeypatch, *, page_=None, error=None):
+        from app.infrastructure.application_browser import browser_use_sidecar as bus
+
+        self.page, self.error, self.calls, self.bus = page_, error, [], bus
+        monkeypatch.setattr(bus, "configured", lambda: True)
+        monkeypatch.setattr(bus, "read_page", self.read_page)
+
+    async def read_page(self, url, *, user_id, job_id, allow_private=False, headless=False):
+        self.calls.append(url)
+        if self.error is not None:
+            raise self.error
+        status, html = self.page
+        return self.bus.RunnerPage(url=url, final_url=url, status=status, title="", html=html)
+
+
+def shell_job(owner: int, server: PostingServer, key: str = "shell") -> int:
+    server.routes[key] = (200, SHELL, {})
+    return new_job(owner, server.url(f"custom/{key}"))
+
+
+def cooldown(owner: int) -> ProviderCooldown | None:
+    with SessionLocal() as db:
+        return db.scalar(select(ProviderCooldown).where(ProviderCooldown.user_id == owner,
+                                                        ProviderCooldown.provider == "WEB:127.0.0.1"))
+
+
+@pytest.mark.parametrize("url,expected", [
+    ("https://www.example.org/job/1", "example.org"), ("https://example.org/job/1", "example.org"),
+    ("http://127.0.0.1:9/x", "127.0.0.1"), ("https://notexample.org/job", None), ("https://example.com/job", None),
+    ("", None), (None, None)])
+def test_only_listed_hosts_and_their_subdomains_are_visible(visible_host, url, expected):
+    assert jd_recovery._visible_host(url) == expected
+
+
+def test_a_site_not_listed_stays_headless(owner, server):
+    browser = FakeBrowser({"shell": (200, page("posting"))})
+    assert run_recovery(browser) == [] and shell_job(owner, server)
+    assert run_recovery(browser) == ["recovered"]
+    assert browser.visible_calls == [False]
+
+
+def test_a_listed_site_is_read_in_a_visible_window_after_http(owner, server, visible_host):
+    browser = FakeBrowser({"shell": (200, page("posting"))})
+    job_id = shell_job(owner, server)
+    assert run_recovery(browser) == ["recovered"]
+    task = task_of(job_id)
+    assert browser.visible_calls == [True] and server.hits, "HTTP is still tried first"
+    assert task.fetch_method == "PLAYWRIGHT" and task.diagnostics["attempt_1"]["playwright"]["visible"] is True
+    assert cooldown(owner) is None
+
+
+@pytest.mark.parametrize("rendered,code", [
+    ((403, "<title>Access Denied</title><h1>Access denied</h1>"), "ACCESS_DENIED"),
+    ((200, page("captcha")), "CAPTCHA_OR_ANTI_BOT")])
+def test_a_refusal_in_the_window_stays_blocked_and_pauses_the_host(owner, server, visible_host, rendered, code):
+    browser = FakeBrowser({"shell": rendered})
+    job_id = shell_job(owner, server)
+    assert run_recovery(browser) == ["blocked"]
+    task = task_of(job_id)
+    assert (task.status, task.result_code) == ("BLOCKED", code) and len(browser.calls) == 1, "never tried again"
+    rest = cooldown(owner)
+    assert timedelta(minutes=59) < rest.until - jd_recovery.utcnow() <= timedelta(hours=1)
+
+
+def test_a_paused_host_is_left_alone_and_the_task_keeps_its_attempt(owner, server, visible_host):
+    backoff.record_limit(owner, "WEB:127.0.0.1", policy=jd_recovery.VISIBLE_REST)
+    browser = FakeBrowser({"shell": (200, page("posting"))})
+    job_id = shell_job(owner, server)
+    assert run_recovery(browser) == ["retrying"]
+    task = task_of(job_id)
+    assert browser.calls == [] and server.hits == [], "neither the browser nor HTTP touched the site"
+    assert task.status == "PENDING" and task.attempt_count == 0 and task.result_code == "RATE_LIMITED"
+    assert task.next_attempt_at > jd_recovery.utcnow() + timedelta(minutes=59)
+
+
+def test_a_pause_on_one_host_does_not_hold_another(owner, server):
+    backoff.record_limit(owner, "WEB:EXAMPLE.ORG", policy=jd_recovery.VISIBLE_REST)
+    browser = FakeBrowser({"shell": (200, page("posting"))})
+    shell_job(owner, server)
+    assert run_recovery(browser) == ["recovered"]
+
+
+def test_a_person_asking_to_run_now_goes_ahead_during_the_pause(owner, server, visible_host):
+    backoff.record_limit(owner, "WEB:127.0.0.1", policy=jd_recovery.VISIBLE_REST)
+    browser = FakeBrowser({"shell": (200, page("posting"))})
+    job_id = shell_job(owner, server)
+    with SessionLocal() as db:
+        db.get(JobDescriptionFetchTask, task_of(job_id).id).run_now_at = jd_recovery.utcnow()
+        db.commit()
+    assert run_recovery(browser) == ["recovered"]
+    assert browser.visible_calls == [True] and cooldown(owner) is None
+
+
+def test_the_runner_reads_a_listed_site_first_and_no_window_opens(owner, server, visible_host, monkeypatch):
+    runner = FakeRunner(monkeypatch, page_=(200, page("posting")))
+    browser = FakeBrowser({"shell": (200, page("posting"))})
+    job_id = shell_job(owner, server)
+    assert run_recovery(browser) == ["recovered"]
+    task = task_of(job_id)
+    assert runner.calls == [server.url("custom/shell")] and browser.calls == []
+    assert task.fetch_method == "PLAYWRIGHT"
+    notes = task.diagnostics["attempt_1"]["playwright"]
+    assert notes["backend"] == "browser_use_runner" and notes["runner"]["kind"] == "found"
+
+
+def test_the_runner_needs_no_browser_service(owner, server, visible_host, monkeypatch):
+    FakeRunner(monkeypatch, page_=(200, page("posting")))
+    shell_job(owner, server)
+    assert run_recovery(None) == ["recovered"]
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "refused", "empty"])
+def test_when_the_runner_fails_the_visible_window_reads_the_page(owner, server, visible_host, monkeypatch, failure):
+    from app.infrastructure.application_browser import browser_use_sidecar as bus
+
+    runner = FakeRunner(monkeypatch, page_=(200, SHELL), error={
+        "unavailable": bus.SidecarUnavailable("not installed"), "refused": bus.SidecarRefused("BROWSER_ERROR", "no"),
+        "empty": None}[failure])
+    browser = FakeBrowser({"shell": (200, page("posting"))})
+    job_id = shell_job(owner, server)
+    assert run_recovery(browser) == ["recovered"]
+    notes = task_of(job_id).diagnostics["attempt_1"]["playwright"]
+    assert len(runner.calls) == 1 and browser.visible_calls == [True]
+    assert notes["backend"] == "visible_window" and notes["runner"]["kind"] != "found" and notes["kind"] == "found"
+
+
+def test_the_fallback_waits_its_turn_after_the_runner(owner, server, visible_host, monkeypatch):
+    import time
+
+    monkeypatch.setattr(get_settings(), "playwright_visible_min_interval_seconds", 0.3)
+    monkeypatch.setattr(jd_recovery, "_visible_last", None)
+    FakeRunner(monkeypatch, page_=(200, SHELL))
+    shell_job(owner, server)
+    clock = time.monotonic()
+    assert run_recovery(FakeBrowser({"shell": (200, page("posting"))})) == ["recovered"]
+    assert time.monotonic() - clock >= 0.3
+
+
+@pytest.mark.parametrize("rendered,code", [
+    ((403, "<title>Access Denied</title><h1>Access denied</h1>"), "ACCESS_DENIED"),
+    ((200, page("captcha")), "CAPTCHA_OR_ANTI_BOT")])
+def test_a_refusal_to_the_runner_never_moves_on_to_the_window(owner, server, visible_host, monkeypatch, rendered, code):
+    FakeRunner(monkeypatch, page_=rendered)
+    browser = FakeBrowser({"shell": (200, page("posting"))})  # a window *could* get through: it must not be tried
+    job_id = shell_job(owner, server)
+    assert run_recovery(browser) == ["blocked"]
+    task = task_of(job_id)
+    assert (task.status, task.result_code) == ("BLOCKED", code) and browser.calls == []
+    assert cooldown(owner) is not None
+
+
+def test_a_rate_limit_to_the_runner_never_moves_on_to_the_window(owner, server, visible_host, monkeypatch):
+    FakeRunner(monkeypatch, page_=(429, "<h1>Too many requests</h1>"))
+    browser = FakeBrowser({"shell": (200, page("posting"))})
+    shell_job(owner, server)
+    assert run_recovery(browser) == ["retrying"]
+    assert browser.calls == [] and cooldown(owner) is not None
+
+
+@pytest.fixture
+def runner_only(visible_host, monkeypatch):
+    monkeypatch.setattr(get_settings(), "playwright_visible_window_fallback", False)
+
+
+def test_the_window_fallback_is_off_unless_asked_for():
+    assert Settings.model_fields["playwright_visible_window_fallback"].default is False
+
+
+def test_with_the_fallback_off_the_runner_still_reads_a_listed_site(owner, server, runner_only, monkeypatch):
+    runner = FakeRunner(monkeypatch, page_=(200, page("posting")))
+    browser = FakeBrowser({"shell": (200, page("posting"))})
+    job_id = shell_job(owner, server)
+    assert run_recovery(browser) == ["recovered"]
+    assert len(runner.calls) == 1 and browser.calls == []
+    assert task_of(job_id).diagnostics["attempt_1"]["playwright"]["backend"] == "browser_use_runner"
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "refused", "empty"])
+def test_with_the_fallback_off_a_runner_failure_opens_no_playwright(owner, server, runner_only, monkeypatch, failure):
+    from app.infrastructure.application_browser import browser_use_sidecar as bus
+
+    FakeRunner(monkeypatch, page_=(200, SHELL), error={
+        "unavailable": bus.SidecarUnavailable("not installed"), "refused": bus.SidecarRefused("BROWSER_ERROR", "no"),
+        "empty": None}[failure])
+    browser = FakeBrowser({"shell": (200, page("posting"))})  # Playwright *could* read it: it must not be tried
+    job_id = shell_job(owner, server)
+    assert "recovered" not in run_recovery(browser)
+    assert browser.calls == [] and task_of(job_id).status != "COMPLETED"
+
+
+def test_with_the_fallback_off_a_runner_not_configured_opens_no_playwright(owner, server, runner_only):
+    browser = FakeBrowser({"shell": (200, page("posting"))})
+    job_id = shell_job(owner, server)
+    assert "recovered" not in run_recovery(browser)
+    notes = task_of(job_id).diagnostics["attempt_1"]["playwright"]
+    assert browser.calls == [] and notes["runner"]["code"] == "RUNNER_UNAVAILABLE"
+
+
+def test_a_site_not_listed_never_reaches_the_runner(owner, server, monkeypatch):
+    runner = FakeRunner(monkeypatch, page_=(200, page("posting")))
+    browser = FakeBrowser({"shell": (200, page("posting"))})
+    shell_job(owner, server)
+    assert run_recovery(browser) == ["recovered"]
+    assert runner.calls == [] and browser.visible_calls == [False]
+
+
+def test_the_daily_listing_check_never_opens_a_window(owner, server, visible_host):
+    from app.services import job_removal
+
+    server.routes["shell"] = (200, SHELL, {})
+    browser = FakeBrowser({"shell": (200, page("posting"))})
+    snapshot = jd_recovery.Snapshot(1, owner, server.url("custom/shell"), TITLE, "Northwind", 1)
+    asyncio.run(job_removal.read_posting(snapshot, browser))
+    assert browser.visible_calls == [False]
+
+
 @pytest.mark.parametrize("path,code", [("gone", "JOB_REMOVED"), ("expired", "JOB_REMOVED"),
                                        ("closed.html", "JOB_CLOSED")])
 def test_removed_and_closed_postings_are_deleted_and_not_imported_again(owner, server, path, code):
@@ -712,6 +946,151 @@ def test_the_manual_recovery_api_queues_and_reports(owner, server):
     assert "Traceback" not in str(status) and len(status["history"]) == 1
     detail = client.get(f"/api/jobs/{job_id}").json()
     assert detail["description_recovery"]["state"] == "BLOCKED"
+
+
+@pytest.mark.parametrize("attempt,expected", [
+    ({"http": {"kind": "found"}, "playwright": {"attempted": False}}, ("HTTP", None, None)),
+    ({"http": {"kind": "empty", "code": "EXTRACTION_FAILED"}, "playwright": {"attempted": True, "kind": "blocked"}},
+     ("Headless browser", "HTTP", "No job description could be found on the page")),
+    ({"http": {"kind": "empty", "code": "EXTRACTION_FAILED"}, "playwright": {
+        "attempted": True, "kind": "found", "backend": "browser_use_runner", "runner": {"kind": "found"}}},
+     ("browser-use runner", "HTTP", "No job description could be found on the page")),
+    ({"http": {"kind": "empty"}, "playwright": {"attempted": True, "kind": "found", "backend": "visible_window",
+                                                "runner": {"kind": "unavailable", "code": "RUNNER_UNAVAILABLE"}}},
+     ("Visible window", "browser-use runner", "Runner unavailable"))])
+def test_a_task_says_which_route_read_it(attempt, expected):
+    route = jd_recovery.read_route({"attempt_1": {"http": {"kind": "stale"}}, "attempt_2": attempt})
+    assert (route["label"], route["from"], route["reason"]) == expected
+
+
+def test_a_task_with_no_read_recorded_has_no_route():
+    assert jd_recovery.read_route(None) is None and jd_recovery.read_route({}) is None
+    assert jd_recovery.read_route({"attempt_1": {"playwright": {"attempted": False}}}) is None
+    assert jd_recovery.read_route({"attempt_x": {"http": {"kind": "found"}}}) is None
+
+
+def test_the_latest_attempt_is_read_by_number_not_by_text():
+    diagnostics = {f"attempt_{n}": {"http": {"kind": "empty"}} for n in (2, 10)}
+    diagnostics["attempt_2"] = {"playwright": {"attempted": True}}
+    assert jd_recovery.read_route(diagnostics)["label"] == "HTTP"
+
+
+def test_a_finished_recovery_row_shows_its_route_and_its_change(owner, server, visible_host, monkeypatch):
+    from app.services import workers
+
+    FakeRunner(monkeypatch, page_=(200, page("posting")))
+    job_id = shell_job(owner, server)
+    assert run_recovery(FakeBrowser()) == ["recovered"]
+    with SessionLocal() as db:
+        db.info["user_id"] = owner
+        rows = workers.rows(db, owner, "recovery")["rows"]
+    done = next(r for r in rows if r["job_id"] == job_id)
+    assert done["model"] == {"model": None, "source": "none"} and done["read_route"] == "browser-use runner"
+    assert done["model_change"] == {"kind": "ROUTE", "from": "HTTP", "to": "browser-use runner",
+                                    "reason": "No job description could be found on the page"}
+
+
+def test_a_waiting_recovery_row_has_no_route_yet(owner, server):
+    from app.services import workers
+
+    job_id = new_job(owner, server.url("posting.html"), description="")
+    with SessionLocal() as db:
+        db.info["user_id"] = owner
+        rows = workers.rows(db, owner, "recovery")["rows"]
+    assert "read_route" not in next(r for r in rows if r["job_id"] == job_id)
+
+
+def _no_tasks(*job_ids: int) -> None:
+    with SessionLocal() as db:  # automatic recovery already ran for them
+        db.execute(delete(JobDescriptionFetchTask).where(JobDescriptionFetchTask.job_id.in_(job_ids)))
+        db.commit()
+
+
+@pytest.fixture
+def own_account():
+    """An account of its own: other test files leave jobs with no description on the shared test user."""
+    with SessionLocal() as db:
+        user = User(email=f"{uuid.uuid4().hex}@jobhunt.test", password_hash="!")
+        db.add(user)
+        db.commit()
+        user_id = user.id
+    yield user_id
+    _clean(user_id)
+    with SessionLocal() as db:
+        db.execute(delete(User).where(User.id == user_id))
+        db.commit()
+
+
+def bulk(user_id: int, **options) -> dict[str, int]:
+    with SessionLocal() as db:
+        db.info["user_id"] = user_id
+        return jd_recovery.enqueue_missing(db, **options)
+
+
+NOTHING_LEFT_OUT = {"already_queued": 0, "hidden_by_domain": 0, "held_for_review": 0, "set_aside": 0, "no_url": 0,
+                    "over_limit": 0}
+
+
+def test_the_bulk_api_queues_a_job_with_no_description(owner, server):
+    job_id = new_job(owner, server.url("posting.html"), description="")
+    _no_tasks(job_id)
+    out = TestClient(web_app).post("/api/jobs/recover-descriptions")
+    assert out.status_code == 202 and out.json()["queued"] >= 1
+    assert server.hits == [], "the request itself never fetches the page"
+    assert task_of(job_id).reason == "user_request" and task_of(job_id).status == "PENDING"
+
+
+def test_bulk_recovery_queues_only_jobs_with_no_description(own_account, server):
+    empty = new_job(own_account, server.url("posting.html"), description="")
+    blank = new_job(own_account, server.url("posting.html") + "?2", description="   ")
+    described = new_job(own_account, server.url("posting.html") + "?3", description=page("posting"))
+    _no_tasks(empty, blank, described)
+    assert bulk(own_account) == {"queued": 2, **NOTHING_LEFT_OUT}
+    assert task_of(empty).status == task_of(blank).status == "PENDING" and task_of(described) is None
+
+
+def test_bulk_recovery_tries_a_blocked_job_again_and_never_queues_one_twice(own_account, server):
+    job_id = new_job(own_account, server.url("login.html"), description="")
+    _no_tasks(job_id)
+    assert bulk(own_account)["queued"] == 1
+    assert bulk(own_account) == {"queued": 0, **NOTHING_LEFT_OUT, "already_queued": 1}
+    run_recovery(FakeBrowser())
+    assert task_of(job_id).status == "BLOCKED"
+    assert bulk(own_account)["queued"] == 1 and task_of(job_id).status == "PENDING"
+
+
+@pytest.mark.parametrize("fields,reason", [
+    ({"domain_match": "NOT_MATCHING"}, "hidden_by_domain"), ({"domain_match": "PENDING"}, "held_for_review"),
+    ({"domain_match": "REVIEW"}, "held_for_review"), ({"status": "dismissed"}, "set_aside"),
+    ({"status": "archived"}, "set_aside"), ({"company": "Skipped Inc"}, "set_aside"),
+    ({"url": "", "source_url": ""}, "no_url")])
+def test_bulk_recovery_spends_nothing_on_a_job_left_out(own_account, server, fields, reason):
+    fields = dict(fields)
+    job_id = new_job(own_account, fields.pop("url", server.url("posting.html")), description="", **fields)
+    _no_tasks(job_id)
+    assert bulk(own_account, excluded_companies={"skipped inc"}) == {"queued": 0, **NOTHING_LEFT_OUT, reason: 1}
+    assert task_of(job_id) is None
+
+
+def test_bulk_recovery_keeps_a_job_the_domain_check_kept(own_account, server):
+    job_id = new_job(own_account, server.url("posting.html"), description="", domain_match="KEPT")
+    _no_tasks(job_id)
+    assert bulk(own_account)["queued"] == 1
+
+
+def test_bulk_recovery_queues_a_bounded_number_newest_first(own_account, server):
+    ids = [new_job(own_account, server.url("posting.html") + f"?{n}", description="") for n in range(3)]
+    _no_tasks(*ids)
+    assert bulk(own_account, limit=2) == {"queued": 2, **NOTHING_LEFT_OUT, "over_limit": 1}
+    assert task_of(ids[0]) is None and task_of(ids[2]) is not None
+
+
+def test_bulk_recovery_leaves_another_accounts_jobs_alone(own_account, owner, server):
+    theirs = new_job(own_account, server.url("posting.html"), description="")
+    _no_tasks(theirs)
+    TestClient(web_app).post("/api/jobs/recover-descriptions").raise_for_status()  # signed in as `owner`
+    assert task_of(theirs) is None
+    assert bulk(own_account)["queued"] == 1, "its owner still can"
 
 
 def test_the_manual_api_leaves_a_usable_description_alone(owner, server):

@@ -442,6 +442,10 @@ def enqueue(db: Session, job: Job, *, reason: str = "new", force: bool = False,
 def queue_job(db: Session, job: Job, *, policy: RankingPolicy, actor: str, reason: str = "new", force: bool = False,
               now: datetime | None = None) -> str | None:
     """Put one job in line for the ranker. Returns None when queued, otherwise why not. Does not commit."""
+    if job.domain_match == "PENDING":  # app.services.domain_classifier: its verdict queues the job, nothing changes now
+        return "Waiting for the AI check"
+    if job.domain_match == "REVIEW":  # the person decides in Discovery → Review, and their choice queues it
+        return "Waiting for your review"
     state = job.state
     if state not in PRE_RANK_STATES and state is not S.RANKING and missing_description(job):
         # prepare() holds back a first ranking; this holds back every later one. Nothing changes state: the job
@@ -1317,7 +1321,9 @@ def sweep(db: Session, *, now: datetime | None = None, limit: int | None = None)
             counts["queued"] += int(_commit(db) and task is not None)
             continue
         if not domain_match.screen(db, job, rules, actor="ranker", now=now):
-            counts["not_matching"] += _commit(db)  # hidden before any model is asked about it
+            waiting = job.domain_match in ("PENDING", "REVIEW")  # for the domain classifier, which queues it afterwards
+            done = _commit(db)
+            counts["not_matching"] += 0 if waiting else done  # hidden before any model is asked about it
             continue
         skipped = queue_job(db, job, policy=policy_of(job.user_id), actor="ranker", now=now)
         if _commit(db):
