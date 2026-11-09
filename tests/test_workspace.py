@@ -67,6 +67,7 @@ def test_packet_flows_from_triage_to_tracker():
     assert any(row["id"] == job["id"] and row["waiting"] for row in waiting)
     detail = client.get(f"/api/approvals/{job['id']}").json()
     assert len(detail["checklist"]) == 6
+    assert detail["resume"]["review"] and {note["tone"] for note in detail["resume"]["review"]} <= {"good", "warn", "bad"}
     assert client.get(f"/api/jobs/{job['id']}/apply-kit").status_code == 400
     before = client.get("/api/workspace/summary").json()["approved"]
     assert client.post(f"/api/jobs/{job['id']}/approve").status_code == 200

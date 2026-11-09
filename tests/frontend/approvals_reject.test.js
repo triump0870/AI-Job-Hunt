@@ -59,6 +59,43 @@ beforeEach(() => {
 
 const view = () => document.getElementById('view');
 
+describe('reviewer notes on Approvals', () => {
+  const show = resume => {
+    ui.D.approval = approval({ resume: { markdown: '# Rohan', generated: '3d ago', edits: [], ...resume } });
+    ui.render();
+    return view().querySelector('#approval-review');
+  };
+
+  it('shows the score and puts concerns ahead of strengths, blockers first', () => {
+    const section = show({ reviewer_score: 45, review: [
+      { tone: 'good', text: 'Strong Python backend' },
+      { tone: 'warn', text: 'No Salesforce experience' },
+      { tone: 'bad', text: 'Cites evidence that does not exist' }] });
+    expect(section.textContent).toContain('45 / 100');
+    expect(section.textContent).toContain('TO WEIGH BEFORE APPROVING · 2');
+    expect(section.textContent).toContain('WHAT HOLDS UP · 1');
+    expect([...section.querySelectorAll('.pretty')].map(n => n.textContent)).toEqual(
+      ['Cites evidence that does not exist', 'No Salesforce experience', 'Strong Python backend']);
+  });
+
+  it('treats a note as text, not markup', () => {
+    const section = show({ reviewer_score: 70, review: [{ tone: 'warn', text: '<img src=x onerror=alert(1)>' }] });
+    expect(section.querySelector('img')).toBeNull();
+    expect(section.textContent).toContain('<img src=x onerror=alert(1)>');
+  });
+
+  it('says so when the reviewer left no notes', () => {
+    expect(show({ reviewer_score: 70, review: [] }).textContent).toContain('The reviewer left no notes.');
+  });
+
+  it('points an unreviewed packet at Tailor and shows no score', () => {
+    const section = show({ reviewer_score: null, review: [] });
+    expect(section.textContent).toContain('has not been reviewed');
+    expect(section.textContent).not.toContain('/ 100');
+    expect(section.querySelector('[data-act="go"]').dataset.screen).toBe('tailor');
+  });
+});
+
 describe('rejecting a job from Approvals', () => {
   it('offers Reject beside the other decisions', () => {
     const actions = [...view().querySelectorAll('[data-act]')].map(b => b.dataset.act);
