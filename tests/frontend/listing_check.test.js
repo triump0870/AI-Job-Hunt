@@ -39,6 +39,13 @@ describe('Discovery · Check listings', () => {
     expect(button().disabled).toBe(true);
   });
 
+  it('hides the check once the scheduled pass ran today, but not the progress of a run already going', () => {
+    expect(ui.listingCheckButton({ listing_checked_today: true })).toBe('');
+    expect(ui.listingCheckButton({ listing_checked_today: false })).toContain('Check listings');
+    ui.S.listingRun = { due: 60, since: 't', checked: 12, removed: 0 };
+    expect(ui.listingCheckButton({ listing_checked_today: true })).toContain('Checking 12 of 60');
+  });
+
   it('starts a run from what the server says is due', async () => {
     fetchMock.mockResolvedValue(json({ due: 60, since: '2026-11-08T10:00:00' }, 202));
     await ui.A['listing-check']();

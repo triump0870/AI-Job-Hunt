@@ -951,6 +951,8 @@ def jobs_search(q: str = "", min_fit: int = 0, max_fit: int = 0, board: str = "a
         return {"ids": [j.id for j in chosen], "total": total,
                 "ranked_ids": [j.id for j in chosen if j.fit_score is not None],
                 "parsed_ids": [j.id for j in chosen if described[j.id] == "PARSED"]}
+    from app.services import job_removal
+
     pages = max(1, -(-total // per_page))
     page = min(page, pages)
     boards = sorted({board_label(j.source) for j in jobs})
@@ -960,6 +962,7 @@ def jobs_search(q: str = "", min_fit: int = 0, max_fit: int = 0, board: str = "a
             "description_states": [[key, name, counts.get(key, 0)]
                                    for key, name in job_description.DESCRIPTION_STATES.items()],
             "total_all": total_all, "applied_hidden": applied_hidden,
+            "listing_checked_today": job_removal.scheduled_check_ran_today(db, db.info["user_id"], job_removal.utcnow()),
             "domain_counts": {"matching": domain_counts["matching"], "not_matching": domain_counts["not_matching"]},
             "parse_enabled": get_settings().jd_parse_enabled,
             "page": page, "pages": pages, "per_page": per_page, "boards": boards,
