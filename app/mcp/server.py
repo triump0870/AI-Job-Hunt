@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from app.mcp import tools
 from app.models import CONVERSATION_ACTION_STATUSES
 from app.prompts.mcp_application import build_mcp_application_prompt
+from app.prompts.mcp_followup import build_mcp_followup_prompt
 from app.prompts.mcp_review import build_mcp_review_prompt
 from app.prompts.mcp_tailoring import MCP_SERVER_INSTRUCTIONS, build_mcp_tailoring_prompt
 from app.services import conversation_actions
@@ -24,7 +25,8 @@ TOOL_NAMES = ("list_jobs_for_tailoring", "get_tailoring_context", "save_tailored
               "list_jobs_for_review", "get_review_context", "save_review", "save_bulk_reviews",
               "get_bulk_operation_status", "list_jobs_for_application", "get_job_packet",
               "search_application_knowledge", "request_human_answer", "begin_application_submission",
-              "release_application_claim", "record_application_result")
+              "release_application_claim", "record_application_result", "find_jobs", "get_job_documents",
+              "list_followups_due", "save_followup_draft", "record_followup_sent", "skip_followup")
 
 JobIds = Annotated[list[int], Field(description="Job IDs from list_jobs_for_tailoring or list_jobs_for_review")]
 
@@ -47,6 +49,12 @@ def run_tool(sessions: SessionFactory, user_id: int, name: str, handler: Callabl
             items = result.get("results")
             job_id = arguments.get("job_id") or next(
                 (a.get("job_id") for a in arguments.values() if isinstance(a, dict)), None)
+            entity_type = None if name in ("get_bulk_operation_status", "search_application_knowledge") else "job"
+            if not isinstance(job_id, int):
+                # Follow-up tools name a follow-up or an application, never a job.
+                entity_type, job_id = next(((kind, arguments[key]) for key, kind in
+                                            (("followup_id", "followup"), ("application_id", "application"))
+                                            if isinstance(arguments.get(key), int)), (entity_type, job_id))
             outcome = result.get("status")
             status = ("ERROR" if not result.get("ok") else outcome if outcome in CONVERSATION_ACTION_STATUSES
                       else "OK")
@@ -59,7 +67,7 @@ def run_tool(sessions: SessionFactory, user_id: int, name: str, handler: Callabl
                        else {"count": result.get("count", len(result.get("jobs") or []))})
             conversation_actions.record(
                 db, tool_name=name, arguments=arguments, result_status=status,
-                entity_type=None if name in ("get_bulk_operation_status", "search_application_knowledge") else "job",
+                entity_type=entity_type,
                 entity_id=job_id if isinstance(job_id, int) else None,
                 operation_id=result.get("operation_id") if items is not None else None, result_summary=summary)
         except Exception:  # auditing never hides the tool's answer
@@ -159,11 +167,14 @@ def build_server(user_id: int, sessions: SessionFactory | None = None) -> MCPSer
                 "Also list jobs whose last attempt stopped at a blocker that is still open"))] = False,
             offset: Annotated[int, Field(description="Jobs to skip: next_offset from the previous page")] = 0,
             limit: Annotated[int, Field(description="Page size (default 20, capped by MCP_APPLICATION_PAGE_LIMIT)")] = 20,
+            who_applies: Annotated[str | None, Field(description=(
+                "Only jobs Claude may submit (claude) or only those the candidate submits (person)"))] = None,
     ) -> dict[str, Any]:
         """Approved jobs not applied to yet whose approved resume scored above 60 in review, best reviewed first,
-        with each job's application URL. Jobs already applied to under another posting are left out."""
+        with each job's application URL and route: its ATS and who applies (claude, or person for LinkedIn, Indeed,
+        Ashby and anything Job Hunt OS cannot drive). Jobs already applied to under another posting are left out."""
         return call("list_jobs_for_application", reviewer_score_above=reviewer_score_above, company=company,
-                    include_blocked=include_blocked, offset=offset, limit=limit)
+                    include_blocked=include_blocked, offset=offset, limit=limit, who_applies=who_applies)
 
     @server.tool()
     def get_job_packet(
@@ -171,10 +182,39 @@ def build_server(user_id: int, sessions: SessionFactory | None = None) -> MCPSer
             formats: Annotated[list[str] | None, Field(description="Files to render: pdf, docx (default both)")] = None,
             include_content: Annotated[bool, Field(description=(
                 "Also return each file base64-encoded (default false: use the local path to upload it)"))] = False,
+            cover_letter_files: Annotated[bool, Field(description=(
+                "Also write the approved cover letter as PDF and DOCX files (default true; none when it is empty)"))] = True,
     ) -> dict[str, Any]:
-        """The approved resume version for a job, its cover letter, and the resume as uploadable PDF and DOCX files
-        written to a local folder. Refused for a job that is not ready to apply to."""
-        return call("get_job_packet", job_id=job_id, formats=formats, include_content=include_content)
+        """The approved resume version for a job, its cover letter, its route (who applies), and the resume and
+        cover letter as uploadable PDF and DOCX files written to a local folder, each tagged with its role. Refused
+        for a job that is not ready to apply to."""
+        return call("get_job_packet", job_id=job_id, formats=formats, include_content=include_content,
+                    cover_letter_files=cover_letter_files)
+
+    @server.tool()
+    def find_jobs(
+            job_id: Annotated[int | None, Field(description="One job's ID")] = None,
+            query: Annotated[str | None, Field(description="Part of the company name or job title (any case)")] = None,
+            stage: Annotated[str | None, Field(description=(
+                "Only jobs with this status (e.g. tailored, approved, applied) or workflow state (e.g. REVIEWED)"))] = None,
+            limit: Annotated[int, Field(description="Maximum jobs (default 10, capped by MCP_APPLICATION_PAGE_LIMIT)")] = 10,
+    ) -> dict[str, Any]:
+        """Find jobs by ID or by company/title at any stage, newest first: status, fit score, tailored versions,
+        the latest version's reviewer score, whether it is approved or applied, and its application URL. Needs a
+        job_id or a query. Returns no descriptions or resume text."""
+        return call("find_jobs", job_id=job_id, query=query, stage=stage, limit=limit)
+
+    @server.tool()
+    def get_job_documents(
+            job_id: Annotated[int, Field(description="A job_id from find_jobs")],
+            formats: Annotated[list[str] | None, Field(description="Files to render: pdf, docx (default both)")] = None,
+            include_content: Annotated[bool, Field(description=(
+                "Also return each file base64-encoded (default false)"))] = False,
+    ) -> dict[str, Any]:
+        """A job's resume and cover letter at any stage after tailoring: the approved packet when there is one, else
+        the latest tailored version (status TAILORED or REVIEWED). Unapproved files are drafts, written to a drafts
+        folder; may_submit is true only for a packet ready to apply to. Never upload a draft to an application."""
+        return call("get_job_documents", job_id=job_id, formats=formats, include_content=include_content)
 
     @server.tool()
     def search_application_knowledge(
@@ -244,6 +284,49 @@ def build_server(user_id: int, sessions: SessionFactory | None = None) -> MCPSer
                     blocker_reason=blocker_reason, detail=detail, question_ids=question_ids,
                     claim_token=claim_token)
 
+    @server.tool()
+    def list_followups_due(
+            within_days: Annotated[int, Field(description="Due within this many days (default 3; 0 = due now or overdue)")] = 3,
+            limit: Annotated[int, Field(description="Maximum follow-ups (default 20, at most 50)")] = 20,
+    ) -> dict[str, Any]:
+        """Follow-ups due on submitted applications, soonest first: the saved draft (or needs_draft when none was
+        written yet), the job, the recruiters, the follow-ups already sent, and employer_replied (when true, do not
+        follow up). Never sends anything."""
+        return call("list_followups_due", within_days=within_days, limit=limit)
+
+    @server.tool()
+    def save_followup_draft(
+            application_id: Annotated[int, Field(description="The application_id from list_followups_due")],
+            text: Annotated[str, Field(description="The full message, 1-5000 characters")],
+            channel: Annotated[str, Field(description="email, linkedin or other")] = "email",
+    ) -> dict[str, Any]:
+        """Save (or replace) the application's follow-up draft. Saving sends nothing: show the candidate the draft
+        and send it only after they explicitly say yes."""
+        return call("save_followup_draft", application_id=application_id, text=text, channel=channel)
+
+    @server.tool()
+    def record_followup_sent(
+            followup_id: Annotated[int, Field(description="The followup_id of the draft that was sent")],
+            sent_text: Annotated[str | None, Field(description="The text really sent (default: the saved draft)")] = None,
+            channel: Annotated[str | None, Field(description="email, linkedin or other (default: the draft's)")] = None,
+            sent_at: Annotated[str | None, Field(description="When it was sent, ISO date and time (default now)")] = None,
+            recipient: Annotated[str | None, Field(description="Who it was sent to (name or address)")] = None,
+    ) -> dict[str, Any]:
+        """Record that the candidate's follow-up was sent (only after it really was). Recording twice changes
+        nothing (ALREADY_SENT). Schedules at most one more follow-up for the application."""
+        return call("record_followup_sent", followup_id=followup_id, sent_text=sent_text, channel=channel,
+                    sent_at=sent_at, recipient=recipient)
+
+    @server.tool()
+    def skip_followup(
+            followup_id: Annotated[int | None, Field(description="The followup_id to skip")] = None,
+            application_id: Annotated[int | None, Field(description=(
+                "Or the application, for a follow-up with no draft yet"))] = None,
+            reason: Annotated[str | None, Field(description="Why the candidate is not following up")] = None,
+    ) -> dict[str, Any]:
+        """The candidate decided not to follow up: cancels the draft and clears the follow-up date."""
+        return call("skip_followup", followup_id=followup_id, application_id=application_id, reason=reason)
+
     @server.prompt()
     def tailor_jobs(minimum_fit_score: float | None = None, limit: int = 5) -> str:
         """Tailor the resume for the best jobs waiting for tailoring."""
@@ -258,5 +341,10 @@ def build_server(user_id: int, sessions: SessionFactory | None = None) -> MCPSer
     def apply_to_jobs(limit: int = 5) -> str:
         """Apply to approved jobs with their approved packets, asking me what the Knowledge bank cannot answer."""
         return build_mcp_application_prompt(limit)
+
+    @server.prompt()
+    def follow_up(within_days: int = 3, limit: int = 5) -> str:
+        """Follow up on submitted applications one at a time; nothing is sent until I say yes."""
+        return build_mcp_followup_prompt(within_days, limit)
 
     return server

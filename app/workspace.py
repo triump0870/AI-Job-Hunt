@@ -53,6 +53,7 @@ from app.services import (
     resume_matching,
     resume_verification,
 )
+from app.services import followups as followup_service
 from app.services.approval import ApprovalRefused
 from app.services.actors import (
     ACTOR_GROUPS,
@@ -2562,6 +2563,9 @@ def app_payload(db: Session, app: Application) -> dict:
         # The packet that was submitted, so the tracker can open it (read-only: an applied packet is locked).
         "resume_id": resume.id if resume else None,
         "draft": draft.draft if draft else "", "draft_id": draft.id if draft else None,
+        # "draft" offers Mark sent and Skip; "sent" is what went out. A follow-up date with no draft can be skipped too.
+        "draft_status": draft.status if draft else None,
+        "followup_pending": stage == "applied" and app.followup_due_at is not None,
         "next": next_step[0], "next_date": next_step[1],
         # The Application Inbox: the email about this application, and whether the employer has already replied
         # (a follow-up would then be unnecessary).
@@ -2757,6 +2761,64 @@ def followup_draft(application_id: int, db: Session = Depends(get_user_db)):
     except Exception as exc:
         raise HTTPException(400, str(exc)) from exc
     return app_payload(db, app)
+
+
+class FollowUpSentIn(BaseModel):
+    """The person sent the follow-up themselves. Every field defaults to the draft as saved."""
+    sent_text: str | None = Field(default=None, max_length=followup_service.TEXT_LIMIT)
+    channel: Literal["email", "linkedin", "other"] | None = None
+    sent_at: datetime | None = None
+    recipient: str | None = Field(default=None, max_length=followup_service.RECIPIENT_LIMIT)
+
+
+class FollowUpSkipIn(BaseModel):
+    reason: str | None = Field(default=None, max_length=1000)
+
+
+def get_followup(db: Session, followup_id: int) -> FollowUp:
+    followup = db.get(FollowUp, followup_id)
+    if not followup:
+        raise HTTPException(404, "Follow-up not found")
+    return followup
+
+
+@router.post("/api/followups/{followup_id}/sent")
+def followup_sent(followup_id: int, payload: FollowUpSentIn | None = None, db: Session = Depends(get_user_db)):
+    """Mark sent: the person sent this follow-up themselves (Job Hunt OS never sends). Recording it twice changes
+    nothing. The same service as the MCP tool record_followup_sent, so both write the same rows."""
+    payload = payload or FollowUpSentIn()
+    followup = get_followup(db, followup_id)
+    try:
+        outcome = followup_service.mark_sent(db, followup, sent_text=payload.sent_text, channel=payload.channel,
+                                      sent_at=payload.sent_at, recipient=payload.recipient, source="tracker")
+    except followup_service.FollowUpRefused as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {**app_payload(db, outcome.application), "followup_status": outcome.status}
+
+
+@router.post("/api/followups/{followup_id}/skip")
+def followup_skip(followup_id: int, payload: FollowUpSkipIn | None = None, db: Session = Depends(get_user_db)):
+    """Skip: no follow-up for this application. The draft is cancelled and the follow-up date cleared."""
+    followup = get_followup(db, followup_id)
+    app = get_app(db, followup.application_id)
+    try:
+        outcome = followup_service.skip(db, app, followup=followup, reason=(payload or FollowUpSkipIn()).reason,
+                                 source="tracker")
+    except followup_service.FollowUpRefused as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {**app_payload(db, app), "followup_status": outcome.status}
+
+
+@router.post("/api/applications/{application_id}/followup-skip")
+def application_followup_skip(application_id: int, payload: FollowUpSkipIn | None = None,
+                              db: Session = Depends(get_user_db)):
+    """Skip a follow-up that has no draft yet: the follow-up date is cleared."""
+    app = get_app(db, application_id)
+    try:
+        outcome = followup_service.skip(db, app, reason=(payload or FollowUpSkipIn()).reason, source="tracker")
+    except followup_service.FollowUpRefused as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {**app_payload(db, app), "followup_status": outcome.status}
 
 
 # ───────────────────────────── settings helpers ─────────────────────────────

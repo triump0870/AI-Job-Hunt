@@ -1849,13 +1849,22 @@ function renderTracker() {
         <div class="box" style="padding:13px"><div class="caps mb8">SUBMITTED</div>
           <div class="small ink2" style="line-height:1.5">${sel.resume_id ? `<a href="#" data-act="go" data-screen="tailor" data-job="${sel.job_id}">${esc(sel.docs)}</a>` : esc(sel.docs)}</div>${sel.notes ? `<div class="xs muted mt8 pretty">${esc(sel.notes)}</div>` : ''}</div>
         <div class="box" style="padding:13px;border-color:#e2ddff;background:var(--brand-softer)"><div class="row gap6 mb8">${pill('AI', 'brand')}<span class="xs b" style="color:var(--brand-ink)">Follow-up draft</span></div>
-          ${sel.inbox_reply ? '<div class="xs mb8" style="color:var(--good)">The employer already replied (Email activity), so a follow-up is probably unnecessary.</div>' : ''}
+          ${sel.inbox_reply ? '<div class="xs mb8" style="color:var(--good)">The employer already replied (Email activity), so a follow-up is probably unnecessary.</div>' : ''}${sel.draft_status === 'sent' ? '<div class="xs mb8 muted">Sent: this is the follow-up that went out.</div>' : ''}
           <div class="small ink2 pretty" style="line-height:1.55;white-space:pre-wrap">${esc(sel.draft || 'No draft yet. Generate one — nothing is ever sent for you.')}</div>
-          <div class="row gap8 mt10">${sel.draft ? btn('Review &amp; copy', 'copy-draft', { app: sel.id }, 'sm primary') : ''}${btn(label('nudge' + sel.id, sel.draft ? 'Regenerate' : 'Draft follow-up', 'Drafting…'), 'draft-nudge', { app: sel.id, stay: 1 }, 'sm' + (sel.draft ? '' : ' primary'), isBusy('nudge' + sel.id))}</div></div>
+          <div class="row gap8 mt10 wrap">${sel.draft ? btn('Review &amp; copy', 'copy-draft', { app: sel.id }, 'sm primary') : ''}${followupButtons(sel)}${btn(label('nudge' + sel.id, sel.draft ? 'Regenerate' : 'Draft follow-up', 'Drafting…'), 'draft-nudge', { app: sel.id, stay: 1 }, 'sm' + (sel.draft ? '' : ' primary'), isBusy('nudge' + sel.id))}</div></div>
         ${renderStagePrep(sel)}
         ${S.scheduling ? renderScheduleForm(sel) : btn('Schedule an interview', 'schedule-start', {}, 'block')}
       </div></div>
   </section></div>`;
+}
+
+// Mark sent / Skip: the person records what they did with the follow-up (Job Hunt OS never sends it).
+// A draft can be marked sent or skipped; a follow-up date with no draft yet can only be skipped.
+function followupButtons(sel) {
+  const open = sel.draft_id && sel.draft_status === 'draft';
+  const sent = open ? btn(label('fsent' + sel.id, 'Mark sent', 'Saving…'), 'followup-sent', { app: sel.id, fu: sel.draft_id }, 'sm', isBusy('fsent' + sel.id)) : '';
+  const skip = open || sel.followup_pending ? btn(label('fskip' + sel.id, 'Skip', 'Skipping…'), 'followup-skip', { app: sel.id, ...(open ? { fu: sel.draft_id } : {}) }, 'sm', isBusy('fskip' + sel.id)) : '';
+  return sent + skip;
 }
 
 /* recruiters and interviews */
@@ -1917,7 +1926,7 @@ function renderScheduleForm(sel) {
     <div class="row gap8 wrap">${field('contact_email', 'type="email" placeholder="Email" style="margin:0;flex:1 1 160px"')}${field('contact_phone', 'type="tel" placeholder="Phone" style="margin:0;flex:1 1 140px"')}</div></div>
     <div class="row gap8 mt10">${btn('Cancel', 'schedule-cancel', {}, 'sm')}${btn(label('schedule', 'Save', 'Saving…'), 'schedule-save', { app: sel.id }, 'sm primary', isBusy('schedule'))}</div></div>`;
 }
-const KIND_DOT = { applied: '#5b4ae8', stage: '#0f9c86', note: '#c6cad8', call: '#0f9c86', email: '#a79bf0', referral: '#a79bf0', interview: '#e0a136' };
+const KIND_DOT = { applied: '#5b4ae8', stage: '#0f9c86', note: '#c6cad8', call: '#0f9c86', email: '#a79bf0', referral: '#a79bf0', interview: '#e0a136', followup: '#a79bf0' };
 
 /* ───────────── job modal + palette ───────────── */
 // A job you turned down says so wherever it turns up again, with the reason when you gave one.
@@ -3325,6 +3334,21 @@ const A = {
     S.editingRecruiter = false; await load();
   }, 'Recruiters saved'),
   'copy-draft': el => copyText(D.tracker.applications.find(a => a.id === Number(el.dataset.app)).draft),
+  'followup-sent': el => {
+    if (!confirm('Record this follow-up as sent? Job Hunt OS does not send it: mark it once you have sent it yourself.')) return;
+    return busy('fsent' + el.dataset.app, async () => {
+      await api(`/api/followups/${el.dataset.fu}/sent`, { method: 'POST', body: {} });
+      await load();
+    }, 'Follow-up recorded as sent');
+  },
+  'followup-skip': el => {
+    if (!confirm('Skip this follow-up? The draft is dropped and no follow-up is scheduled for this application.')) return;
+    return busy('fskip' + el.dataset.app, async () => {
+      const url = el.dataset.fu ? `/api/followups/${el.dataset.fu}/skip` : `/api/applications/${el.dataset.app}/followup-skip`;
+      await api(url, { method: 'POST', body: {} });
+      await load();
+    }, 'Follow-up skipped');
+  },
   'schedule-start': () => {
     let tz = BROWSER_TZ; try { tz = tzName(localStorage.getItem('interviewTimezone') || tz); } catch { /* storage blocked */ }
     if (!tzOptions().some(([v]) => v === tz)) tz = BROWSER_TZ;

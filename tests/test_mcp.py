@@ -125,9 +125,26 @@ def test_server_exposes_only_the_approved_tools_and_prompts(account):
     names = {tool.name for tool in asyncio.run(server.list_tools())}
     assert names == set(TOOL_NAMES)
     assert not any(word in name for name in names for word in ("sql", "file", "shell", "env", "key", "setting"))
-    assert {p.name for p in asyncio.run(server.list_prompts())} == {"tailor_jobs", "review_applications", "apply_to_jobs"}
+    assert {p.name for p in asyncio.run(server.list_prompts())} == {"tailor_jobs", "review_applications", "apply_to_jobs",
+                                                                  "follow_up"}
     content = asyncio.run(server.call_tool("list_jobs_for_tailoring", {"minimum_fit_score": 85}))
     assert "Grab" in str(content)
+
+
+def test_new_tools_are_registered_with_their_arguments(account):
+    server = build_server(account["user_id"])
+    tools_by_name = {tool.name: tool for tool in asyncio.run(server.list_tools())}
+    expected = {"find_jobs": {"job_id", "query", "stage", "limit"},
+                "get_job_documents": {"job_id", "formats", "include_content"},
+                "list_followups_due": {"within_days", "limit"},
+                "save_followup_draft": {"application_id", "text", "channel"},
+                "record_followup_sent": {"followup_id", "sent_text", "channel", "sent_at", "recipient"},
+                "skip_followup": {"followup_id", "application_id", "reason"}}
+    for name, arguments in expected.items():
+        assert name in TOOL_NAMES and hasattr(tools, name)
+        assert set(tools_by_name[name].input_schema["properties"]) == arguments, name
+    assert "who_applies" in tools_by_name["list_jobs_for_application"].input_schema["properties"]
+    assert "cover_letter_files" in tools_by_name["get_job_packet"].input_schema["properties"]
 
 
 def test_server_refuses_to_start_without_a_valid_token(account, monkeypatch, capsys):

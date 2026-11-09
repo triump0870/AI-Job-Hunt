@@ -181,8 +181,14 @@ def packet_slug(name: str, company: str) -> str:
     return slug or "resume"
 
 
-def packet_filename(slug: str, kind: str, version: int | None = None) -> str:
-    """The file name for one part of a packet: resume PDF and DOCX, or the cover letter."""
-    if kind == "cover_letter":
-        return f"cover-letter-{slug}.txt"
-    return f"{slug}-v{version or 1}.{kind}"
+COVER_LETTER_KINDS = {"cover_letter": "txt", "cover_letter_pdf": "pdf", "cover_letter_docx": "docx"}
+
+
+def packet_filename(slug: str, kind: str, version: int | None = None, *, draft: bool = False) -> str:
+    """The file name for one part of a packet: resume PDF and DOCX (`pdf`, `docx`), or the cover letter as text
+    (`cover_letter`, the Apply screen's download), PDF (`cover_letter_pdf`) or DOCX (`cover_letter_docx`). A `draft`
+    (a version nobody approved yet) says so in its name."""
+    suffix = "-draft" if draft else ""
+    if kind in COVER_LETTER_KINDS:
+        return f"cover-letter-{slug}{suffix}.{COVER_LETTER_KINDS[kind]}"
+    return f"{slug}-v{version or 1}{suffix}.{kind}"

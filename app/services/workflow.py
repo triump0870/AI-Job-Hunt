@@ -595,12 +595,12 @@ def create_due_followups(db: Session) -> int:
             Application.followup_due_at <= now,
         )
     ).all()
+    from app.services import followups
     from app.services.application_inbox.service import blocks_followup
 
     created = 0
     for app in apps:
-        existing = db.scalar(select(FollowUp).where(FollowUp.application_id == app.id))
-        if existing:
+        if not followups.needs_draft(db, app):  # a draft is waiting, or MAX_SENT follow-ups already went out
             continue
         if blocks_followup(db, app):
             # The Application Inbox saw a reply (or the application moved on): a nudge would be noise.
@@ -622,8 +622,9 @@ def draft_followup(db: Session, app: Application, commit: bool = True) -> Follow
     llm = LLMClient.for_user(db)
     job = db.get(Job, app.job_id)
     profile = rv.for_job(db, get_profile(db), job)
-    sent = db.scalars(select(FollowUp.draft).where(FollowUp.application_id == app.id, FollowUp.status != "draft")
-                      .order_by(FollowUp.id)).all()
+    from app.services.followups import previous_texts
+
+    sent = previous_texts(db, app)  # what was really sent; a cancelled draft never went out
     context = build_followup_context(db, profile, job)
     prompt = build_followup_prompt(
         candidate_profile=profile, job=job, context=context,
