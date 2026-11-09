@@ -171,6 +171,18 @@ def recover_description(job_id: int, request: Request, background: BackgroundTas
     return {**_recovery(db, job), "queued": task is not None, "message": "Recovery queued"}
 
 
+@router.post("/api/jobs/recover-descriptions", status_code=202)
+def recover_descriptions(request: Request, background: BackgroundTasks, db: Session = Depends(get_user_db)):
+    """Queue recovery for every job with no description. Nothing is fetched in the request. Says what was queued and
+    what was left out, and why."""
+    from app.workspace import excluded_companies
+
+    out = jd_recovery.enqueue_missing(db, excluded_companies=excluded_companies(db))
+    if out["queued"]:
+        run_soon(background, request.app, "jd_recovery")
+    return out
+
+
 @router.get("/api/jobs/{job_id}/description-recovery")
 def description_recovery(job_id: int, db: Session = Depends(get_user_db)):
     """Where recovery of this job's description stands, with its recent attempts."""

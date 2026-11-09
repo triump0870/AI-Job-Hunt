@@ -324,6 +324,14 @@ class Settings(BaseSettings):
     playwright_browser: str = "chromium"
     # PLAYWRIGHT_HEADLESS=false opens a visible window for local debugging of extraction selectors.
     playwright_headless: bool = True
+    # Hosts (comma separated, subdomains included) whose postings JD recovery reads in a visible window, for sites that
+    # refuse the headless browser but serve an ordinary one. Plain Chromium: no spoofing, and a challenge stays BLOCKED.
+    # Visible pages open one at a time, at least this many seconds apart. Local installs only: it needs a display.
+    playwright_visible_hosts: str = ""
+    playwright_visible_min_interval_seconds: int = 10
+    # Those hosts are read by the browser-use runner. True lets Playwright's visible window read them when the runner
+    # could not; False (the default) leaves a runner failure as the result, and Playwright never opens these hosts.
+    playwright_visible_window_fallback: bool = False
     playwright_navigation_timeout_seconds: int = 45
     playwright_page_timeout_seconds: int = 60
     playwright_max_concurrency: int = 2

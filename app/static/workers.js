@@ -239,20 +239,24 @@ function wkLastRun(t) {
   return `<div class="wk-last" title="${attr(`Last run ${fmtDateTime(at)}`)}"><b>${esc(fmtDateTime(at))}</b><small>${esc(wkAgo(at))}</small></div>`;
 }
 // The model a task uses (or its next request will use), and the route it goes by.
-const WK_CHANGE = { FAILOVER: ['Failed over', 'bad'], RESTING: ['Using a backup', 'warn'], FALLBACK: ['Fallback', 'warn'], ESCALATED: ['Escalated', 'brand'], CONFIG: ['Model changed', 'brand'] };
+const WK_CHANGE = { FAILOVER: ['Failed over', 'bad'], RESTING: ['Using a backup', 'warn'], FALLBACK: ['Fallback', 'warn'], ESCALATED: ['Escalated', 'brand'], CONFIG: ['Model changed', 'brand'], ROUTE: ['Route changed', 'brand'] };
 const WK_ACTIVE = ['RUNNING', 'QUEUED', 'RETRYING', 'running', 'queued', 'PENDING', 'PROCESSING'];
 function wkModel(r) {
   const m = r.model;
-  if (m?.source === 'none') return '<div class="wk-model nocall"><small>No model call</small></div>';
+  if (m?.source === 'none') {
+    return r.read_route
+      ? `<div class="wk-model" title="${attr(`Read by ${r.read_route}, with no model call`)}"><span class="wk-route direct">${esc(r.read_route)}</span><small>No model call</small></div>`
+      : '<div class="wk-model nocall"><small>No model call</small></div>';
+  }
   if (!m?.model) return '<div class="wk-model empty" aria-hidden="true"></div>';
   const verb = m.source === 'used' ? (WK_ACTIVE.includes(r.status) && r.waiting_for !== 'APPROVAL' ? 'in use' : 'used') : 'next request';
-  return `<div class="wk-model" title="${attr(`${m.worker ? `${m.worker} · ` : ''}${m.source === 'used' ? 'In use' : 'Next request'}: ${m.model} via ${m.route_label}${m.via ? ` (${m.via})` : ''}${m.backups?.length ? ` · backups ${m.backups.join(', ')}` : ''}`)}">
+  return `<div class="wk-model" title="${attr(`${m.worker ? `${m.worker} · ` : ''}${m.source === 'used' ? 'In use' : 'Next request'}: ${m.model} via ${m.route_label}${m.via ? ` (${m.via})` : ''}${m.backups?.length ? ` · backups ${m.backups.join(', ')}` : ''}${r.read_route ? ` · read by ${r.read_route}` : ''}`)}">
     <span class="wk-route ${m.route === 'LITELLM' ? 'gw' : 'direct'}">${esc(m.route_label)}</span><span class="mono ellipsis">${esc(m.model)}</span>
-    <small>${verb}${m.via ? ` · ${esc(m.via)}` : ''}</small></div>`;
+    <small>${verb}${m.via ? ` · ${esc(m.via)}` : ''}${r.read_route ? ` · read by ${esc(r.read_route)}` : ''}</small></div>`;
 }
 function wkModelChange(r) {
   const c = r.model_change;
-  if (!c) return `<div class="wk-change none">${r.model?.model ? '<span class="faint xs">No change</span>' : ''}</div>`;  // finished without a model call: nothing to say
+  if (!c) return `<div class="wk-change none">${r.model?.model || r.read_route ? '<span class="faint xs">No change</span>' : ''}</div>`;  // finished without a model call or a route: nothing to say
   const [label, tone] = WK_CHANGE[c.kind] || [c.kind, 'muted'];
   return `<div class="wk-change t-${tone}" title="${attr(`${label}: ${c.from || '?'} → ${c.to || '?'} — ${c.reason || ''}`)}"><b>${esc(label)}</b>
     <span class="mono ellipsis">${c.from ? `<s>${esc(c.from)}</s> → ` : ''}${esc(c.to || '—')}</span></div>`;

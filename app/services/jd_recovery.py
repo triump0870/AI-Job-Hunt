@@ -26,7 +26,7 @@ import asyncio
 import contextlib
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -38,7 +38,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import ACTIVE_JD_FETCH_STATUSES, Job, JobDescriptionFetchTask, JobRanking
-from app.services import backoff, jd_extractors, jd_quality, server_settings, system_log, tracing, worker_settings
+from app.services import (
+    backoff,
+    jd_extractors,
+    jd_quality,
+    server_settings,
+    system_log,
+    tracing,
+    worker_settings,
+)
 from app.services.lifecycle import ErrorCategory
 from app.services.lifecycle import WorkflowState as S
 from app.settings import get_settings
@@ -96,6 +104,10 @@ CATEGORY_OF = {"NETWORK_ERROR": ErrorCategory.TRANSIENT, "TIMEOUT": ErrorCategor
                "SSL_ERROR": ErrorCategory.EXTERNAL_SERVICE, "REDIRECT_LOOP": ErrorCategory.EXTERNAL_SERVICE,
                jd_quality.ERROR_PAGE: ErrorCategory.EXTERNAL_SERVICE, jd_quality.UNRELATED_PAGE: ErrorCategory.VALIDATION,
                "LEASE_EXPIRED": ErrorCategory.LEASE_EXPIRED}
+# A refusal from a host read in a visible window (PLAYWRIGHT_VISIBLE_HOSTS) pauses that host for a fixed hour. These
+# visits share the person's address with their own use of the site, so it is left alone rather than asked again.
+VISIBLE_REFUSALS = frozenset({jd_quality.ACCESS_DENIED, jd_quality.CAPTCHA_OR_ANTI_BOT, "RATE_LIMITED"})
+VISIBLE_REST = backoff.RateLimitPolicy(base_seconds=3600, multiplier=1.0, max_seconds=3600)
 
 
 def utcnow() -> datetime:
@@ -239,6 +251,45 @@ def sweep(db: Session, limit: int | None = None, *, now: datetime | None = None)
     return {"assessed": assessed, "queued": queued}
 
 
+def enqueue_missing(db: Session, *, excluded_companies: Collection[str] = (), limit: int | None = None,
+                    now: datetime | None = None) -> dict[str, int]:
+    """A person asked for every job with no description to be read from its posting: queue them, at most `limit` at a
+    time, newest first. As with asking for one job, a URL tried before is tried again. Nothing is spent on a job the
+    domain check hides or holds, one the person set aside, or one with no URL; the counts say what was left out.
+    Commits. Nothing is fetched here: the recovery worker does it, one visit at a time for listed hosts."""
+    from app.services import domain_match, ranker
+
+    limit = max(1, limit or get_settings().jd_fetch_enqueue_batch_size)
+    now = now or utcnow()
+    counts = {"queued": 0, "already_queued": 0, "hidden_by_domain": 0, "held_for_review": 0, "set_aside": 0,
+              "no_url": 0, "over_limit": 0}
+    jobs = db.scalars(select(Job).where(func.trim(func.coalesce(Job.description, "")) == "")
+                      .order_by(Job.id.desc())).all()
+    for job in jobs:
+        if job.domain_match == domain_match.NOT_MATCHING:
+            counts["hidden_by_domain"] += 1
+        elif job.domain_match in domain_match.HELD:
+            counts["held_for_review"] += 1
+        elif (job.status in ("archived", "dismissed") or (job.company or "").lower() in excluded_companies
+              or ranker.removed_by_user(db, job)):
+            counts["set_aside"] += 1
+        elif not (job.url or job.source_url or "").strip():
+            counts["no_url"] += 1
+        elif active_task(db, job.id) is not None:
+            counts["already_queued"] += 1
+        elif counts["queued"] >= limit:
+            counts["over_limit"] += 1
+        else:
+            try:
+                with db.begin_nested():
+                    enqueue(db, job, reason="user_request", force=True, now=now)
+                counts["queued"] += 1
+            except IntegrityError:  # queued by another request at the same moment
+                counts["already_queued"] += 1
+    db.commit()
+    return counts
+
+
 def waiting_reason(db: Session, job: Job) -> str | None:
     """Why ranking should wait for this job's recovery, or None to go ahead. Only while a task is queued or running;
     every task ends (lease recovery fails a task that used its last attempt), so the wait always ends."""
@@ -371,8 +422,9 @@ class Snapshot:
 
 @dataclass
 class Outcome:
-    status: str  # COMPLETED | FAILED | BLOCKED | SKIPPED | RETRY
+    status: str  # COMPLETED | FAILED | BLOCKED | SKIPPED | RETRY | HOLD
     code: str
+    held_seconds: int = 0  # HOLD: nothing was fetched, so the attempt is given back and the task waits this long
     text: str = ""
     method: str | None = None
     final_url: str | None = None
@@ -500,7 +552,94 @@ def _http_stage(snapshot: Snapshot) -> PageResult:
                       redirects=redirects, extractor=jd_extractors.extractor_for(current))
 
 
-async def _browser_stage(snapshot: Snapshot, browser: Any, start_url: str) -> PageResult:
+def _visible_host(url: str | None) -> str | None:
+    """The PLAYWRIGHT_VISIBLE_HOSTS entry this URL belongs to (the host or a subdomain of it), if any."""
+    host = (urlparse(url or "").hostname or "").lower()
+    for entry in get_settings().playwright_visible_hosts.split(","):
+        entry = entry.strip().lower()
+        if entry and host and (host == entry or host.endswith(f".{entry}")):
+            return entry
+    return None
+
+
+def _visible_provider(host: str) -> str:
+    return f"WEB:{host}"  # a cooldown of its own: other sites and external calls are not held up
+
+
+_visible_gate: tuple[asyncio.AbstractEventLoop, asyncio.Lock] | None = None
+_visible_last: float | None = None
+
+
+def _gate() -> asyncio.Lock:
+    """One visit to a listed host at a time, runner and window together. A lock belongs to its event loop."""
+    global _visible_gate
+    loop = asyncio.get_running_loop()
+    if _visible_gate is None or _visible_gate[0] is not loop:
+        _visible_gate = (loop, asyncio.Lock())
+    return _visible_gate[1]
+
+
+async def _visible_turn() -> None:
+    """Wait out PLAYWRIGHT_VISIBLE_MIN_INTERVAL_SECONDS since the last visit, whichever browser made it."""
+    if _visible_last is not None:
+        remaining = get_settings().playwright_visible_min_interval_seconds - (time.monotonic() - _visible_last)
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+
+
+def _runner_failed(result: PageResult) -> bool:
+    """The runner did not get to read the page, or found nothing on it. A page that answered is never asked again in
+    another browser: a refusal, a challenge or a login wall stays what it is, and a removed posting is removed."""
+    return result.kind in ("unavailable", "empty") or (result.kind == "transient" and result.code != "RATE_LIMITED")
+
+
+async def _runner_stage(snapshot: Snapshot, start_url: str) -> PageResult:
+    from app.infrastructure.application_browser import browser_use_sidecar as sidecar
+
+    try:
+        with tracing.trace(job_id=snapshot.job_id, user_id=snapshot.user_id):
+            page = await sidecar.read_page(start_url, user_id=snapshot.user_id, job_id=snapshot.job_id,
+                                           allow_private=get_settings().jd_fetch_allow_private_hosts)
+    except sidecar.SidecarUnavailable as exc:
+        return PageResult("unavailable", "RUNNER_UNAVAILABLE", detail=str(exc)[:300])
+    except sidecar.SidecarRefused as exc:
+        return PageResult("transient", "BROWSER_ERROR", detail=f"runner: {exc.code}")
+    return await asyncio.to_thread(
+        _read_page, snapshot, page.html, status=page.status, final_url=page.final_url, title_hint=page.title,
+        method=PLAYWRIGHT, redirects=0, extractor=jd_extractors.extractor_for(page.final_url))
+
+
+async def _visible_read(snapshot: Snapshot, browser: Any, start_url: str) -> tuple[PageResult, dict[str, Any]]:
+    """A listed host: the browser-use runner, then Playwright's visible window only if the runner failed and
+    PLAYWRIGHT_VISIBLE_WINDOW_FALLBACK allows it. Never the headless browser. One at a time and spaced apart, so a
+    fallback is not a second visit straight after the first. Returns the result and what each one did."""
+    from app.infrastructure.application_browser import browser_use_sidecar as sidecar
+
+    global _visible_last
+    notes: dict[str, Any] = {"visible": True, "backend": "browser_use_runner"}
+    window = (get_settings().playwright_visible_window_fallback and browser is not None
+              and browser.is_available())
+    async with _gate():
+        result = PageResult("unavailable", "RUNNER_UNAVAILABLE", detail="The browser-use runner is not configured")
+        if sidecar.configured():
+            await _visible_turn()
+            try:
+                result = await _runner_stage(snapshot, start_url)
+            finally:
+                _visible_last = time.monotonic()
+        notes["runner"] = _stage_note(result)
+        if not window or not _runner_failed(result):
+            return result, notes
+        await _visible_turn()
+        try:
+            rendered = await _browser_stage(snapshot, browser, start_url, visible=True)
+        finally:
+            _visible_last = time.monotonic()
+        notes["backend"] = "visible_window"
+        return rendered, notes
+
+
+async def _browser_stage(snapshot: Snapshot, browser: Any, start_url: str, *, visible: bool = False) -> PageResult:
     from app.infrastructure.browser.service import (
         BLOCKED_URL,
         REDIRECT_LOOP,
@@ -514,7 +653,7 @@ async def _browser_stage(snapshot: Snapshot, browser: Any, start_url: str) -> Pa
     try:
         with tracing.trace(job_id=snapshot.job_id, user_id=snapshot.user_id):
             page = await browser.fetch_rendered_page(start_url, wait_for=extractor.selectors, metadata={
-                "worker": WORKER, "extractor": extractor.name, "attempt": snapshot.attempt})
+                "worker": WORKER, "extractor": extractor.name, "attempt": snapshot.attempt}, visible=visible)
     except BrowserUnavailable as exc:
         return PageResult("unavailable", "PLAYWRIGHT_UNAVAILABLE", detail=f"{exc.code}: {exc}")
     except NavigationFailed as exc:
@@ -573,6 +712,28 @@ def _stage_note(result: PageResult) -> dict[str, Any]:
             "detail": (result.detail or "")[:200] or None}
 
 
+def read_route(diagnostics: dict[str, Any] | None) -> dict[str, str | None] | None:
+    """Which route a task's latest attempt ended on and, when an earlier one came first, which and why it moved on. Read
+    only from what that attempt recorded, as short labels: None when it recorded no read at all."""
+    attempts = [(int(key[8:]), value) for key, value in (diagnostics or {}).items()
+                if key.startswith("attempt_") and key[8:].isdigit() and isinstance(value, dict)]
+    if not attempts:
+        return None
+    latest = max(attempts, key=lambda attempt: attempt[0])[1]
+    http, browser = latest.get("http") or {}, latest.get("playwright") or {}
+    if browser.get("attempted"):
+        backend, runner = browser.get("backend"), browser.get("runner")
+        if backend == "visible_window" and runner:
+            came_from, code = "browser-use runner", runner.get("code")
+        else:
+            came_from, code = "HTTP", http.get("code")
+        label = {"browser_use_runner": "browser-use runner", "visible_window": "Visible window"}.get(
+            backend, "Headless browser")
+        return {"label": label, "from": came_from if came_from == "browser-use runner" or http else None,
+                "reason": message_for(code) or None}
+    return {"label": "HTTP", "from": None, "reason": None} if http else None
+
+
 def should_try_browser_after_http(result: PageResult) -> bool:
     """Central policy for a single ordinary browser attempt after HTTP.
 
@@ -619,6 +780,16 @@ async def recover(sessions: Callable[[], Session], snapshot: Snapshot, *, browse
         outcome.status, outcome.code, outcome.detail = SKIPPED, "INVALID_URL", str(exc)
         return outcome
 
+    visible_host = _visible_host(snapshot.url) if snapshot.use_browser else None
+    if visible_host and not backoff.bypassing():  # a person's Run now goes ahead; a new refusal pauses the host again
+        until = await asyncio.to_thread(backoff.cooling_until, snapshot.user_id, _visible_provider(visible_host))
+        if until is not None:
+            outcome.status, outcome.code = "HOLD", "RATE_LIMITED"
+            outcome.held_seconds = max(1, round((until - utcnow()).total_seconds()))
+            outcome.detail = f"{visible_host} refused a recent visit, so visits are paused until {until:%H:%M} UTC"
+            outcome.diagnostics["playwright"] = {"attempted": False, "kind": "skipped", "reason": outcome.detail}
+            return outcome
+
     http = await asyncio.to_thread(_http_stage, snapshot)
     outcome.diagnostics["http"] = _stage_note(http)
     outcome.final_url, outcome.http_status, outcome.redirect_count = http.final_url, http.status, http.redirect_count
@@ -639,15 +810,23 @@ async def recover(sessions: Callable[[], Session], snapshot: Snapshot, *, browse
         outcome.diagnostics["playwright"] = {"attempted": False, "kind": "skipped",
                                              "reason": "The browser fallback is turned off for your account"}
     elif best is None and try_browser:
-        if browser is None or not browser.is_available():
+        if (browser is None or not browser.is_available()) and not visible_host:
             outcome.diagnostics["playwright"] = {"attempted": False, "kind": "unavailable",
                                                  "code": "PLAYWRIGHT_UNAVAILABLE",
                                                  "detail": (browser.diagnostics().get("reason")
                                                             if browser is not None else "no browser service")}
         else:
             outcome.playwright_used = True
-            rendered = await _browser_stage(snapshot, browser, http.final_url or snapshot.url)
-            outcome.diagnostics["playwright"] = {"attempted": True, **_stage_note(rendered)}
+            start_url = http.final_url or snapshot.url
+            rendered, notes = (await _visible_read(snapshot, browser, start_url) if visible_host
+                               else (await _browser_stage(snapshot, browser, start_url), {}))
+            outcome.diagnostics["playwright"] = {"attempted": True, **_stage_note(rendered), **notes}
+            if visible_host:
+                if rendered.code in VISIBLE_REFUSALS:
+                    await asyncio.to_thread(backoff.record_limit, snapshot.user_id, _visible_provider(visible_host),
+                                            policy=VISIBLE_REST)
+                elif rendered.kind == "found":
+                    await asyncio.to_thread(backoff.note_success, snapshot.user_id, _visible_provider(visible_host))
             if rendered.kind == "found":
                 return _done(snapshot, rendered, PLAYWRIGHT, outcome)
             if rendered.kind in ("removed", "blocked", "permanent"):
@@ -748,6 +927,10 @@ def _settle(sessions: Callable[[], Session], claim_: FetchClaim, snapshot: Snaps
                 label = "skipped"
             else:
                 label = apply_recovered(db, job, task, outcome, now)
+        elif outcome.status == "HOLD":  # nothing was fetched: the attempt is given back and the task waits
+            task.attempt_count = max(0, task.attempt_count - 1)
+            _release(task, now, outcome.code, retry_in=outcome.held_seconds, detail=outcome.detail)
+            label = "retrying"
         elif outcome.status == "RETRY" and task.attempt_count < (own := worker_settings.for_user(
                 db, task.user_id, "recovery"))["max_attempts"]:
             _release(task, now, outcome.code, detail=message_for(outcome.code), retry_seconds=own["retry_seconds"])

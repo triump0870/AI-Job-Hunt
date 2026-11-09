@@ -37,6 +37,7 @@ from app.services.ats_forms import generic
 from tests import application_support as aps
 from tests import guarded_support as gs
 from tests import qualification_support as qs
+from tests.jd_support import PostingServer
 
 RUNNER = Path(__file__).resolve().parents[1] / "sidecars/browser_use_runner/runner.py"
 PYTHON = os.environ.get("BROWSER_USE_PYTHON") or "/Users/rohanroy/miniconda3/envs/web/bin/python"
@@ -63,6 +64,59 @@ def test_the_runner_is_browser_use_0_1_48_and_gets_no_secrets(runner, monkeypatc
                                        "PYTHONNOUSERSITE", "PLAYWRIGHT_BROWSERS_PATH"}
     info = asyncio.run(bus.health())
     assert info["compatible"] and info["browser_use"] == "0.1.48" and info["protocol"] == 1
+
+
+def test_a_page_read_returns_the_rendered_page_and_sends_nothing(runner):
+    body = ("<html><head><title>Posting</title></head><body><main>The role</main><script>"
+            "fetch('/custom/beacon', {method: 'POST', body: 'x'});"
+            "document.querySelector('main').textContent = 'Rendered by the page';</script></body></html>")
+    with PostingServer() as server:
+        server.routes["posting"] = (200, body, {})
+        server.routes["beacon"] = (200, "ok", {})
+        page = asyncio.run(bus.read_page(server.url("custom/posting"), user_id=1, job_id=5, allow_private=True,
+                                         headless=True))
+    assert page.status == 200 and page.title == "Posting" and "Rendered by the page" in page.html
+    assert page.final_url == server.url("custom/posting")
+
+
+def test_a_page_read_reports_a_refusal_as_the_site_gave_it(runner):
+    with PostingServer() as server:
+        page = asyncio.run(bus.read_page(server.url("forbidden"), user_id=1, job_id=5, allow_private=True,
+                                         headless=True))
+    assert page.status == 403
+
+
+def test_a_page_that_redirects_to_another_host_is_not_used(runner):
+    with PostingServer() as server, PostingServer() as other:
+        other.routes["page"] = (200, "<html><title>Another site</title><body>Not the posting</body></html>", {})
+        server.routes["away"] = (302, "", {"Location": f"http://localhost:{other.httpd.server_port}/custom/page"})
+        with pytest.raises(bus.SidecarRefused) as refused:
+            asyncio.run(bus.read_page(server.url("custom/away"), user_id=1, job_id=5, allow_private=True,
+                                      headless=True))
+    assert refused.value.code == "URL_NOT_ALLOWED"
+
+
+def test_a_page_read_leaves_an_application_session_alone(runner, tmp_path):
+    """A page read is outside the manager: a run's window under the same account and number stays open."""
+    from app.services import application_execution
+
+    manager = bus.get_sidecars()
+    with PostingServer() as server, application_execution.background_loop() as loop:
+        server.routes["posting"] = (200, "<html><body><main>The role</main></body></html>", {})
+        run = application_execution.loop_runner(loop, timeout=90)
+        session = run(manager.start(user_id=1, task_id=0, job_id=5, allowed_hosts=["127.0.0.1"],
+                                    upload_dir=str(tmp_path), allow_private=True))
+        try:
+            run(bus.read_page(server.url("custom/posting"), user_id=1, job_id=5, allow_private=True, headless=True))
+            assert session.alive and manager.get(1, 0) is session
+        finally:
+            run(manager.close(1, 0))
+
+
+def test_a_page_read_is_refused_when_the_backend_is_off(runner, monkeypatch):
+    monkeypatch.setattr(aps.get_settings(), "browser_use_webui_enabled", False)
+    with pytest.raises(bus.SidecarUnavailable):
+        asyncio.run(bus.read_page("https://example.com/", user_id=1, job_id=5))
 
 
 def test_the_runner_reads_fills_and_refuses_everything_it_must(runner, tmp_path):

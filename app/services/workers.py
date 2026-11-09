@@ -501,6 +501,8 @@ def rows(db: Session, user_id: int, kind: str, now: datetime | None = None, *, q
     out.sort(key=lambda r: (order.get(r["status"], 3), not r["run_now"],
                             r["next_attempt_at"] or "", -(r["task_id"]) if r["status"] not in order else r["task_id"]))
     attach_models(db, user_id, spec, out[:ROW_LIMIT])
+    if spec.kind == "recovery":
+        _attach_read_routes(db, user_id, out[:ROW_LIMIT])
     return {"rows": out[:ROW_LIMIT], "total": len(out), "truncated": len(out) > ROW_LIMIT or len(tasks) >= SCAN_LIMIT,
             "status_counts": counts, "filters": {"q": text, "status": status or "all"},
             "cleared_at": _iso(since), "cleared_hidden": _hidden(db, spec, user_id, since, now)}
@@ -835,6 +837,34 @@ def attach_models(db: Session, user_id: int, spec: WorkerKind | str, rows_: list
         import logging
 
         logging.getLogger("jobhunt.workers").warning("could not read task models", exc_info=True)
+
+
+def _attach_read_routes(db: Session, user_id: int, rows_: list[dict[str, Any]]) -> None:
+    """A finished recovery task may use no model at all, so its row also says what read the page (`read_route`), and a
+    move from one route to the next is its change, unless a model's own change is already there. Only what the task
+    recorded counts. Bounded (one query), labels only, and it never raises."""
+    finished = {r["task_id"]: r for r in rows_ if r.get("status") not in STATUS_FILTERS["active"]}
+    if not finished:
+        return
+    try:
+        from app.models import JobDescriptionFetchTask
+        from app.services.jd_recovery import read_route
+
+        for task_id, diagnostics in db.execute(select(JobDescriptionFetchTask.id, JobDescriptionFetchTask.diagnostics)
+                                               .where(JobDescriptionFetchTask.user_id == user_id,
+                                                      JobDescriptionFetchTask.id.in_(finished))).all():
+            route = read_route(diagnostics)
+            if route is None:
+                continue
+            r = finished[task_id]
+            r["read_route"] = route["label"]
+            if route["from"] and not r.get("model_change"):
+                r["model_change"] = {"kind": "ROUTE", "from": route["from"], "to": route["label"],
+                                     "reason": route["reason"]}
+    except Exception:
+        import logging
+
+        logging.getLogger("jobhunt.workers").warning("could not read recovery routes", exc_info=True)
 
 
 def _worker_label(worker_type: str | None) -> str | None:
