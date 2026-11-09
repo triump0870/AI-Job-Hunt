@@ -1390,7 +1390,7 @@ function renderTailorSingle(queue) {
       <span class="small muted">${r.edits.length} edits · ${accepted} accepted</span></div>${body}</section>
     <div class="c-side col gap14">
       <section class="card pad18"><div class="row gap8 mb12">${pill('AI', 'brand')}<span class="card-title sm">Reviewer notes</span><span class="mono bb base" style="margin-left:auto;color:var(--good)">${fitTxt(r.reviewer_score)} / 100</span></div>
-        <div class="col gap10">${unreviewed ? `<div class="small muted">${reviewing ? 'The reviewer is checking this packet on the server. You can leave this page.' : 'This packet has not been reviewed: its review never ran or failed. Send it to review to score it without tailoring it again.'}</div>${reviewButton ? `<div>${reviewButton}</div>` : ''}` : r.review.length ? r.review.map(n => `<div class="row top-align gap10"><span class="note-dot" style="background:${{ good: '#0f9c86', warn: '#e0a136', bad: '#c22f4e' }[n.tone]}"></span><div class="small ink2 pretty" style="line-height:1.55">${esc(n.text)}</div></div>`).join('') : '<div class="small muted">The reviewer left no notes.</div>'}</div>
+        <div class="col gap10">${unreviewed ? `<div class="small muted">${reviewing ? 'The reviewer is checking this packet on the server. You can leave this page.' : 'This packet has not been reviewed: its review never ran or failed. Send it to review to score it without tailoring it again.'}</div>${reviewButton ? `<div>${reviewButton}</div>` : ''}` : r.review.length ? r.review.map(reviewNoteRow).join('') : '<div class="small muted">The reviewer left no notes.</div>'}</div>
         <div class="xs faint mt12" style="padding-top:12px;border-top:1px solid var(--line2)">${esc(threshold)}</div></section>
       <section class="card pad18"><div class="card-title sm mb12">Keyword coverage</div><div class="row wrap gap6">${r.keywords.length ? r.keywords.map(k => `<span class="kw ${k.status}" title="${k.status}">${esc(k.word)}</span>`).join('') : '<span class="small muted">No keywords yet: they come from the parsed job description (Job description → Structured).</span>'}</div>${r.missing_supported?.length ? `<div class="small muted mt8">Your verified facts support these, but the resume doesn't use them yet: ${esc(r.missing_supported.join(', '))}</div>` : ''}</section>
       <section class="card pad18"><div class="card-title sm mb10">Exports</div><div class="col gap8">
@@ -1401,6 +1401,24 @@ function renderTailorSingle(queue) {
 }
 
 /* ───────────── approvals ───────────── */
+const reviewNoteRow = n => `<div class="row top-align gap10"><span class="note-dot" style="background:${{ good: '#0f9c86', warn: '#e0a136', bad: '#c22f4e' }[n.tone]}"></span><div class="small ink2 pretty" style="line-height:1.55">${esc(n.text)}</div></div>`;
+// What the reviewer said about this packet, so it can be judged without going back to Tailor. Concerns come first
+// (blocking reasons ahead of gaps): they are what an approval has to weigh.
+function renderApprovalReview(job, r, minScore) {
+  const unreviewed = r.reviewer_score == null;
+  const notes = r.review || [];
+  const concerns = [...notes.filter(n => n.tone === 'bad'), ...notes.filter(n => n.tone === 'warn')];
+  const strengths = notes.filter(n => n.tone === 'good');
+  const group = (title, items) => items.length ? `<div><div class="caps-sm mb8">${title} · ${items.length}</div><div class="col gap10">${items.map(reviewNoteRow).join('')}</div></div>` : '';
+  const body = unreviewed
+    ? `<div class="small muted">This packet has not been reviewed, so there are no notes yet. <a href="#" data-act="go" data-screen="tailor" data-job="${job.id}">Send it to review in Tailor</a>.</div>`
+    : notes.length
+      ? `<div class="grid-auto" style="grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:18px">${group('TO WEIGH BEFORE APPROVING', concerns)}${group('WHAT HOLDS UP', strengths)}</div>`
+      : '<div class="small muted">The reviewer left no notes.</div>';
+  return `<div id="approval-review" style="padding:18px 22px;border-bottom:1px solid var(--line2)">
+    <div class="row gap8 mb12">${pill('AI', 'brand')}<span class="base b">Reviewer notes</span>${unreviewed ? '' : `<span class="mono bb base" style="margin-left:auto;color:${r.reviewer_score >= minScore ? 'var(--good)' : 'var(--bad)'}">${fitTxt(r.reviewer_score)} / 100</span>`}</div>
+    ${body}</div>`;
+}
 function renderApprovals() {
   const list = D.approvals; if (!list) return loading();
   if (!D.approvalFacets.total_all) return renderApprovalsBody(list);
@@ -1431,6 +1449,7 @@ function renderApprovalsBody(list) {
     ${renderInsightsCard(job.id)}
     ${r ? `<div style="padding:18px 22px;border-bottom:1px solid var(--line2)"><div class="base b mb12">Pre-submit checklist</div>
       <div class="grid-auto" style="grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px">${a.checklist.map(c => `<div class="check-item ${c.state}"><span class="mark">${c.state === 'ok' ? '✓' : '!'}</span><div><div class="small b lbl">${esc(c.label)}</div><div class="xs muted mt4">${esc(c.detail)}</div></div></div>`).join('')}</div></div>
+    ${renderApprovalReview(job, r, a.min_review_score)}
     <div class="grid-auto" style="grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:0">
       <div style="padding:18px 22px;border-right:1px solid var(--line2)"><div class="row between mb10"><div class="base b">Tailored resume</div><a class="small" href="#" data-act="go" data-screen="tailor" data-job="${job.id}">Edit in Tailor</a></div><div class="doc clip">${miniMarkdown(r.markdown)}</div></div>
       <div style="padding:18px 22px"><div class="base b mb10">ATS answers to reuse</div>
