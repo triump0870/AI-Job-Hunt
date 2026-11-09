@@ -50,6 +50,11 @@ def snapshot(**workers):
     ("managed-lan", "ollama_chat", "m", {"api_base": "http://192.168.1.20:11434"}, "LOCAL"),
     ("managed-away", "ollama_chat", "m", {"api_base": "https://ollama.example.com"}, "CLOUD"),
     ("managed-relay", "ollama_chat", "m:cloud", {"api_base": "http://localhost:11434"}, "CLOUD"),  # local daemon relays it
+    ("local-cloud", "ollama_chat", "qwen2.5:14b", {"api_base": "http://localhost:11434"}, "LOCAL"),  # only the alias says cloud
+    ("my-cloud", "ollama", "qwen2.5:14b", None, "LOCAL"),
+    ("studio", "lm_studio", "m-cloud", None, "LOCAL"),  # Ollama's naming says nothing about another engine
+    ("broken", "ollama_chat", "m", {"api_base": "http://[::1"}, None),  # unreadable: unknown, and it must not raise
+    ("hostless", "ollama_chat", "m", {"api_base": "http://"}, None),
 ])
 def test_model_hosting_says_where_a_model_runs(name, provider, underlying, params, expected):
     row = AIModel(litellm_model_name=name, provider=provider, underlying_model=underlying, model_type="CUSTOM",
@@ -78,6 +83,9 @@ def _hosted(name, provider, **fields):
     (["local-a", "cloud-a", "unknown"], "MIXED"),  # both kinds are known to be in there, whatever the other one is
     (["cloud-a", "unknown"], None),  # could still turn out mixed: not called all-cloud
     (["cloud-a", "not-in-the-catalog"], None),
+    (["cloud-a", "groq/not-listed"], "CLOUD"),  # no catalog row, but the name states its provider
+    (["local-a", "groq/not-listed"], "MIXED"),
+    (["local-a", "ollama_chat/not-listed"], "LOCAL"),
     (None, None),  # not synced since the column arrived
 ])
 def test_a_router_is_judged_by_the_models_it_routes_to(members, expected):
@@ -92,6 +100,26 @@ def test_a_removed_model_still_counts_for_the_router_that_routes_to_it():
     rows = [_hosted("gone", "groq", removed_at=config.utcnow()),
             AIModel(litellm_model_name="R", provider="litellm", model_type="AUTO_ROUTER", router_models=["gone"])]
     assert config.catalog_hosting(rows)["R"] == "CLOUD"
+
+
+def test_a_cloud_classifier_makes_a_router_of_local_models_mixed(account, litellm):
+    litellm.deployments += [
+        deployment("Classified", "auto_router/complexity_router", complexity_router_config={
+            "tiers": {"SIMPLE": ["plain:20b"]}, "classifier_llm_config": {"model": "groq/judge"}}),
+        deployment("plain:20b", "plain:20b", custom_llm_provider="ollama_chat"),
+        deployment("groq/judge", "groq/judge")]
+    account.call("POST", "/models/sync")
+    assert {m["name"]: m for m in account.get("/models")["models"]}["Classified"]["hosting"] == "MIXED"
+
+
+def test_an_unreadable_api_base_does_not_break_the_configuration_page(account):
+    account.call("POST", "/models/sync")
+    with SessionLocal() as db:
+        db.add(AIModel(user_id=account.user_id, litellm_model_name="broken", display_name="broken", managed=True,
+                       provider="ollama_chat", underlying_model="m", model_type="CUSTOM", source="USER",
+                       deployment_params={"model": "ollama_chat/m", "api_base": "http://[::1"}))
+        db.commit()
+    assert {m["name"]: m for m in account.get("/models")["models"]}["broken"]["hosting"] is None
 
 
 def test_sync_records_router_members_and_the_provider_a_deployment_states(account, litellm):

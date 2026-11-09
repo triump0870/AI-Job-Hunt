@@ -446,15 +446,21 @@ SELF_HOSTABLE_ROUTES = frozenset({"openai_like", "custom_openai", "hosted_vllm"}
 _OLLAMA_CLOUD_NAME = re.compile(r"[:-]cloud(?:$|-)", re.IGNORECASE)
 
 
-def _is_local_host(api_base: str) -> bool:
-    host = (urlsplit(api_base if "//" in api_base else f"//{api_base}").hostname or "").lower()
+def _api_base_hosting(api_base: str) -> str | None:
+    """LOCAL or CLOUD from a deployment's address; None when it cannot be read, since this label must never raise."""
+    try:
+        host = (urlsplit(api_base if "//" in api_base else f"//{api_base}").hostname or "").lower()
+    except ValueError:
+        return None
+    if not host:
+        return None
     if host == "localhost" or host.endswith((".localhost", ".local")) or host == "host.docker.internal":
-        return True
+        return "LOCAL"
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
-        return False
-    return address.is_loopback or address.is_private
+        return "CLOUD"
+    return "LOCAL" if address.is_loopback or address.is_private else "CLOUD"
 
 
 def model_hosting(row: AIModel) -> str | None:
@@ -466,20 +472,28 @@ def model_hosting(row: AIModel) -> str | None:
     provider = (row.provider or "").lower()
     if provider == "litellm" or row.model_type == "AUTO_ROUTER":
         return None
-    names = (row.underlying_model or "", row.litellm_model_name or "")
-    if any(_OLLAMA_CLOUD_NAME.search(name) for name in names):
+    # The real model name, never the alias: a person can call any model "local-cloud". The suffix is Ollama's naming,
+    # so it says nothing about another engine, but it does settle a model whose provider nobody reported.
+    if (not provider or provider.startswith("ollama")) and _OLLAMA_CLOUD_NAME.search(row.underlying_model or ""):
         return "CLOUD"
     api_base = str((row.deployment_params or {}).get("api_base") or "") if row.managed else ""
     if api_base:
-        return "LOCAL" if _is_local_host(api_base) else "CLOUD"
+        return _api_base_hosting(api_base)
     if not provider or provider in SELF_HOSTABLE_ROUTES:
         return None
     return "LOCAL" if provider in LOCAL_ENGINES else "CLOUD"
 
 
+def _unlisted_hosting(name: str) -> str | None:
+    """A router member with no catalog row, such as a classifier: "groq/x" names its provider, a bare name does not."""
+    provider, _, underlying = name.partition("/") if "/" in name else ("", "", name)
+    return model_hosting(AIModel(litellm_model_name=name, provider=provider or None, underlying_model=underlying,
+                                 model_type="CUSTOM", managed=False))
+
+
 def _router_hosting(members: list[str], known: dict[str, str | None]) -> str | None:
     """LOCAL or CLOUD only when every member is known to be; MIXED as soon as both kinds are known to be in there."""
-    kinds = {known.get(name) for name in members}
+    kinds = {known[name] if name in known else _unlisted_hosting(name) for name in members}
     if {"LOCAL", "CLOUD"} <= kinds:
         return "MIXED"
     return next(iter(kinds)) if len(kinds) == 1 else None

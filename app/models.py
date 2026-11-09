@@ -2347,7 +2347,8 @@ class AIModel(Base):
     # EMBEDDING models only: the length of the vectors it returns (LiteLLM model_info.output_vector_size, or measured
     # by an explicit model test). NULL = unknown, and an embedding model of unknown size cannot be applied.
     embedding_dimensions: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # Auto routers only: the models LiteLLM says it routes to. Discovered, not configuration. NULL = unknown.
+    # Auto routers only: the models LiteLLM says it sends requests to, its LLM classifier included. Discovered, not
+    # configuration. NULL = unknown.
     router_models: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     overrides: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     # Failover for every worker that uses this model (app.services.failover): the models tried, in order, when it is

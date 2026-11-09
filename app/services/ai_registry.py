@@ -56,9 +56,13 @@ def describe(deployments: list[dict[str, Any]], ollama: dict[str, dict[str, dict
 
 
 def _router_members(params: dict[str, Any]) -> list[str] | None:
-    """Every model an auto router deployment can send a request to, sorted so a re-sync compares equal."""
+    """Every model an auto router deployment can send a request to, sorted so a re-sync compares equal.
+
+    That includes an LLM classifier: it reads each request in order to choose a tier, so it counts for where they go.
+    """
     router = params.get("complexity_router_config") or {}
-    members = {params.get("complexity_router_default_model"), router.get("default_model")}
+    members = {params.get("complexity_router_default_model"), router.get("default_model"),
+               (router.get("classifier_llm_config") or {}).get("model")}
     for target in (router.get("tiers") or {}).values():
         members.update(target if isinstance(target, list) else [target])
     return sorted(str(m) for m in members if m) or None
