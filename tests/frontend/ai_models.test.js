@@ -368,6 +368,28 @@ describe('AI Orchestration → Models & routing', () => {
     expect(document.getElementById('toast').textContent).toContain('now v5');
     expect(ui.AIM.failed).toBeNull();
   });
+  it('tags each model Local or Cloud on its card, in the pickers and in the backup chain, and leaves unknown untagged', async () => {
+    const models = [model('local-fast', { hosting: 'LOCAL' }), model('beam:cloud', { hosting: 'CLOUD' }), model('Groq', { provider: 'litellm', hosting: null })];
+    routes['GET /api/settings/ai'] = () => ({ ...overview(), models, workers: [worker('RANKER', 'Ranker', { mode: 'FIXED', primary_model: 'beam:cloud', fallback_model: 'local-fast', secondary_models: ['Groq'] }, 'beam:cloud')] });
+    await open();
+    const ranker = document.querySelector('select[data-worker="RANKER"]');
+    const labels = [...ranker.querySelectorAll('optgroup[label="Models"] option')].map(o => o.textContent);
+    expect(labels).toEqual(['local-fast · Local', 'beam:cloud · Cloud', 'Groq']);
+    expect(ranker.value).toBe('model:beam:cloud');  // the label changed, the value saved did not
+    const chain = [...ranker.closest('tr').querySelectorAll('.aim-chain li')];
+    expect(chain.map(li => li.querySelector('.aim-host')?.textContent ?? null)).toEqual(['Local', null]);
+    await open('models');
+    const tag = name => document.querySelector(`.aim-mcard[data-model="${name}"] .aim-mcard-tags .aim-host`);
+    expect(tag('local-fast').textContent).toBe('Local'); expect(tag('local-fast').classList.contains('local')).toBe(true);
+    expect(tag('beam:cloud').textContent).toBe('Cloud'); expect(tag('beam:cloud').classList.contains('cloud')).toBe(true);
+    expect(tag('Groq')).toBeNull();
+  });
+  it('tags a router with both kinds behind it as Local + Cloud', async () => {
+    routes['GET /api/settings/ai'] = () => ({ ...overview(), models: [model('Ollama Ro', { provider: 'litellm', hosting: 'MIXED' })] });
+    await open('models');
+    const tag = document.querySelector('.aim-mcard[data-model="Ollama Ro"] .aim-host');
+    expect(tag.textContent).toBe('Local + Cloud'); expect(tag.classList.contains('mixed')).toBe(true);
+  });
   it('shows each model as a card: monogram, health, stats and the first workers that use it', async () => {
     routes['GET /api/settings/ai'] = () => ({ ...overview(), models: [model('local-reasoning', { health_status: 'HEALTHY', health_latency_ms: 90, used_by: ['RANKER', 'REVIEWER', 'INBOX_CLASSIFIER', 'TAILOR'] }), model('ollama_chat/qwen2.5', { enabled: false })] });
     await open('models');

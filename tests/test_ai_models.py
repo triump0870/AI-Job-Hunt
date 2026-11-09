@@ -8,7 +8,13 @@ from sqlalchemy import select
 
 from app.db import SessionLocal
 from app.main import app
-from app.models import AIConfigAuditEntry, AIConfigVersion, LiteLLMConnection, WorkerModelConfig
+from app.models import (
+    AIConfigAuditEntry,
+    AIConfigVersion,
+    AIModel,
+    LiteLLMConnection,
+    WorkerModelConfig,
+)
 from app.services import ai_model_config as config
 from app.services import model_resolution
 from app.services.ai_workers import WORKERS
@@ -25,6 +31,81 @@ def snapshot(**workers):
             "routing": {"auto_router_enabled": True, "auto_router_model_name": "auto", "classifier": "HEURISTIC",
                         "tier_models": {"SIMPLE": "fast"}},
             "workers": workers}
+
+
+# ───────────── hosting: the Local / Cloud tag ─────────────
+@pytest.mark.parametrize(("name", "provider", "underlying", "params", "expected"), [
+    ("ollama_chat/qwen2.5:14b", "ollama_chat", "qwen2.5:14b", None, "LOCAL"),
+    ("phi4:latest", "ollama", "phi4:latest", None, "LOCAL"),
+    ("beam:cloud", "ollama", "beam:cloud", None, "CLOUD"),  # Ollama's provider, but it runs on Ollama's servers
+    ("nemotron-3-nano:30b-cloud-Ro", "ollama", "nemotron-3-nano:30b-cloud", None, "CLOUD"),  # an alias of a hosted model
+    ("gpt-oss:20b-cloud", None, "gpt-oss:20b-cloud", None, "CLOUD"),
+    ("groq/openai/gpt-oss-120b", "groq", "openai/gpt-oss-120b", None, "CLOUD"),
+    ("poolside/laguna-s-2.1:free", "poolside", "laguna-s-2.1:free", None, "CLOUD"),
+    ("cloudy-local", "ollama", "cloudy:7b", None, "LOCAL"),  # "cloud" in a name is not the hosted-model suffix
+    ("Groq", "litellm", "complexity_router", None, None),  # a router's tiers can mix both
+    ("gpt-oss:20b", None, "gpt-oss:20b", None, None),  # nobody reported a provider: unknown, not guessed
+    ("vllm-box", "hosted_vllm", "m", None, None),  # could be anywhere
+    ("managed-here", "ollama_chat", "m", {"api_base": "http://localhost:11434"}, "LOCAL"),
+    ("managed-lan", "ollama_chat", "m", {"api_base": "http://192.168.1.20:11434"}, "LOCAL"),
+    ("managed-away", "ollama_chat", "m", {"api_base": "https://ollama.example.com"}, "CLOUD"),
+    ("managed-relay", "ollama_chat", "m:cloud", {"api_base": "http://localhost:11434"}, "CLOUD"),  # local daemon relays it
+])
+def test_model_hosting_says_where_a_model_runs(name, provider, underlying, params, expected):
+    row = AIModel(litellm_model_name=name, provider=provider, underlying_model=underlying, model_type="CUSTOM",
+                  managed=params is not None, deployment_params=params)
+    assert config.model_hosting(row) == expected
+
+
+def test_a_router_type_has_no_hosting_whatever_its_provider():
+    assert config.model_hosting(AIModel(litellm_model_name="r", provider="groq", model_type="AUTO_ROUTER")) is None
+
+
+def test_hosting_is_shown_but_is_not_part_of_the_versioned_snapshot():
+    row = AIModel(litellm_model_name="m", provider="ollama", underlying_model="m", model_type="CUSTOM", managed=False)
+    assert "hosting" not in config.model_snapshot(row)  # a derived label must never read as a pending config change
+
+
+def _hosted(name, provider, **fields):
+    return AIModel(litellm_model_name=name, provider=provider, underlying_model=name, model_type="CUSTOM", managed=False,
+                   **fields)
+
+
+@pytest.mark.parametrize(("members", "expected"), [
+    (["local-a", "local-b"], "LOCAL"),
+    (["cloud-a", "groq/b"], "CLOUD"),
+    (["local-a", "cloud-a"], "MIXED"),
+    (["local-a", "cloud-a", "unknown"], "MIXED"),  # both kinds are known to be in there, whatever the other one is
+    (["cloud-a", "unknown"], None),  # could still turn out mixed: not called all-cloud
+    (["cloud-a", "not-in-the-catalog"], None),
+    (None, None),  # not synced since the column arrived
+])
+def test_a_router_is_judged_by_the_models_it_routes_to(members, expected):
+    rows = [_hosted("local-a", "ollama"), _hosted("local-b", "ollama_chat"), _hosted("cloud-a:cloud", "ollama"),
+            _hosted("groq/b", "groq"), _hosted("unknown", None),
+            AIModel(litellm_model_name="R", provider="litellm", model_type="AUTO_ROUTER", managed=False,
+                    router_models=[{"cloud-a": "cloud-a:cloud"}.get(m, m) for m in members] if members else None)]
+    assert config.catalog_hosting(rows)["R"] == expected
+
+
+def test_a_removed_model_still_counts_for_the_router_that_routes_to_it():
+    rows = [_hosted("gone", "groq", removed_at=config.utcnow()),
+            AIModel(litellm_model_name="R", provider="litellm", model_type="AUTO_ROUTER", router_models=["gone"])]
+    assert config.catalog_hosting(rows)["R"] == "CLOUD"
+
+
+def test_sync_records_router_members_and_the_provider_a_deployment_states(account, litellm):
+    litellm.deployments += [
+        deployment("Mixed", "auto_router/complexity_router", complexity_router_default_model="plain:20b",
+                   complexity_router_config={"tiers": {"SIMPLE": ["plain:20b"], "COMPLEX": "hosted:cloud"}}),
+        deployment("plain:20b", "plain:20b", custom_llm_provider="ollama_chat"),
+        deployment("hosted:cloud", "hosted:cloud", custom_llm_provider="ollama_chat")]
+    account.call("POST", "/models/sync")
+    models = {m["name"]: m for m in account.get("/models")["models"]}
+    assert models["plain:20b"]["provider"] == "ollama_chat" and models["plain:20b"]["hosting"] == "LOCAL"
+    assert models["hosted:cloud"]["hosting"] == "CLOUD"
+    assert models["Mixed"]["hosting"] == "MIXED"
+    assert "router_models" not in models["Mixed"]  # read for the tag, not part of the versioned snapshot
 
 
 # ───────────── resolution: FIXED, TIER, AUTO_ROUTER ─────────────
