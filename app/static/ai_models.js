@@ -23,12 +23,17 @@ const aimModel = name => aimModels().find(m => m.name === name);
 const aimTokens = n => n == null ? 'unknown' : n >= 1000 ? `${Math.round(n / 1024 * 10) / 10}K`.replace('.0K', 'K') : String(n);
 const aimYes = v => v === true ? 'yes' : v === false ? 'no' : 'unknown';
 const aimOpt = (value, label, selected) => `<option value="${attr(value)}" ${String(value) === String(selected ?? '') ? 'selected' : ''}>${esc(label)}</option>`;
+// Where a model runs; MIXED is a router with both kinds behind it. The server leaves it empty when unknown, so no tag shows.
+const AIM_HOSTING = { LOCAL: 'Local', CLOUD: 'Cloud', MIXED: 'Local + Cloud' };
+const aimHosting = name => AIM_HOSTING[aimModel(name)?.hosting] || '';
+const aimHostName = name => aimHosting(name) ? `${name} · ${aimHosting(name)}` : name;  // options cannot hold a styled tag
+const aimHostTag = name => { const h = aimHosting(name); return h ? `<em class="aim-host ${aimModel(name).hosting.toLowerCase()}">${h}</em>` : ''; };
 // Chat pickers (tiers, backups, router) never offer an embedding model; the Embedder offers nothing else.
 const aimFits = (m, capability = 'CHAT') => capability === 'EMBEDDING' ? m.model_type === 'EMBEDDING' : m.model_type !== 'EMBEDDING';
 function aimModelOptions(selected, blank = 'Not set') {
   const names = aimModels().filter(m => m.enabled && aimFits(m)).map(m => m.name);
   if (selected && !names.includes(selected)) names.push(selected);
-  return aimOpt('', blank, selected) + names.map(n => aimOpt(n, n, selected)).join('');
+  return aimOpt('', blank, selected) + names.map(n => aimOpt(n, aimHostName(n), selected)).join('');
 }
 const aimPanel = (content, extra = '') => `<section class="card flush aim-panel ${extra}">${content}</section>`;
 
@@ -47,11 +52,11 @@ function aimTargetOptions(selected, capability = 'CHAT') {
   if (kind === 'model' && name && !models.includes(name)) models.push(name);
   if (embedding) return aimOpt('', 'Off (full-text retrieval only)', selected) + models.map(n => {
     const m = aimModel(n), size = m?.embedding_dimensions;
-    return aimOpt(`model:${n}`, `${n}${size ? ` · ${size} dims` : ' · size unknown'}`, selected);
+    return aimOpt(`model:${n}`, `${aimHostName(n)}${size ? ` · ${size} dims` : ' · size unknown'}`, selected);
   }).join('');
   return aimOpt('', 'Choose a model', selected)
-    + (tiers.length ? `<optgroup label="Tiers">${tiers.map(([t, x]) => aimOpt(`tier:${t}`, `${t}${x.model ? ` · ${x.model}` : ''}`, selected)).join('')}</optgroup>` : '')
-    + (models.length ? `<optgroup label="Models">${models.map(n => aimOpt(`model:${n}`, n, selected)).join('')}</optgroup>` : '')
+    + (tiers.length ? `<optgroup label="Tiers">${tiers.map(([t, x]) => aimOpt(`tier:${t}`, `${t}${x.model ? ` · ${aimHostName(x.model)}` : ''}`, selected)).join('')}</optgroup>` : '')
+    + (models.length ? `<optgroup label="Models">${models.map(n => aimOpt(`model:${n}`, aimHostName(n), selected)).join('')}</optgroup>` : '')
     + (router || selected === 'auto' ? `<optgroup label="Auto router">${aimOpt('auto', `Auto router${router ? ` · ${d.routing.auto_router_model_name}` : ' (off)'}`, selected)}</optgroup>` : '');
 }
 // `c` is null for a worker added after the account's configuration was seeded (no row yet; saving creates it).
@@ -198,7 +203,7 @@ function aimHealth(w) {
 // A backup chain in the order it is tried: 1 → 2 → 3, each in its model's own colour.
 function aimBackupChain(backups, none = 'No backup', noun = 'Backup') {
   if (!backups.length) return `<span class="aim-wk-none">${esc(none)}</span>`;
-  return `<ol class="aim-chain">${backups.map((b, i) => `<li style="--h:${aimHue(b)}" title="${attr(`${noun} ${i + 1}: ${b}`)}"><b>${i + 1}</b><span class="mono">${esc(b)}</span></li>`).join('')}</ol>`;
+  return `<ol class="aim-chain">${backups.map((b, i) => `<li style="--h:${aimHue(b)}" title="${attr(`${noun} ${i + 1}: ${aimHostName(b)}`)}"><b>${i + 1}</b><span class="mono">${esc(b)}</span>${aimHostTag(b)}</li>`).join('')}</ol>`;
 }
 function aimWorkers() {
   const d = aimData();
@@ -257,7 +262,7 @@ function aimSizeModels(g, backups) {
   const busy = isBusy('aim-size'), primary = g.output_cap && !g.output_cap.applied ? '' : 'primary';
   const row = (m, i) => {
     const use = `Use ${m.name} instead of ${g.model} for ${g.label}`;
-    const tags = [i === 0 ? '<span class="pill brand">Recommended</span>' : '', m.proven ? '<span class="pill good">Proven for this worker</span>' : '',
+    const tags = [aimHostTag(m.name), i === 0 ? '<span class="pill brand">Recommended</span>' : '', m.proven ? '<span class="pill good">Proven for this worker</span>' : '',
       `<span class="xs muted">${m.context_window ? `${esc(aimTokens(m.context_window))} context` : 'context unknown'}</span>`].join('');
     const backup = m.in_chain ? '<span class="pill muted" title="Already in this worker\'s backups">Backup</span>'
       : backups.length < AIM_BACKUPS ? btn('Add as backup', 'aim-size-backup', { worker: g.worker_type, model: m.name }, 'ghost sm', busy) : '';
@@ -389,7 +394,7 @@ function aimModelCard(m, labels, d) {
   const sub = [m.provider || 'provider unknown', m.underlying_model && m.underlying_model !== m.name ? m.underlying_model : ''].filter(Boolean).join(' · ');
   const caps = AIM_CAPS.map(([n, key, icon]) => { const v = m[key]; return `<span class="aim-cap ${v === true ? 'yes' : v === false ? 'no' : 'unk'}" title="${attr(`${n}: ${aimYes(v)}`)}"><i aria-hidden="true">${icon}</i>${n}<b aria-hidden="true">${v === true ? '✓' : v === false ? '✗' : '?'}</b></span>`; }).join('');
   const stat = (k, v, hint = '') => `<div><dt>${k}</dt><dd>${v}${hint ? `<small>${hint}</small>` : ''}</dd></div>`;
-  const tags = [m.managed ? pill('Managed', 'brand') : '', m.present_in_litellm ? '' : pill('Not in LiteLLM', 'warn'), m.enabled ? '' : pill('Disabled', 'muted'), m.model_type && m.model_type !== 'CUSTOM' ? pill(m.model_type.replace('_', ' ').toLowerCase(), 'plain') : ''].join('');
+  const tags = [aimHostTag(m.name), m.managed ? pill('Managed', 'brand') : '', m.present_in_litellm ? '' : pill('Not in LiteLLM', 'warn'), m.enabled ? '' : pill('Disabled', 'muted'), m.model_type && m.model_type !== 'CUSTOM' ? pill(m.model_type.replace('_', ' ').toLowerCase(), 'plain') : ''].join('');
   const more = open ? `<div class="aim-mcard-more"><label class="field" for="aim-type-${attr(m.name)}"><span>Type</span><select class="select" id="aim-type-${attr(m.name)}" data-act-change="aim-model-type" data-name="${attr(m.name)}">${(d.options?.model_types || []).map(t => aimOpt(t, t.replace('_', ' ').toLowerCase(), m.model_type)).join('')}</select></label>${m.model_type === 'EMBEDDING' ? `<label class="field" for="aim-dims-${attr(m.name)}"><span>Vector size (dimensions)</span><input class="input" type="number" min="1" max="65536" id="aim-dims-${attr(m.name)}" value="${attr(m.embedding_dimensions ?? '')}" placeholder="${attr(m.discovered?.embedding_dimensions ? `Discovered: ${m.discovered.embedding_dimensions}` : 'Unknown — run Test')}" data-act-change="aim-model-dims" data-name="${attr(m.name)}"></label>` : ''}${m.managed ? btn('Stop managing', 'aim-model-unmanage', { name: m.name }, 'sm') : ''}${btn(isBusy('aim-model-remove') ? 'Deleting…' : 'Delete model', 'aim-model-remove', { name: m.name, managed: m.managed ? '1' : '' }, 'sm danger', isBusy('aim-model-remove'))}</div>` : '';
   const refs = AIM.refs?.[m.name];
   return `<article class="card aim-mcard ${m.enabled ? '' : 'off'}" style="--h:${aimHue(m.name)}" data-model="${attr(m.name)}" tabindex="-1">

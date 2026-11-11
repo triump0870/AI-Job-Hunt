@@ -30,7 +30,8 @@ from app.services.redaction import redact_text
 from app.settings import get_settings
 
 FACTS = ("provider", "underlying_model", "supports_structured_output", "supports_tools", "supports_reasoning",
-         "supports_vision", "context_window", "max_context_window", "max_output_tokens", "embedding_dimensions")
+         "supports_vision", "context_window", "max_context_window", "max_output_tokens", "embedding_dimensions",
+         "router_models")
 JSON_TYPES = {"string": str, "number": (int, float), "array": list, "object": dict, "boolean": bool}
 
 
@@ -54,13 +55,28 @@ def describe(deployments: list[dict[str, Any]], ollama: dict[str, dict[str, dict
     return out
 
 
+def _router_members(params: dict[str, Any]) -> list[str] | None:
+    """Every model an auto router deployment can send a request to, sorted so a re-sync compares equal.
+
+    That includes an LLM classifier: it reads each request in order to choose a tier, so it counts for where they go.
+    """
+    router = params.get("complexity_router_config") or {}
+    members = {params.get("complexity_router_default_model"), router.get("default_model"),
+               (router.get("classifier_llm_config") or {}).get("model")}
+    for target in (router.get("tiers") or {}).values():
+        members.update(target if isinstance(target, list) else [target])
+    return sorted(str(m) for m in members if m) or None
+
+
 def _describe_one(deployment: dict[str, Any], ollama: dict[str, dict[str, dict[str, Any]]]) -> dict[str, Any]:
     params = deployment.get("litellm_params") or {}
     info = deployment.get("model_info") or {}
     model = str(params.get("model") or "")
     provider, _, underlying = model.partition("/") if "/" in model else (info.get("litellm_provider"), "", model)
+    # LiteLLM's model map does not know every name, but the deployment still states the provider it was set up with.
+    provider = provider or info.get("litellm_provider") or params.get("custom_llm_provider")
     facts: dict[str, Any] = {
-        "provider": provider or info.get("litellm_provider"), "underlying_model": underlying or None,
+        "provider": provider, "underlying_model": underlying or None,
         "supports_structured_output": _bool(info.get("supports_response_schema")),
         "supports_tools": _bool(info.get("supports_function_calling")),
         "supports_reasoning": _bool(info.get("supports_reasoning")),
@@ -73,7 +89,8 @@ def _describe_one(deployment: dict[str, Any], ollama: dict[str, dict[str, dict[s
         "model_type": None,
     }
     if model.startswith("auto_router/"):
-        facts.update(provider="litellm", model_type="AUTO_ROUTER", supports_structured_output=None)
+        facts.update(provider="litellm", model_type="AUTO_ROUTER", supports_structured_output=None,
+                     router_models=_router_members(params))
     elif info.get("mode") == "embedding":
         facts["model_type"] = "EMBEDDING"
     if str(provider or "").startswith("ollama"):

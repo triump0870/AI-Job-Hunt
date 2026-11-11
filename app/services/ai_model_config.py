@@ -17,12 +17,14 @@ audit entries and API responses never contain a credential.
 """
 from __future__ import annotations
 
+import ipaddress
 import logging
 import re
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import urlsplit
 
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
@@ -435,6 +437,76 @@ def safe_params(params: dict[str, Any] | None) -> dict[str, Any] | None:
         else:
             out[key] = redact_value(value)
     return out
+
+
+# Engines that run on the person's own machine, and OpenAI-compatible routes that may point anywhere.
+LOCAL_ENGINES = frozenset({"ollama", "ollama_chat", "lm_studio", "llamafile", "vllm"})
+SELF_HOSTABLE_ROUTES = frozenset({"openai_like", "custom_openai", "hosted_vllm"})
+# Ollama names its hosted models "<name>:cloud" or "<name>:<size>-cloud", even when the local daemon relays them.
+_OLLAMA_CLOUD_NAME = re.compile(r"[:-]cloud(?:$|-)", re.IGNORECASE)
+
+
+def _api_base_hosting(api_base: str) -> str | None:
+    """LOCAL or CLOUD from a deployment's address; None when it cannot be read, since this label must never raise."""
+    try:
+        host = (urlsplit(api_base if "//" in api_base else f"//{api_base}").hostname or "").lower()
+    except ValueError:
+        return None
+    if not host:
+        return None
+    if host == "localhost" or host.endswith((".localhost", ".local")) or host == "host.docker.internal":
+        return "LOCAL"
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return "CLOUD"
+    return "LOCAL" if address.is_loopback or address.is_private else "CLOUD"
+
+
+def model_hosting(row: AIModel) -> str | None:
+    """Where one model runs: LOCAL, CLOUD, or None when that is not known.
+
+    Derived for display, never stored. A router runs nowhere itself (see catalog_hosting), and a model with no reported
+    provider stays unknown.
+    """
+    provider = (row.provider or "").lower()
+    if provider == "litellm" or row.model_type == "AUTO_ROUTER":
+        return None
+    # The real model name, never the alias: a person can call any model "local-cloud". The suffix is Ollama's naming,
+    # so it says nothing about another engine, but it does settle a model whose provider nobody reported.
+    if (not provider or provider.startswith("ollama")) and _OLLAMA_CLOUD_NAME.search(row.underlying_model or ""):
+        return "CLOUD"
+    api_base = str((row.deployment_params or {}).get("api_base") or "") if row.managed else ""
+    if api_base:
+        return _api_base_hosting(api_base)
+    if not provider or provider in SELF_HOSTABLE_ROUTES:
+        return None
+    return "LOCAL" if provider in LOCAL_ENGINES else "CLOUD"
+
+
+def _unlisted_hosting(name: str) -> str | None:
+    """A router member with no catalog row, such as a classifier: "groq/x" names its provider, a bare name does not."""
+    provider, _, underlying = name.partition("/") if "/" in name else ("", "", name)
+    return model_hosting(AIModel(litellm_model_name=name, provider=provider or None, underlying_model=underlying,
+                                 model_type="CUSTOM", managed=False))
+
+
+def _router_hosting(members: list[str], known: dict[str, str | None]) -> str | None:
+    """LOCAL or CLOUD only when every member is known to be; MIXED as soon as both kinds are known to be in there."""
+    kinds = {known[name] if name in known else _unlisted_hosting(name) for name in members}
+    if {"LOCAL", "CLOUD"} <= kinds:
+        return "MIXED"
+    return next(iter(kinds)) if len(kinds) == 1 else None
+
+
+def catalog_hosting(rows: list[AIModel]) -> dict[str, str | None]:
+    """Where every model in a catalog runs, with each router judged by the models it routes to.
+
+    Pass removed models too: LiteLLM can still route to a model that was removed from Job Hunt OS.
+    """
+    own = {row.litellm_model_name: model_hosting(row) for row in rows}
+    return {row.litellm_model_name: _router_hosting(row.router_models, own) if row.router_models
+            else own[row.litellm_model_name] for row in rows}
 
 
 def model_snapshot(row: AIModel) -> dict[str, Any]:
@@ -1701,6 +1773,7 @@ def overview(db: Session, user_id: int) -> dict[str, Any]:
     draft = draft_snapshot(db, user_id)
     every = db.scalars(select(AIModel).where(AIModel.user_id == user_id).order_by(AIModel.litellm_model_name)).all()
     models = [m for m in every if m.removed_at is None]
+    hosting = catalog_hosting(every)
     removed = [{"name": m.litellm_model_name, "removed_at": _iso(m.removed_at), "managed_before": m.source == "USER"}
                for m in every if m.removed_at is not None]
     used = usage_by_model(db, user_id, draft)
@@ -1724,8 +1797,8 @@ def overview(db: Session, user_id: int) -> dict[str, Any]:
                      "resolved": dict(zip(("model", "assignment", "note"),
                                           model_resolution.resolve_model(draft, w.worker_type), strict=True))}
                     for w in WORKERS.values()],
-        "models": [{"name": m.litellm_model_name, **model_snapshot(m), "present_in_litellm": m.present_in_litellm,
-                    "source": m.source, "health_status": m.health_status,
+        "models": [{"name": m.litellm_model_name, **model_snapshot(m), "hosting": hosting[m.litellm_model_name],
+                    "present_in_litellm": m.present_in_litellm, "source": m.source, "health_status": m.health_status,
                     "health_checked_at": _iso(m.health_checked_at), "health_latency_ms": m.health_latency_ms,
                     "health_error": m.health_error, "last_synced_at": _iso(m.last_synced_at),
                     "discovered": {name: getattr(m, name) for name in OVERRIDABLE},
