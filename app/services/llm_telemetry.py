@@ -209,6 +209,9 @@ class Attempt:
     routing_cause: str | None = None
     failed_over_from: str | None = None  # the model failover moved this request off (app.services.failover)
     fallback_used: bool | None = None
+    # LiteLLM client-side fallbacks went with the request: a 429 then names the last provider tried, which may not be
+    # this model's (app.services.model_health learns a gateway alias's provider only without them). Not stored.
+    fallbacks_sent: bool = False
     escalated: bool = False
     escalation_reason: str | None = None
     confidence: float | None = None
@@ -368,7 +371,8 @@ def record(attempt: Attempt, *, latency_ms: int, error: BaseException | None = N
         log_call(entry)
         from app.services import model_health
 
-        model_health.record_outcome(entry, rate_limit=getattr(error, "rate_limit", None))  # never raises
+        model_health.record_outcome(entry, rate_limit=getattr(error, "rate_limit", None),  # never raises
+                                    fallbacks_sent=attempt.fallbacks_sent)
     except Exception:  # noqa: BLE001  telemetry is best effort by design
         log.warning("could not record LLM telemetry for %s/%s", attempt.provider, attempt.requested_model,
                     exc_info=True)

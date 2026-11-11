@@ -76,7 +76,12 @@ function foFallbacks(model) {
 function foRoutes() {
   const rows = (FO.routes?.routes || []).map(r => {
     const [label, tone] = r.half_open ? ['Probing', 'warn'] : (FO_STATE[r.state] || FO_STATE.HEALTHY);
-    return `<tr><td class="mono">${esc(r.model)}</td><td>${r.worker_type ? esc(r.worker_type.replace(/_/g, ' ').toLowerCase()) : '<span class="muted">all workers</span>'}</td>
+    // A provider-wide rest: every model that provider serves (and the aliases seen using it), for every worker.
+    const name = r.provider
+      ? `<span>${esc(r.provider)} — whole provider${r.free_only ? ' (free models)' : ''}</span>${r.members?.length
+        ? `<div class="settings-help">Includes ${r.members.map(m => `<span class="mono">${esc(m)}</span>`).join(', ')}</div>` : ''}`
+      : esc(r.model);
+    return `<tr><td class="mono">${name}</td><td>${r.worker_type ? esc(r.worker_type.replace(/_/g, ' ').toLowerCase()) : '<span class="muted">all workers</span>'}</td>
       <td>${pill(label, tone)}${r.reason ? `<div class="settings-help">${esc(r.reason)}</div>` : ''}${foFallbacks(r.model)}</td>
       <td>${r.score != null ? esc(String(r.score)) : '—'}</td><td>${r.samples != null ? `${esc(String(r.failure_pct ?? 0))}% of ${esc(String(r.samples))}` : '—'}</td>
       <td>${r.p95_ms != null ? `${esc(String(r.p95_ms))} ms` : '—'}</td><td>${r.resting ? esc(foWhen(r.cooling_until)) : '—'}</td>

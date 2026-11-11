@@ -193,7 +193,7 @@ def test_a_resting_primary_moves_to_the_next_healthy_model_and_keeps_the_rest_as
     outcome(owner, status="FAILED", error_type="RATE_LIMIT")
     moved = failover.apply(worker(), owner)
     assert moved.model == "fast" and moved.failed_over_from == "mid"
-    assert moved.chain() == ["deep", "mid"]  # the resting primary stays last, a last resort
+    assert moved.chain() == ["deep"]  # a rate-limited primary is not called at all while another model can answer
     assert "failover" in moved.note
 
 
@@ -301,7 +301,7 @@ def test_a_models_own_fallbacks_follow_the_workers_backups_and_take_over_when_it
     assert alone.chain() == ["deep"]  # no backups on the worker: the model's fallback still applies
     outcome(owner, status="FAILED", error_type="RATE_LIMIT")
     moved = failover.apply(alone, owner)
-    assert moved.model == "deep" and moved.failed_over_from == "mid" and moved.chain() == ["mid"]
+    assert moved.model == "deep" and moved.failed_over_from == "mid" and moved.chain() == []
 
 
 def test_a_model_rests_for_its_own_time_before_it_is_tried_again(owner, monkeypatch):
@@ -404,4 +404,249 @@ def test_a_resting_backup_moves_behind_the_healthy_ones_while_the_primary_keeps_
     assert w.chain() == ["fast", "deep"]
     outcome(owner, model="fast", status="FAILED", error_type="RATE_LIMIT")
     moved = failover.apply(w, owner)
-    assert moved.model == "mid" and moved.failed_over_from is None and moved.chain() == ["deep", "fast"]
+    assert moved.model == "mid" and moved.failed_over_from is None and moved.chain() == ["deep"]  # fast: rate limited
+
+
+# ───────────── provider-wide rate limits ─────────────
+
+OPENROUTER_RPM = ('LLMRateLimitError: LiteLLM request failed for model=X: litellm.RateLimitError: RateLimitError: '
+                  'OpenrouterException - {"error":{"message":"Rate limit exceeded: requests per minute"}}')
+OPENROUTER_FREE = ('LLMRateLimitError: litellm.RateLimitError: RateLimitError: OpenrouterException - {"error":'
+                   '{"message":"Rate limit exceeded: free-models-per-day. Add 10 credits"}}')
+PROVIDERS = {"models": {
+    "or-paid": {"provider": "openrouter", "underlying_model": "deepseek/deepseek-chat"},
+    "or-free": {"provider": "openrouter", "underlying_model": "nvidia/nemotron:free"},
+    "groq-a": {"provider": "groq", "underlying_model": "openai/gpt-oss-120b"},
+    "Router B4": {"provider": "litellm", "model_type": "AUTO_ROUTER"},
+    "Router X": {"provider": "litellm", "model_type": "AUTO_ROUTER"},
+    "local": {"provider": "ollama", "underlying_model": "qwen2.5:7b"},
+    "cloud": {"provider": "ollama", "underlying_model": "beam:cloud"},
+}, "routing": {"auto_router_model_name": "jobhunt-auto"}}
+
+
+@pytest.fixture
+def providers(monkeypatch):
+    monkeypatch.setattr(model_resolution, "active_snapshot", lambda uid: (1, PROVIDERS))
+
+
+def limit(owner, model, message, *, worker="RANKER", fallbacks_sent=False):
+    model_health.record_outcome({"user_id": owner, "provider": "litellm", "requested_model": model,
+                                 "status": "FAILED", "error_type": "RATE_LIMIT", "worker_type": worker,
+                                 "error_message": message}, rate_limit=rate_limits.classify(message),
+                                fallbacks_sent=fallbacks_sent)
+
+
+def test_the_provider_named_in_a_429_is_read_from_litellms_error():
+    assert rate_limits.provider_named(OPENROUTER_RPM) == "openrouter"
+    assert rate_limits.provider_named("RateLimitError: GroqException - {") == "groq"
+    assert rate_limits.provider_named(OLLAMA_CAP) == "ollama_cloud"  # only Ollama's hosted models have limits
+    assert rate_limits.provider_named("litellm.RateLimitError: RateLimitError: plain") is None
+    assert rate_limits.free_pool(OPENROUTER_FREE) and not rate_limits.free_pool(OPENROUTER_RPM)
+
+
+def test_a_429_naming_its_provider_rests_every_model_of_it_for_every_worker(owner, providers):
+    limit(owner, "or-paid", OPENROUTER_RPM, worker="RANKER")
+    assert model_health.resting(owner, "or-free", "REVIEWER") and model_health.limited_until(owner, "or-free", "TAILOR")
+    assert not model_health.resting(owner, "groq-a", "REVIEWER")
+    row = route(owner, "provider:openrouter")
+    assert row.state == "COOLING" and route(owner, "or-paid") is None  # one rest for the provider, not per model
+    assert [e.message.split(":")[0] for e in events(owner)] == ["Every openrouter model is resting"]
+    limit(owner, "or-free", OPENROUTER_RPM)  # the same outage again: still one event
+    assert len(events(owner)) == 1
+
+
+def test_the_free_model_quota_rests_only_free_models(owner, providers):
+    limit(owner, "or-free", OPENROUTER_FREE)
+    assert model_health.resting(owner, "or-free") and not model_health.resting(owner, "or-paid")
+    assert route(owner, "provider:openrouter").stats["free_only"] is True
+    limit(owner, "or-free", OPENROUTER_RPM)  # a limit that is not the free quota widens the rest to paid models
+    assert model_health.resting(owner, "or-paid")
+
+
+def test_a_router_alias_joins_its_provider_only_from_a_429_without_fallbacks(owner, providers):
+    limit(owner, "Router X", OPENROUTER_RPM, fallbacks_sent=True)  # LiteLLM reports the last provider it tried
+    assert route(owner, "provider:openrouter").stats["members"] == []
+    assert route(owner, "Router X").state == "COOLING"  # the alias itself still rests, as before
+    limit(owner, "Router B4", OPENROUTER_RPM)
+    assert route(owner, "provider:openrouter").stats["members"] == ["Router B4"]
+    assert route(owner, "Router B4") is None  # covered by the provider's rest
+    assert model_health.provider_keys(owner, "Router B4") == ["provider:openrouter"]
+    assert model_health.resting(owner, "Router B4", "REVIEWER")
+    limit(owner, "jobhunt-auto", OPENROUTER_RPM)  # the app's own auto router spans providers: never a member
+    assert "jobhunt-auto" not in route(owner, "provider:openrouter").stats["members"]
+
+
+def test_ollama_cloud_limits_never_rest_local_models(owner, providers):
+    limit(owner, "cloud", OLLAMA_CAP)
+    assert model_health.resting(owner, "cloud") and not model_health.resting(owner, "local")
+
+
+def test_a_429_naming_no_provider_rests_only_that_model(owner, providers):
+    limit(owner, "or-paid", "LLMRateLimitError: Rate limit reached")
+    assert route(owner, "or-paid").state == "COOLING" and route(owner, "provider:openrouter") is None
+    assert not model_health.resting(owner, "or-free")
+
+
+def test_a_provider_rest_ends_and_recovers_like_any_route(owner, providers):
+    limit(owner, "or-paid", OPENROUTER_RPM)
+    with SessionLocal() as db:
+        db.execute(ModelRouteState.__table__.update().where(ModelRouteState.model == "provider:openrouter")
+                   .values(cooling_until=model_health.utcnow() - timedelta(seconds=1)))
+        db.commit()
+    model_health.reset_cache()
+    assert not model_health.resting(owner, "or-free")  # half-open: traffic probes it
+    for _ in range(CFG["recovery_successes"]):
+        outcome(owner, model="or-free")
+    assert route(owner, "provider:openrouter").state == "HEALTHY"
+
+
+def test_a_person_puts_a_provider_back_in_service(owner, providers):
+    limit(owner, "or-paid", OPENROUTER_RPM)
+    response = client.post("/api/failover/routes/reset", json={"model": "provider:openrouter", "worker_type": ""})
+    assert response.status_code == 200, response.text
+    assert not model_health.resting(owner, "or-free")
+
+
+def test_the_routes_api_shows_a_provider_rest(owner, providers):
+    limit(owner, "Router B4", OPENROUTER_FREE)
+    item = next(r for r in client.get("/api/failover/routes").json()["routes"] if r["model"] == "provider:openrouter")
+    assert item["provider"] == "openrouter" and item["members"] == ["Router B4"] and item["free_only"] is True
+
+
+# ───────────── skipping and holding rate-limited models ─────────────
+
+def chained(**escalation):
+    snap = snapshot(RANKER={"mode": "FIXED", "primary_model": "mid", "fallback_model": "fast",
+                            "secondary_models": ["deep"], **({"escalation": escalation} if escalation else {})})
+    return resolve(snap, "RANKER")
+
+
+def test_an_error_rested_backup_is_still_a_last_resort(owner):
+    for _ in range(CFG["consecutive_failures"]):
+        outcome(owner, model="fast", status="FAILED", error_type="PROVIDER_ERROR")
+    assert failover.apply(chained(), owner).chain() == ["deep", "fast"]  # errors, not a rate limit: kept last
+
+
+def test_when_every_model_is_rate_limited_the_request_is_held_until_the_first_clears(owner):
+    w = chained()
+    assert failover.held_seconds(w, owner) is None
+    for model in ("mid", "fast"):
+        outcome(owner, model=model, status="FAILED", error_type="RATE_LIMIT")
+    assert failover.held_seconds(w, owner) is None  # deep can still answer
+    outcome(owner, model="deep", status="FAILED", error_type="RATE_LIMIT")
+    held = failover.held_seconds(w, owner)
+    assert held and held <= CFG["cooldown_seconds"]
+    with backoff_bypass():
+        assert failover.held_seconds(w, owner) is None  # a task a person asked to run now still sends
+    assert client.put("/api/failover/settings", json={"values": {"enabled": False}}).status_code == 200
+    failover.reset_cache()
+    assert failover.held_seconds(w, owner) is None
+
+
+def backoff_bypass():
+    from app.services import backoff
+
+    return backoff.bypass()
+
+
+def test_the_escalation_model_falls_back_only_to_its_own_fallbacks(owner):
+    snap = snapshot(RANKER={"mode": "FIXED", "primary_model": "mid", "fallback_model": "fast",
+                            "escalation": {"model": "deep", "conditions": ["LOW_CONFIDENCE"],
+                                           "confidence_threshold": 0.9}})
+    snap["models"]["deep"]["fallback_models"] = ["big"]
+    w = resolve(snap, "RANKER")
+    assert w.escalation.fallbacks == ("big",) and "big" in w.capabilities
+    assert failover.escalation_target(w, owner) == "deep"
+    outcome(owner, model="deep", status="FAILED", error_type="RATE_LIMIT")
+    assert failover.escalation_target(w, owner) == "big"
+    outcome(owner, model="big", status="FAILED", error_type="RATE_LIMIT")
+    assert failover.escalation_target(w, owner) is None  # never "fast", the worker's own backup
+
+
+# ───────────── end to end: holds and escalation through the gateway ─────────────
+
+def rest(uid, model, minutes=60):
+    with SessionLocal() as db:
+        model_health.trip(db, uid, model, "", cause="RATE_LIMIT", reason="test", cfg=CFG,
+                          not_before=model_health.utcnow() + timedelta(minutes=minutes))
+        db.commit()
+    model_health.reset_cache()
+
+
+def escalating(account, **extra):
+    account.worker("RANKER", escalation={"model": "tier-3-review", "conditions": ["LOW_CONFIDENCE", "MANUAL"],
+                                         "confidence_threshold": 0.85, **extra})
+    account.apply()
+
+
+def test_a_rate_limited_escalation_model_keeps_the_first_answer_without_calling_it(gateway, litellm):  # noqa: F811
+    from app.models import SystemLogEntry
+
+    escalating(gateway)
+    rest(gateway.user_id, "tier-3-review")
+    litellm.answer("tier-2-reasoning", {"score": 60, "confidence": 0.5})
+    result = run(gateway, ranking_prompt(), workflow_type="job", entity_id=7)
+    assert result.data == {"score": 60, "confidence": 0.5}
+    assert result.routing["escalation_skipped"] == {"reason": "LOW_CONFIDENCE", "cause": "RATE_LIMITED",
+                                                    "model": "tier-3-review"}
+    assert [b["model"] for b in litellm.chat_bodies] == ["tier-2-reasoning"]  # nothing sent to the resting model
+    with SessionLocal() as db:
+        line = db.scalars(select(SystemLogEntry).where(SystemLogEntry.user_id == gateway.user_id,
+                                                       SystemLogEntry.operation == "escalation_skipped")).one()
+    assert line.status == "RATE_LIMITED" and line.entity_id == 7 and "first answer stands" in line.message
+
+
+def test_an_escalation_that_hits_a_429_keeps_the_first_answer(gateway, litellm):  # noqa: F811
+    escalating(gateway)
+    litellm.answer("tier-2-reasoning", {"score": 60, "confidence": 0.5})
+    litellm.rate_limited.add("tier-3-review")
+    result = run(gateway, ranking_prompt())
+    assert result.data["score"] == 60 and result.routing["escalation_skipped"]["cause"] == "RATE_LIMIT"
+    assert [b["model"] for b in litellm.chat_bodies] == ["tier-2-reasoning", "tier-3-review"]
+
+
+def test_a_manual_escalation_still_reports_its_failure(gateway, litellm):  # noqa: F811
+    escalating(gateway)
+    litellm.answer("tier-2-reasoning", {"score": 60, "confidence": 0.99})
+    litellm.rate_limited.add("tier-3-review")
+    with pytest.raises(LLMRateLimitError):
+        run(gateway, ranking_prompt(), escalate=True)
+
+
+def test_a_schema_failure_with_nowhere_to_escalate_keeps_its_own_error(gateway, litellm):  # noqa: F811
+    from app.services.llm import LLMResponseError
+
+    gateway.worker("RANKER", escalation={"model": "tier-3-review", "conditions": ["SCHEMA_FAILURE"]})
+    gateway.apply()
+    rest(gateway.user_id, "tier-3-review")
+    litellm.answer("tier-2-reasoning", "this is not json")
+    with pytest.raises(LLMResponseError) as raised:
+        run(gateway, ranking_prompt())
+    assert not getattr(raised.value, "_jobhunt_escalated", False)  # its correction retry is still allowed
+    assert [b["model"] for b in litellm.chat_bodies] == ["tier-2-reasoning"]
+
+
+def test_every_model_rate_limited_sends_nothing_and_gives_the_wait(gateway, litellm):  # noqa: F811
+    gateway.worker("RANKER", fallback_model="tier-1-fast")
+    gateway.apply()
+    uid = gateway.user_id
+    for model in (model_resolution.get(uid, "RANKER").model, "tier-1-fast"):
+        rest(uid, model, minutes=10)
+    before = len(logs_of(uid))
+    with pytest.raises(LLMRateLimitError) as raised:
+        run(gateway, ranking_prompt())
+    assert 0 < raised.value.held_seconds <= 600 and litellm.chat_bodies == []
+    assert len(logs_of(uid)) == before  # a held request is not a provider call
+
+
+def test_rate_limited_backups_are_not_sent_as_litellm_fallbacks(gateway, litellm):  # noqa: F811
+    gateway.worker("RANKER", fallback_model="tier-1-fast", secondary_models=["tier-3-review"])
+    gateway.apply()
+    rest(gateway.user_id, "tier-1-fast")
+    run(gateway, ranking_prompt())
+    assert litellm.chat_bodies[-1]["fallbacks"] == ["tier-3-review"]
+
+
+def logs_of(uid):
+    with SessionLocal() as db:
+        return db.scalars(select(LLMRequestLog).where(LLMRequestLog.user_id == uid)).all()

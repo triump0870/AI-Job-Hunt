@@ -10,6 +10,11 @@ No model is ever called, and unknown stays healthy: a route with fewer than `min
     a rested route  → COOLING until `cooling_until`, then half-open: traffic probes it, `recovery_successes`
                       successes restore it, one failure rests it again for twice as long
 
+A 429 that names its provider ("OpenrouterException - …") rests the whole provider, as a route `provider:<name>` for
+every worker: each model the configuration says that provider serves, and each gateway alias (an auto router) seen
+refusing with that provider's 429 on a request sent without fallbacks. A shared free-model quota (OpenRouter's
+free-models-per-day) rests only the free models. A 429 that names no provider rests that one model, as before.
+
 The state is an overlay on the active AI configuration (app.services.failover reads it); nothing here edits a
 configuration version. State lives in `model_route_states`, so every process agrees; readers cache it for a moment.
 """
@@ -40,6 +45,9 @@ BASELINE_MIN_SAMPLES = 20
 # Errors that say nothing about how a model performs: our own configuration and an oversized request.
 NOT_HEALTH = ("CONFIGURATION", "CONTEXT_OVERFLOW")
 SCHEMA_ERRORS = ("SCHEMA_VALIDATION", "INVALID_JSON")
+# A provider-wide rest is the route (worker_type "", "provider:<name>").
+PROVIDER_PREFIX = "provider:"
+MAX_MEMBERS = 100  # gateway aliases remembered per provider: bounded
 
 
 def utcnow() -> datetime:
@@ -221,7 +229,8 @@ def states(user_id: int | None) -> dict[tuple[str, str], dict[str, Any]]:
 
 
 def resting(user_id: int | None, model: str | None, worker_type: str = "", *, now: datetime | None = None) -> bool:
-    """True while the model should not be used for this worker: rested model-wide or for this worker."""
+    """True while the model should not be used for this worker: rested model-wide, for this worker, or because its
+    provider is rate limited."""
     if not model:
         return False
     moment = now or utcnow()
@@ -230,7 +239,93 @@ def resting(user_id: int | None, model: str | None, worker_type: str = "", *, no
         entry = view.get(key)
         if entry and entry["state"] != "HEALTHY" and entry["cooling_until"] and entry["cooling_until"] > moment:
             return True
-    return False
+    return _provider_until(user_id, model, view, moment) is not None
+
+
+def limited_until(user_id: int | None, model: str | None, worker_type: str = "", *,
+                  now: datetime | None = None) -> datetime | None:
+    """Until when the model is rate limited (a COOLING rest: its own, this worker's, or its provider's), else None.
+    A rest for errors (DEGRADED) is not a rate limit: such a model stays a last resort."""
+    if not model or user_id is None:
+        return None
+    moment = now or utcnow()
+    view = states(user_id)
+    untils = [entry["cooling_until"] for key in (("", model), (worker_type, model))
+              if (entry := view.get(key)) and entry["state"] == "COOLING" and entry["cooling_until"]
+              and entry["cooling_until"] > moment]
+    provider = _provider_until(user_id, model, view, moment)
+    if provider is not None:
+        untils.append(provider)
+    return max(untils) if untils else None
+
+
+# ───────────── providers ─────────────
+
+def provider_route(name: str) -> str:
+    return f"{PROVIDER_PREFIX}{name}"[:200]
+
+
+def _model_entry(user_id: int | None, model: str) -> dict[str, Any]:
+    """The model's entry in the active configuration (cached by model_resolution). Never raises."""
+    try:
+        from app.services import model_resolution
+
+        snapshot = model_resolution.active_snapshot(user_id)[1]
+        return ((snapshot.get("models") or {}).get(model) or {}) | {
+            "_router": (snapshot.get("routing") or {}).get("auto_router_model_name") == model}
+    except Exception:  # noqa: BLE001  unknown means no provider is known
+        return {}
+
+
+def configured_provider(user_id: int | None, model: str) -> str | None:
+    """The provider the configuration says serves this model, or None for an auto router or an unreported provider.
+    Ollama's own models are not rate limited; its hosted (cloud) models are, under "ollama_cloud"."""
+    entry = _model_entry(user_id, model)
+    provider = str(entry.get("provider") or "").lower()
+    if not provider or provider == "litellm" or entry.get("model_type") == "AUTO_ROUTER" or entry.get("_router"):
+        return None
+    provider = provider.removesuffix("_chat")
+    if provider == "ollama":
+        underlying = str(entry.get("underlying_model") or model).lower()
+        return "ollama_cloud" if underlying.endswith((":cloud", "-cloud")) or model.lower().endswith(
+            (":cloud", "-cloud")) else None
+    return provider
+
+
+def _free(user_id: int | None, model: str) -> bool | None:
+    """Whether the model is one of a provider's free models: True/False when its name says, None for an alias."""
+    entry = _model_entry(user_id, model)
+    names = [n.lower() for n in (model, entry.get("underlying_model")) if isinstance(n, str) and n]
+    if any(n.endswith((":free", "/free")) or n == "free" for n in names):
+        return True
+    return False if configured_provider(user_id, model) else None
+
+
+def provider_keys(user_id: int | None, model: str, view: dict[tuple[str, str], dict[str, Any]] | None = None) -> list[
+        str]:
+    """The provider routes that cover this model: its configured provider, else every provider it was seen refusing
+    for."""
+    configured = configured_provider(user_id, model)
+    if configured:
+        return [provider_route(configured)]
+    return [key for (worker, key), entry in (view if view is not None else states(user_id)).items()
+            if worker == "" and key.startswith(PROVIDER_PREFIX) and model in ((entry.get("stats") or {}).get("members")
+                                                                             or ())]
+
+
+def _provider_until(user_id: int | None, model: str, view: dict[tuple[str, str], dict[str, Any]],
+                    moment: datetime) -> datetime | None:
+    if not any(worker == "" and key.startswith(PROVIDER_PREFIX) for worker, key in view):
+        return None  # the common case: no provider is resting, and no configuration lookup is needed
+    untils = []
+    for key in provider_keys(user_id, model, view):
+        entry = view.get(("", key))
+        if not entry or entry["state"] != "COOLING" or not entry["cooling_until"] or entry["cooling_until"] <= moment:
+            continue
+        if (entry.get("stats") or {}).get("free_only") and _free(user_id, model) is False:
+            continue  # the free-model quota is used up; a paid model on the same provider is not
+        untils.append(entry["cooling_until"])
+    return max(untils) if untils else None
 
 
 def route_score(user_id: int | None, model: str, worker_type: str = "") -> tuple[float | None, dict[str, Any]]:
@@ -301,7 +396,7 @@ def _flush_logs(db: Session) -> None:
 
 def trip(db: Session, user_id: int, model: str, worker_type: str, *, cause: str, reason: str,
          cfg: dict[str, Any], stats: Stats | None = None, now: datetime | None = None,
-         not_before: datetime | None = None) -> bool:
+         not_before: datetime | None = None, rest_model: str | None = None) -> bool:
     """Rest a route. Returns False when it was already resting (so one outage is one event, not hundreds).
 
     `not_before` is when the provider said the limit clears: the route rests at least until then, since a call
@@ -315,13 +410,15 @@ def trip(db: Session, user_id: int, model: str, worker_type: str, *, cause: str,
         return False
     trips = int((row.stats or {}).get("trips", 0)) + 1 if row.state != "HEALTHY" or row.probe_successes else 1
     row.state = "COOLING" if cause == "RATE_LIMIT" else "DEGRADED"
-    row.cooling_until = max(moment + _cooldown(cfg, trips, _rest_seconds(user_id, model), cause), not_before or moment)
+    rest = _rest_seconds(user_id, rest_model or model)  # a provider rests for the refusing model's own rest time
+    row.cooling_until = max(moment + _cooldown(cfg, trips, rest, cause), not_before or moment)
     row.reason, row.last_changed_at, row.probe_successes, row.updated_at = reason[:300], moment, 0, moment
     row.consecutive_failures = 0
     row.stats = {**(stats.public() if stats else row.stats or {}), "trips": trips}
     where = f" for {worker_type.replace('_', ' ').title()}" if worker_type else ""
+    subject = (f"Every {model[len(PROVIDER_PREFIX):]} model" if model.startswith(PROVIDER_PREFIX) else model)
     _emit(db, user_id, worker_type=worker_type, from_model=model, to_model=None, cause=cause,
-          message=f"{model} is resting{where}: {reason}", metrics=row.stats, cfg=cfg)
+          message=f"{subject} is resting{where}: {reason}", metrics=row.stats, cfg=cfg)
     reset_cache(user_id)
     return True
 
@@ -357,7 +454,7 @@ def reset_route(db: Session, user_id: int, model: str, worker_type: str = "") ->
 
 # ───────────── per-request outcomes ─────────────
 
-def record_outcome(entry: dict[str, Any], rate_limit: Any = None) -> None:
+def record_outcome(entry: dict[str, Any], rate_limit: Any = None, *, fallbacks_sent: bool = False) -> None:
     """Called with every LLM telemetry row (app.services.llm_telemetry.record). Never raises.
 
     Success on a healthy route writes nothing. A 429 rests the model overall, at least until the provider said it
@@ -373,7 +470,7 @@ def record_outcome(entry: dict[str, Any], rate_limit: Any = None) -> None:
             return  # a request never sent (held by a cooldown or token pacing) says nothing about the model
         worker_type = entry.get("worker_type") or ""
         known = states(user_id)
-        keys = [("", model), (worker_type, model)]
+        keys = [("", model), (worker_type, model), *(("", key) for key in provider_keys(user_id, model, known))]
         if not failed and not entry.get("fallback_used") and not any(
                 known.get(k) and (known[k]["state"] != "HEALTHY" or known[k]["consecutive_failures"]) for k in keys):
             return
@@ -382,7 +479,8 @@ def record_outcome(entry: dict[str, Any], rate_limit: Any = None) -> None:
             if not cfg["enabled"]:
                 return
             _apply_outcome(db, user_id, model, worker_type, failed or bool(entry.get("fallback_used")), kind, cfg,
-                           rate_limit if failed else None)
+                           rate_limit if failed else None, message=entry.get("error_message"),
+                           fallbacks_sent=fallbacks_sent)
             db.commit()
             _flush_logs(db)
         reset_cache(user_id)
@@ -408,7 +506,8 @@ def _rate_limit_rest(limit: Any, cfg: dict[str, Any], now: datetime) -> tuple[da
 
 
 def _apply_outcome(db: Session, user_id: int, model: str, worker_type: str, failed: bool, kind: str | None,
-                   cfg: dict[str, Any], rate_limit: Any = None) -> None:
+                   cfg: dict[str, Any], rate_limit: Any = None, *, message: str | None = None,
+                   fallbacks_sent: bool = False) -> None:
     from app.services import rate_limits
 
     now = utcnow()
@@ -417,7 +516,15 @@ def _apply_outcome(db: Session, user_id: int, model: str, worker_type: str, fail
             if getattr(rate_limit, "kind", None) == rate_limits.TOO_LARGE:
                 return  # one request over the model's limit says nothing about the model's next, smaller one
             until, reason = _rate_limit_rest(rate_limit, cfg, now)
-            trip(db, user_id, model, "", cause="RATE_LIMIT", reason=reason, cfg=cfg, now=now, not_before=until)
+            named = rate_limits.provider_named(message)
+            if named is None:  # the error does not say who refused: rest this model only
+                trip(db, user_id, model, "", cause="RATE_LIMIT", reason=reason, cfg=cfg, now=now, not_before=until)
+                return
+            if not _rest_provider(db, user_id, model, named, reason, until, cfg, now, rate_limits.free_pool(message),
+                                  fallbacks_sent):
+                # The provider that refused is not one this model is known to use (an alias not yet seen refusing
+                # alone): the model rests as before, and is not taught to be that provider's.
+                trip(db, user_id, model, "", cause="RATE_LIMIT", reason=reason, cfg=cfg, now=now, not_before=until)
             return
         row = _row(db, user_id, worker_type, model)
         halfopen = row.state != "HEALTHY" and (row.cooling_until is None or row.cooling_until <= now)
@@ -428,8 +535,9 @@ def _apply_outcome(db: Session, user_id: int, model: str, worker_type: str, fail
                  reason=(f"{row.consecutive_failures} failures in a row" if not halfopen else "it failed its recovery probe"),
                  cfg=cfg, now=now)
         return
-    for key in ("", worker_type):
-        row = _row(db, user_id, key, model, create=False)
+    routes = [(key, model) for key in ("", worker_type)] + [("", p) for p in provider_keys(user_id, model)]
+    for key, name in routes:
+        row = _row(db, user_id, key, name, create=False)
         if row is None:
             continue
         row.consecutive_failures = 0
@@ -437,7 +545,33 @@ def _apply_outcome(db: Session, user_id: int, model: str, worker_type: str, fail
         if row.state != "HEALTHY" and row.cooling_until and row.cooling_until <= now:
             row.probe_successes += 1
             if row.probe_successes >= cfg["recovery_successes"]:
-                recover(db, user_id, model, key, cfg=cfg, now=now)
+                recover(db, user_id, name, key, cfg=cfg, now=now)
+
+
+def _rest_provider(db: Session, user_id: int, model: str, named: str, reason: str, until: datetime | None,
+                   cfg: dict[str, Any], now: datetime, free_only: bool, fallbacks_sent: bool) -> bool:
+    """Rest every model of the provider that refused. Returns whether `model` is covered by that rest: the provider
+    is the one configured for it, or it is an alias learned (now or before) to be served by it.
+
+    An alias is learned only from a request sent without fallbacks: with fallbacks, LiteLLM reports the last
+    provider it tried, which may not be the alias's own. The app's own auto router spans providers and is never
+    learned."""
+    key = provider_route(named)
+    configured = configured_provider(user_id, model)
+    new = trip(db, user_id, key, "", cause="RATE_LIMIT", reason=f"{named} answered 429 for {model}: {reason}",
+               cfg=cfg, now=now, not_before=until, rest_model=model)
+    row = _row(db, user_id, "", key)
+    stats = dict(row.stats or {})
+    # A rest for the free quota alone widens to every model when a paid one is refused too; never narrows.
+    stats["free_only"] = free_only if new else bool(stats.get("free_only", free_only)) and free_only
+    members = [m for m in stats.get("members") or [] if isinstance(m, str)]
+    learnable = (configured is None and not fallbacks_sent and not _model_entry(user_id, model).get("_router"))
+    if learnable and model not in members:
+        members = [*members, model][-MAX_MEMBERS:]
+    stats["members"] = members
+    row.stats = stats
+    reset_cache(user_id)
+    return configured == named or (configured is None and model in members)
 
 
 # ───────────── the scheduled sweep ─────────────

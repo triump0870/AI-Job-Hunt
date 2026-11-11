@@ -98,6 +98,19 @@ describe('browser notification when a model switches', () => {
 });
 
 describe('failover settings and route health', () => {
+  it('shows a provider-wide rest as the whole provider with the aliases it covers', () => {
+    ui.FO.settings = settings();
+    ui.FO.routes = { routes: [route({ model: 'provider:openrouter', provider: 'openrouter', free_only: true,
+      members: ['Openrouter B4'], reason: 'openrouter answered 429 for Openrouter B4' })], resting: 1 };
+    document.getElementById('view').innerHTML = ui.foPanel();
+    const text = document.getElementById('view').textContent;
+    expect(text).toContain('openrouter — whole provider (free models)');
+    expect(text).toContain('Includes Openrouter B4');
+    expect(text).not.toContain('provider:openrouter');
+    const reset = document.querySelector('#view [data-act="fo-reset"]');  // put back in service by its route name
+    expect(reset.dataset.model).toBe('provider:openrouter');
+  });
+
   it('lists resting routes with the reason and offers to put them back in service', async () => {
     ui.FO.settings = settings(); ui.FO.routes = { routes: [route(), route({ model: 'ok-model', state: 'HEALTHY', resting: false, reason: null })], resting: 1 };
     document.getElementById('view').innerHTML = ui.foPanel();

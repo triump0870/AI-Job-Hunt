@@ -130,3 +130,30 @@ def classify(text: str | None, headers: Any = None, *, now: datetime | None = No
         return RateLimit(THROTTLE if until else UNKNOWN, until)
     except Exception:  # noqa: BLE001  a reading we cannot make is an ordinary rate limit
         return RateLimit(UNKNOWN)
+
+
+# ───────────── which provider refused ─────────────
+
+# LiteLLM names the provider that answered 429: "litellm.RateLimitError: RateLimitError: OpenrouterException - {…}".
+_PROVIDER = re.compile(r"\b([A-Za-z][A-Za-z0-9_]{1,40})Exception\s*-", re.IGNORECASE)
+_NOT_PROVIDERS = {"litellm", "ratelimit", "llm", "api", "http", "timeout", "internalserver", "badrequest",
+                  "serviceunavailable", "apiconnection", "contextwindowexceeded"}
+_FREE_POOL = re.compile(r"free-models-per", re.IGNORECASE)
+
+
+def provider_named(text: str | None) -> str | None:
+    """The provider LiteLLM says refused the request, normalized ("Ollama_chat" → "ollama_cloud": only Ollama's hosted
+    models have usage limits), or None when the text names none. Only what the error said is used."""
+    match = _PROVIDER.search(text or "")
+    if not match:
+        return None
+    name = match.group(1).lower()
+    if name in _NOT_PROVIDERS:
+        return None
+    name = name.removesuffix("_chat")
+    return "ollama_cloud" if name == "ollama" else name
+
+
+def free_pool(text: str | None) -> bool:
+    """A 429 for the provider's shared free-model quota (OpenRouter's free-models-per-day): paid models are unaffected."""
+    return bool(text and _FREE_POOL.search(text))
