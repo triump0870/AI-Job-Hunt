@@ -69,9 +69,10 @@ def _key(algorithm: str, user_id: int, worker_type: str, model: str, position: i
 
 def order(worker: ResolvedWorker, user_id: int, cfg: dict[str, Any], tokens_needed: int | None = None) -> list[str]:
     chain = [worker.model, *worker.chain()]
-    healthy = [m for m in chain if not model_health.resting(user_id, m, worker.worker_type)
+    # Rate limited: the model's own, its provider's, or (for the app's auto router) every tier model's rest.
+    capped = {m for m in chain if limited(worker, user_id, m)}
+    healthy = [m for m in chain if m not in capped and not model_health.resting(user_id, m, worker.worker_type)
                and not _waiting(user_id, m, tokens_needed)]
-    capped = {m for m in chain if m not in healthy and limited(worker, user_id, m)}
     if len(capped) < len(chain):  # something else can answer: a rate-limited model is not called at all
         chain = [m for m in chain if m not in capped]
     if worker.model in healthy:  # the primary keeps its place; a resting backup moves behind the healthy ones

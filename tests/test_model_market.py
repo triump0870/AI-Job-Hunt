@@ -212,6 +212,8 @@ def test_switching_the_market_off_makes_no_web_request(web, monkeypatch):
     monkeypatch.setattr(get_settings(), "model_market_enabled", False)
     states = mm.load(1)
     assert web.calls == [] and all(not s.enabled for n, s in states.items() if n != "ollama_local")
+    assert "switched off" in mm.openrouter_endpoints("openai/gpt-oss-120b", 1)["error"]  # details too
+    assert web.calls == []
 
 
 def test_endpoint_lookups_are_cached(web):
@@ -244,6 +246,30 @@ def test_cost_per_request_uses_the_workers_typical_tokens_and_your_own_measured_
     measured = row(input_per_million=1.0, output_per_million=2.0,
                    observed={"samples": mm.OWN_SAMPLES, "cost_per_request": 0.5})
     assert mm.cost_per_request(measured, need) == 0.5
+
+
+def test_a_worker_is_ranked_on_its_own_requests_to_a_model_not_every_workers():
+    fast_for_others = {"samples": mm.OWN_SAMPLES * 5, "p50_ms": 500, "cost_per_request": 0.0001}
+    slow_for_ranker = {"samples": mm.OWN_SAMPLES, "p50_ms": 30_000, "cost_per_request": 0.02}
+    model = row(observed=fast_for_others, observed_by_worker={"RANKER": slow_for_ranker, "CLASSIFIER": fast_for_others},
+                input_per_million=1.0, output_per_million=2.0)
+    ranker = Requirements(worker_type="RANKER", input_tokens=12_000, output_tokens=1_000)
+    assert mm.cost_per_request(model, ranker) == 0.02 and mm.latency_seconds(model, ranker) == (30.0, "yours")
+    assert mm.matches(model, Constraints(max_cost_per_request=0.01), ranker)[0] is False  # the Ranker's own cost
+    # A worker that never used the model: list prices, not another worker's measurements.
+    tailor = Requirements(worker_type="TAILOR", input_tokens=10_000, output_tokens=2_000)
+    assert mm.cost_per_request(model, tailor) == pytest.approx(0.014) and mm.latency_seconds(model, tailor) == (
+        None, None)
+    assert mm.cost_per_request(model, Requirements()) == 0.0001  # no worker: every request together
+
+
+def test_a_model_the_platform_marks_inactive_is_never_suggested():
+    live = row("live", platform="groq", input_per_million=0.1, output_per_million=0.2, uptime_pct=99.0, active=True)
+    gone = row("gone", platform="groq", input_per_million=0.01, output_per_million=0.02, uptime_pct=100.0,
+               active=False)
+    out = mm.rank([live, gone], "balanced", Constraints())
+    assert [s["model_id"] for s in out["suggestions"]] == ["live"] and out["suggestions"][0]["active"] is True
+    assert mm.matches(gone, Constraints())[0] is True  # search still lists it, with active false
 
 
 def test_your_latency_wins_over_benchmarks_once_measured_enough():
@@ -352,6 +378,19 @@ def test_telemetry_is_this_accounts_own_and_skips_requests_never_sent():
     assert beam["cost_per_request"] == 0.002 and beam["schema_valid_pct"] == 100.0
     assert measured["workers"]["RANKER"]["p90_input_tokens"] == 1000
     assert measured["openrouter_free_quota_429s"] == 1
+    assert measured["model_workers"]["beam:cloud"]["RANKER"]["samples"] == 4
+
+
+def test_an_answer_from_a_litellm_fallback_counts_against_the_requested_model():
+    mine = make_user(SessionLocal)
+    with SessionLocal() as db:
+        db.add_all([log(mine, "primary", latency_ms=1000), log(mine, "primary", latency_ms=1000),
+                    log(mine, "primary", fallback_used=True, latency_ms=90_000, estimated_cost=Decimal("0.5"))])
+        db.commit()
+        measured = mm.telemetry(db, mine)
+    primary = measured["models"]["primary"]
+    assert primary["samples"] == 3 and primary["failure_pct"] == pytest.approx(33.3)
+    assert primary["p95_ms"] == 1000 and primary["cost_per_request"] == 0.002  # the fallback's figures are not its
 
 
 def test_gateway_models_land_on_their_platform_with_your_measurements(web, monkeypatch):

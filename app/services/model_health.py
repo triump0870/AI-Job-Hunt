@@ -47,6 +47,9 @@ NOT_HEALTH = ("CONFIGURATION", "CONTEXT_OVERFLOW")
 SCHEMA_ERRORS = ("SCHEMA_VALIDATION", "INVALID_JSON")
 # A provider-wide rest is the route (worker_type "", "provider:<name>").
 PROVIDER_PREFIX = "provider:"
+# The provider's free-model quota rests on its own route ("provider:<name>:free"), with its own deadline, so a
+# day-long free-quota rest never holds the provider's paid models and a short paid rest never ends it early.
+FREE_SUFFIX = ":free"
 MAX_MEMBERS = 100  # gateway aliases remembered per provider: bounded
 
 
@@ -261,8 +264,15 @@ def limited_until(user_id: int | None, model: str | None, worker_type: str = "",
 
 # ───────────── providers ─────────────
 
-def provider_route(name: str) -> str:
-    return f"{PROVIDER_PREFIX}{name}"[:200]
+def provider_route(name: str, *, free: bool = False) -> str:
+    return f"{PROVIDER_PREFIX}{name}"[:200 - len(FREE_SUFFIX)] + (FREE_SUFFIX if free else "")
+
+
+def provider_name(route: str) -> str | None:
+    """The provider a provider route rests ("provider:openrouter:free" → "openrouter"), else None."""
+    if not route.startswith(PROVIDER_PREFIX):
+        return None
+    return route[len(PROVIDER_PREFIX):].removesuffix(FREE_SUFFIX)
 
 
 def _model_entry(user_id: int | None, model: str) -> dict[str, Any]:
@@ -303,11 +313,11 @@ def _free(user_id: int | None, model: str) -> bool | None:
 
 def provider_keys(user_id: int | None, model: str, view: dict[tuple[str, str], dict[str, Any]] | None = None) -> list[
         str]:
-    """The provider routes that cover this model: its configured provider, else every provider it was seen refusing
-    for."""
+    """The provider routes that cover this model: its configured provider (the provider-wide route and its free-quota
+    route), else every provider route it was seen refusing for."""
     configured = configured_provider(user_id, model)
     if configured:
-        return [provider_route(configured)]
+        return [provider_route(configured), provider_route(configured, free=True)]
     return [key for (worker, key), entry in (view if view is not None else states(user_id)).items()
             if worker == "" and key.startswith(PROVIDER_PREFIX) and model in ((entry.get("stats") or {}).get("members")
                                                                              or ())]
@@ -416,7 +426,9 @@ def trip(db: Session, user_id: int, model: str, worker_type: str, *, cause: str,
     row.consecutive_failures = 0
     row.stats = {**(stats.public() if stats else row.stats or {}), "trips": trips}
     where = f" for {worker_type.replace('_', ' ').title()}" if worker_type else ""
-    subject = (f"Every {model[len(PROVIDER_PREFIX):]} model" if model.startswith(PROVIDER_PREFIX) else model)
+    named = provider_name(model)
+    subject = (model if named is None else f"Every free {named} model" if model.endswith(FREE_SUFFIX)
+               else f"Every {named} model")
     _emit(db, user_id, worker_type=worker_type, from_model=model, to_model=None, cause=cause,
           message=f"{subject} is resting{where}: {reason}", metrics=row.stats, cfg=cfg)
     reset_cache(user_id)
@@ -556,14 +568,13 @@ def _rest_provider(db: Session, user_id: int, model: str, named: str, reason: st
     An alias is learned only from a request sent without fallbacks: with fallbacks, LiteLLM reports the last
     provider it tried, which may not be the alias's own. The app's own auto router spans providers and is never
     learned."""
-    key = provider_route(named)
+    key = provider_route(named, free=free_only)
     configured = configured_provider(user_id, model)
-    new = trip(db, user_id, key, "", cause="RATE_LIMIT", reason=f"{named} answered 429 for {model}: {reason}",
+    trip(db, user_id, key, "", cause="RATE_LIMIT", reason=f"{named} answered 429 for {model}: {reason}",
                cfg=cfg, now=now, not_before=until, rest_model=model)
     row = _row(db, user_id, "", key)
     stats = dict(row.stats or {})
-    # A rest for the free quota alone widens to every model when a paid one is refused too; never narrows.
-    stats["free_only"] = free_only if new else bool(stats.get("free_only", free_only)) and free_only
+    stats["free_only"] = free_only  # each route keeps its own kind: the two rests never merge
     members = [m for m in stats.get("members") or [] if isinstance(m, str)]
     learnable = (configured is None and not fallbacks_sent and not _model_entry(user_id, model).get("_router"))
     if learnable and model not in members:

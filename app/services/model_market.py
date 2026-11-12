@@ -105,7 +105,8 @@ class MarketModel:
     gateway_health: str | None = None
     resting: bool = False
     used_by: list[str] = field(default_factory=list)
-    observed: dict[str, Any] | None = None
+    observed: dict[str, Any] | None = None  # every worker's requests together
+    observed_by_worker: dict[str, dict[str, Any]] | None = None  # each worker's own: what a worker's ranking uses
     observed_tpm_limit: int | None = None
     sources: list[str] = field(default_factory=list)
 
@@ -537,6 +538,8 @@ ENDPOINTS_CACHE_SECONDS = 1800.0  # uptime moves faster than a catalog
 def openrouter_endpoints(model_id: str, user_id: int | None) -> dict[str, Any]:
     """Per-provider figures for one OpenRouter model (price, context, uptime; OpenRouter reports no latency here),
     cached for half an hour. Fetched for a handful of models at a time, never the whole catalog."""
+    if not get_settings().model_market_enabled:
+        return {"endpoints": [], "error": "web catalogs are switched off (MODEL_MARKET_ENABLED=false)"}
     author, _, slug = model_id.partition("/")
     if not author or not slug:
         return {"endpoints": [], "error": "not an OpenRouter author/slug id"}
@@ -610,30 +613,38 @@ def telemetry(db: Session, user_id: int, *, now: datetime | None = None) -> dict
         LLMRequestLog.requested_model, LLMRequestLog.worker_type, LLMRequestLog.status, LLMRequestLog.error_type,
         LLMRequestLog.latency_ms, LLMRequestLog.input_tokens, LLMRequestLog.output_tokens,
         LLMRequestLog.estimated_cost, LLMRequestLog.cost_source, LLMRequestLog.structured_output_valid,
+        LLMRequestLog.fallback_used,
     ).where(LLMRequestLog.user_id == user_id, LLMRequestLog.provider == "litellm", LLMRequestLog.created_at >= since,
             LLMRequestLog.requested_model.is_not(None),
             or_(LLMRequestLog.cost_source.is_(None), LLMRequestLog.cost_source != "not_sent"))
         .order_by(LLMRequestLog.created_at.desc()).limit(TELEMETRY_MAX_ROWS)).all()
     by_model: dict[str, list[Any]] = defaultdict(list)
     by_worker: dict[str, list[Any]] = defaultdict(list)
+    by_model_worker: dict[str, dict[str, list[Any]]] = defaultdict(lambda: defaultdict(list))
     for row in rows:
         if row.status == "FAILED" and row.error_type in NOT_HEALTH:
             continue
         by_model[row.requested_model].append(row)
         if row.worker_type:
             by_worker[row.worker_type].append(row)
+            by_model_worker[row.requested_model][row.worker_type].append(row)
     from sqlalchemy import func
 
     free_quota = db.scalar(select(func.count(LLMRequestLog.id)).where(
         LLMRequestLog.user_id == user_id, LLMRequestLog.created_at >= since, LLMRequestLog.error_type == "RATE_LIMIT",
         LLMRequestLog.error_message.ilike("%free-models-per-day%"))) or 0
     return {"models": {m: _summary(items) for m, items in by_model.items()},
+            # A model's cost and latency depend on the worker's prompts: a worker is ranked on its own requests.
+            "model_workers": {m: {w: _summary(items) for w, items in workers.items()}
+                              for m, workers in by_model_worker.items()},
             "workers": {w: _tokens(items) for w, items in by_worker.items()}, "days": TELEMETRY_DAYS,
             "openrouter_free_quota_429s": int(free_quota)}
 
 
 def _summary(items: list[Any]) -> dict[str, Any]:
-    ok = [r for r in items if r.status == "SUCCEEDED"]
+    # An answer a LiteLLM fallback gave did not come from the requested model: it counts against it, and its
+    # latency and cost are the fallback's, not this model's (as model_health.summarize counts it).
+    ok = [r for r in items if r.status == "SUCCEEDED" and not getattr(r, "fallback_used", None)]
     latencies = [r.latency_ms for r in ok if r.latency_ms is not None]
     judged = [r.structured_output_valid for r in items if r.structured_output_valid is not None]
     costs = [float(r.estimated_cost) for r in ok if r.estimated_cost is not None and r.cost_source != "unknown"]
@@ -653,7 +664,8 @@ def _tokens(items: list[Any]) -> dict[str, Any]:
             "p50_input_tokens": _percentile(ins, 50), "p50_output_tokens": _percentile(outs, 50)}
 
 
-def gateway_rows(db: Session, user_id: int, measured: dict[str, Any]) -> list[MarketModel]:
+def gateway_rows(db: Session, user_id: int, measured: dict[str, Any],
+                 by_worker: dict[str, dict[str, Any]] | None = None) -> list[MarketModel]:
     """This account's gateway models as rows on the platform that serves them, with what your requests measured."""
     from sqlalchemy import select
 
@@ -690,6 +702,7 @@ def gateway_rows(db: Session, user_id: int, measured: dict[str, Any]) -> list[Ma
             vision=m.supports_vision, in_gateway=True, gateway_names=[m.litellm_model_name],
             gateway_health=m.health_status, resting=model_health.resting(user_id, m.litellm_model_name),
             used_by=sorted(users.get(m.litellm_model_name, [])), observed=measured.get(m.litellm_model_name),
+            observed_by_worker=(by_worker or {}).get(m.litellm_model_name),
             observed_tpm_limit=windows.get(f"LITELLM:{m.litellm_model_name}"[:230]),
             pricing_note=("an auto router: what it costs depends on the model it picks" if m.model_type == "AUTO_ROUTER"
                           else "Ollama Cloud is a subscription with usage caps, not priced per token"
@@ -712,6 +725,7 @@ def _attach_gateway(rows: dict[tuple[str, str], MarketModel], gateway: list[Mark
         known.resting = known.resting or g.resting
         known.used_by = sorted({*known.used_by, *g.used_by})
         known.observed = known.observed or g.observed  # several gateway names for one model: the first measured
+        known.observed_by_worker = known.observed_by_worker or g.observed_by_worker
         known.observed_tpm_limit = known.observed_tpm_limit or g.observed_tpm_limit
         known.sources.append("gateway")
 
@@ -738,10 +752,10 @@ def catalog(db: Session, user_id: int, *, refresh: bool = False) -> Catalog:
                  parse_ollama_cloud(data("ollama_cloud")), parse_ollama_local(data("ollama_local") or {}),
                  parse_litellm_prices(data("litellm_prices")))
     benchmarks = parse_artificial_analysis(data("artificial_analysis"))
-    measured: dict[str, Any] = {"models": {}, "workers": {}, "days": TELEMETRY_DAYS}
+    measured: dict[str, Any] = {"models": {}, "model_workers": {}, "workers": {}, "days": TELEMETRY_DAYS}
     try:
         measured = telemetry(db, user_id)
-        _attach_gateway(rows, gateway_rows(db, user_id, measured["models"]))
+        _attach_gateway(rows, gateway_rows(db, user_id, measured["models"], measured["model_workers"]))
     except Exception:
         log.warning("model market could not read this account's gateway or telemetry", exc_info=True)
     attach_benchmarks(rows.values(), benchmarks)
@@ -819,12 +833,20 @@ def matches(row: MarketModel, c: Constraints, r: Requirements | None = None) -> 
     return True, notes
 
 
+def observed_for(row: MarketModel, r: Requirements | None) -> dict[str, Any]:
+    """Your measurements that apply: the worker's own requests to this model when ranking for a worker (another
+    worker's short prompts say nothing about this one's cost or latency), else every request to it."""
+    if r is not None and r.worker_type:
+        return (row.observed_by_worker or {}).get(r.worker_type) or {}
+    return row.observed or {}
+
+
 def cost_per_request(row: MarketModel, r: Requirements | None) -> float | None:
     """The request's estimated cost from list prices and the worker's typical tokens; your measured cost per request
     wins when there are enough samples. None when either side is unknown."""
-    if row.observed and (row.observed.get("samples") or 0) >= OWN_SAMPLES and \
-            row.observed.get("cost_per_request") is not None:
-        return float(row.observed["cost_per_request"])
+    observed = observed_for(row, r)
+    if (observed.get("samples") or 0) >= OWN_SAMPLES and observed.get("cost_per_request") is not None:
+        return float(observed["cost_per_request"])
     if row.free is True:
         return 0.0
     if row.input_per_million is None or row.output_per_million is None:
@@ -837,7 +859,7 @@ def cost_per_request(row: MarketModel, r: Requirements | None) -> float | None:
 def latency_seconds(row: MarketModel, r: Requirements | None) -> tuple[float | None, str | None]:
     """Typical time to a full answer: your own p50 when measured enough, else benchmark TTFT + output at the
     benchmark's speed. None when neither is known."""
-    observed = row.observed or {}
+    observed = observed_for(row, r)
     if (observed.get("samples") or 0) >= OWN_SAMPLES and observed.get("p50_ms") is not None:
         return round(observed["p50_ms"] / 1000, 2), "yours"
     if row.ttft_seconds is not None and row.tokens_per_second:
@@ -848,7 +870,7 @@ def latency_seconds(row: MarketModel, r: Requirements | None) -> tuple[float | N
 
 def metric_values(row: MarketModel, r: Requirements | None) -> dict[str, float | None]:
     """Each metric as a number where *higher is better*, or None when unknown."""
-    observed = row.observed or {}
+    observed = observed_for(row, r)
     enough = (observed.get("samples") or 0) >= OWN_SAMPLES
     cost = cost_per_request(row, r)
     latency, _ = latency_seconds(row, r)
@@ -877,6 +899,8 @@ def rank(rows: list[MarketModel], objective: str, c: Constraints, r: Requirement
         raise ValueError(f"objective must be one of {', '.join(OBJECTIVES)}")
     candidates: list[tuple[MarketModel, list[str]]] = []
     for row in rows:
+        if row.active is False:
+            continue  # the platform says it is not served now: never suggested (search still lists it)
         ok, notes = matches(row, c, r)
         if ok:
             candidates.append((row, notes))
@@ -939,7 +963,8 @@ def _suggestion(row: MarketModel, notes: list[str], values: dict[str, float | No
         "latency_seconds": latency, "latency_source": latency_source, "ttft_seconds": row.ttft_seconds,
         "tokens_per_second": row.tokens_per_second, "quality_index": row.quality_index, "uptime_pct": row.uptime_pct,
         "context_window": row.context_window, "structured_output": row.structured_output, "tools": row.tools,
-        "reasoning": row.reasoning, "observed": row.observed, "observed_tpm_limit": row.observed_tpm_limit,
+        "reasoning": row.reasoning, "observed": observed_for(row, r) or None,
+        "observed_tpm_limit": row.observed_tpm_limit, "active": row.active,
         "in_gateway": row.in_gateway, "gateway_names": row.gateway_names, "used_by": row.used_by,
         "reasons": reasons, "flags": notes, "sources": row.sources,
     }
@@ -979,7 +1004,7 @@ def current_model(rows: list[MarketModel], user_id: int, worker_type: str, r: Re
     latency, source = latency_seconds(row, r)
     return {"gateway_name": resolved.model, "id": f"{row.platform}/{row.model_id}", "known": True,
             "cost_per_request_usd": cost, "latency_seconds": latency, "latency_source": source,
-            "quality_index": row.quality_index, "observed": row.observed, "backups": resolved.chain(),
+            "quality_index": row.quality_index, "observed": observed_for(row, r) or None, "backups": resolved.chain(),
             "escalation": resolved.escalation.model if resolved.escalation else None}
 
 

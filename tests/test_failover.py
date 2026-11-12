@@ -342,8 +342,8 @@ def test_a_named_reset_holds_the_model_until_then_even_when_it_is_already_restin
     outcome(owner, status="FAILED", error_type="RATE_LIMIT")  # a plain 429: the 60-second cooldown
     assert route(owner).cooling_until - model_health.utcnow() <= timedelta(seconds=60)
     reset = model_health.utcnow() + timedelta(hours=3)
-    quota = rate_limits.classify('"free-models-per-day" "X-RateLimit-Reset":"%d"' % (reset.replace(
-        tzinfo=UTC).timestamp() * 1000))
+    reset_ms = int(reset.replace(tzinfo=UTC).timestamp() * 1000)
+    quota = rate_limits.classify(f'"free-models-per-day" "X-RateLimit-Reset":"{reset_ms}"')
     assert quota.kind == rate_limits.QUOTA
     outcome(owner, status="FAILED", error_type="RATE_LIMIT", rate_limit=quota)
     assert abs((route(owner).cooling_until - reset).total_seconds()) < 1  # held until the provider's reset
@@ -458,9 +458,27 @@ def test_a_429_naming_its_provider_rests_every_model_of_it_for_every_worker(owne
 def test_the_free_model_quota_rests_only_free_models(owner, providers):
     limit(owner, "or-free", OPENROUTER_FREE)
     assert model_health.resting(owner, "or-free") and not model_health.resting(owner, "or-paid")
-    assert route(owner, "provider:openrouter").stats["free_only"] is True
-    limit(owner, "or-free", OPENROUTER_RPM)  # a limit that is not the free quota widens the rest to paid models
+    assert route(owner, "provider:openrouter:free").stats["free_only"] is True
+    assert route(owner, "provider:openrouter") is None
+    limit(owner, "or-free", OPENROUTER_RPM)  # a limit that is not the free quota rests paid models too
     assert model_health.resting(owner, "or-paid")
+
+
+def test_a_short_paid_rest_never_inherits_the_free_quota_deadline(owner, providers):
+    with SessionLocal() as db:
+        cfg = failover_settings.for_user(db, owner)
+        now = model_health.utcnow()
+        midnight = now + timedelta(hours=10)
+        model_health._rest_provider(db, owner, "or-free", "openrouter", "free quota", midnight, cfg, now, True, False)
+        model_health._rest_provider(db, owner, "or-paid", "openrouter", "rpm", now + timedelta(seconds=30), cfg, now,
+                                    False, False)
+        db.commit()
+    model_health.reset_cache()
+    later = model_health.utcnow() + timedelta(hours=1)
+    assert model_health.limited_until(owner, "or-free", now=later) is not None  # the free quota still rests
+    assert model_health.limited_until(owner, "or-paid", now=later) is None  # the per-minute limit has cleared
+    paid = route(owner, "provider:openrouter")
+    assert paid.cooling_until < midnight and paid.stats["free_only"] is False
 
 
 def test_a_router_alias_joins_its_provider_only_from_a_429_without_fallbacks(owner, providers):
@@ -509,7 +527,8 @@ def test_a_person_puts_a_provider_back_in_service(owner, providers):
 
 def test_the_routes_api_shows_a_provider_rest(owner, providers):
     limit(owner, "Router B4", OPENROUTER_FREE)
-    item = next(r for r in client.get("/api/failover/routes").json()["routes"] if r["model"] == "provider:openrouter")
+    item = next(r for r in client.get("/api/failover/routes").json()["routes"]
+                if r["model"] == "provider:openrouter:free")
     assert item["provider"] == "openrouter" and item["members"] == ["Router B4"] and item["free_only"] is True
 
 
@@ -541,6 +560,19 @@ def test_when_every_model_is_rate_limited_the_request_is_held_until_the_first_cl
     assert client.put("/api/failover/settings", json={"values": {"enabled": False}}).status_code == 200
     failover.reset_cache()
     assert failover.held_seconds(w, owner) is None
+
+
+def test_the_apps_auto_router_moves_behind_a_backup_while_every_tier_model_is_rate_limited(owner):
+    from dataclasses import replace
+
+    w = replace(chained(), model="jobhunt-auto", router_model="jobhunt-auto",
+                router_tiers={"SIMPLE": "tier-a", "COMPLEX": "tier-b"})
+    cfg = failover_settings.resolve({})
+    assert failover.order(w, owner, cfg)[0] == "jobhunt-auto"
+    for model in ("tier-a", "tier-b"):
+        outcome(owner, model=model, status="FAILED", error_type="RATE_LIMIT")
+    ordered = failover.order(w, owner, cfg)
+    assert ordered[0] != "jobhunt-auto" and "jobhunt-auto" not in ordered  # a backup that can answer goes first
 
 
 def backoff_bypass():
