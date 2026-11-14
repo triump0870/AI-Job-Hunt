@@ -60,7 +60,9 @@ REQUIREMENT_LEVELS_RULE = (
     "JOB REQUIREMENTS is the posting parsed into requirements, each from the posting's own words. level REQUIRED is "
     "asked for by the employer; PREFERRED is a plus, never required; INFORMATIONAL asks nothing of the candidate. "
     "\"derived\": true marks the application's inference, never an employer statement. Take levels as given; do not "
-    "reclassify them."
+    "reclassify them. A requirement with \"alternatives\" is one requirement the employer lets the candidate meet with "
+    "any one of them (\"one of Python, Java or Go\"): one supported alternative meets it in full, and the others are "
+    "never gaps."
 )
 
 

@@ -113,6 +113,8 @@ class User(Base):
     rankings: Mapped[list[JobRanking]] = relationship(back_populates="user", passive_deletes=True)
     optimization_tasks: Mapped[list[AIOptimizationTask]] = relationship(back_populates="user", passive_deletes=True)
     optimization_reports: Mapped[list[AIOptimizationReport]] = relationship(back_populates="user", passive_deletes=True)
+    optimization_decisions: Mapped[list[AIOptimizationDecision]] = relationship(back_populates="user",
+                                                                                passive_deletes=True)
     conversation_actions: Mapped[list[ConversationAction]] = relationship(back_populates="user", passive_deletes=True)
     mcp_tokens: Mapped[list[McpToken]] = relationship(back_populates="user", passive_deletes=True)
     litellm_connection: Mapped[LiteLLMConnection | None] = relationship(back_populates="user", uselist=False,
@@ -745,6 +747,8 @@ class JobRequirementEvidence(Base):
     confidence: Mapped[float] = mapped_column(Float, default=0.0)
     is_explicit: Mapped[bool] = mapped_column(Boolean, default=True)
     is_derived: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Rows sharing a group id are alternatives the posting offers ("one of Python, Java or Go"): any one meets it.
+    alternative_group: Mapped[str | None] = mapped_column(String(60), nullable=True)
     # Who settled this row's level: the parser, or the user (a correction or a re-parse decision). A parser never
     # replaces a USER row.
     origin: Mapped[str] = mapped_column(String(10), default="PARSER", server_default="PARSER")
@@ -1782,6 +1786,10 @@ LLM_STAGES = ("RANKER", "TAILOR", "REVIEWER", "RESUME_PARSER", "JD_PARSER", "JD_
 LLM_ERROR_TYPES = ("TIMEOUT", "RATE_LIMIT", "INVALID_JSON", "SCHEMA_VALIDATION", "PROVIDER_ERROR", "CONTEXT_OVERFLOW",
                    "CONFIGURATION", "OTHER")
 OPTIMIZATION_TASK_STATUSES = ("PENDING", "PROCESSING", "COMPLETED", "FAILED")
+# What a person did with a recommendation (app.services.advisor_actions). STAGED: its change is in the AI configuration
+# draft waiting for Apply or Cancel; APPLIED: it became a config version; UNDONE: that version was rolled back;
+# CANCELLED: the staged draft was thrown away; DISMISSED: hidden for a while.
+OPTIMIZATION_DECISION_STATUSES = ("STAGED", "APPLIED", "UNDONE", "CANCELLED", "DISMISSED")
 
 
 class LLMRequestLog(Base):
@@ -2206,6 +2214,40 @@ class AIOptimizationTask(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     user: Mapped[User] = relationship(back_populates="optimization_tasks")
+
+
+class AIOptimizationDecision(Base):
+    """A person's decision on one recommendation: a one-click change staged, applied, undone or cancelled, or the
+    recommendation dismissed. The change itself only ever goes through the AI configuration's draft → preview → apply
+    (app.services.ai_model_config); this row records which recommendation it came from and which version it made."""
+
+    __tablename__ = "ai_optimization_decisions"
+    __table_args__ = (
+        CheckConstraint(f"status IN ({_values(OPTIMIZATION_DECISION_STATUSES)})",
+                        name="ck_ai_optimization_decisions_status"),
+        Index("ix_ai_optimization_decisions_user_key", "user_id", "recommendation_key"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = _owner("ai_optimization_decisions")
+    report_id: Mapped[int | None] = mapped_column(
+        ForeignKey("ai_optimization_reports.id", ondelete="SET NULL", name="fk_ai_optimization_decisions_report_id"),
+        nullable=True, index=True)
+    recommendation_key: Mapped[str] = mapped_column(String(40))
+    action_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    status: Mapped[str] = mapped_column(String(20))
+    title: Mapped[str] = mapped_column(String(300), default="")
+    # The change as it was staged (field → before/after per worker): identifiers and settings only, no prompt text.
+    detail: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    draft_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    base_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    config_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    undo_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+    user: Mapped[User] = relationship(back_populates="optimization_decisions")
 
 
 CONVERSATION_ACTION_STATUSES = ("OK", "PARTIAL", "REJECTED", "ERROR")

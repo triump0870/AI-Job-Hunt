@@ -927,7 +927,7 @@ def test_the_parser_must_name_list_skills_like_their_requirements():
         JOB_DESCRIPTION_PARSER_SYSTEM,
     )
 
-    assert JOB_DESCRIPTION_PARSER_PROMPT_VERSION == "v2"
+    assert JOB_DESCRIPTION_PARSER_PROMPT_VERSION == "v3"
     assert "copied exactly from the normalized_value of a SKILL" in JOB_DESCRIPTION_PARSER_SYSTEM
 
 

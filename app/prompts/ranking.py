@@ -31,13 +31,14 @@ from app.prompts.common import (
 )
 from app.prompts.contracts import QUALIFICATION_RECOMMENDATIONS, RankingResult, describe_fields
 
+# v7: a requirement with alternatives ("one of Python, Java or Go") is assessed once and met by any one of them.
 # v6: each fact once. The verified resume (experience and projects) is application data, no longer wrapped as
 # untrusted; each bullet has one id to cite; VERIFIED EVIDENCE holds only verified facts that are not on the resume;
 # the background skills are not repeated beside RELEVANT SKILLS; the posting arrives without duplicate paragraphs or
 # legal boilerplate.
 # v5: per-requirement MATCH / PARTIAL_MATCH / MISSING / UNKNOWN assessments (the match lists are derived from them),
 # no job-search configuration in the profile, and requirement ids instead of duplicated candidate-match copies.
-RANKING_PROMPT_VERSION = "v6"
+RANKING_PROMPT_VERSION = "v7"
 RANKING_MARKER = "FIT_ANALYSIS"
 SCORE_FIELDS = ("overall_fit_score", "candidate_fit_score", "resume_fit_score", "seniority_match_score",
                 "skills_match_score", "leadership_match_score", "domain_match_score", "location_match_score")
@@ -67,7 +68,9 @@ REQUIRED first. Keep supported and unsupported to a short phrase each, and leave
   UNKNOWN        the facts neither show nor rule it out.
   fatal is true only for an explicitly stated hard requirement (licence, clearance, work authorization, a stated
   minimum of experience) that is MISSING. Unknown is never fatal; lower confidence instead. Unknown salary is
-  never a gap. strong_matches, partial_matches and missing_requirements may be omitted: they are derived.""",
+  never a gap. A requirement with "alternatives" gets one assessment: MATCH when the facts support any one
+  alternative (name it in `supported`), and the alternatives the candidate lacks are not gaps, missing requirements
+  or partial matches. strong_matches, partial_matches and missing_requirements may be omitted: they are derived.""",
     REQUIREMENT_LEVELS_RULE + " term_overlap lists requirement ids whose words appear in the verified facts: a hint "
     "to confirm, not a verdict. When only JOB DESCRIPTION is given, the posting is unparsed: read it yourself.",
     "RELEVANT EXPERIENCE and RELEVANT PROJECTS are the candidate's verified resume: every role header, but only the "

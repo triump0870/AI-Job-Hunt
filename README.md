@@ -61,7 +61,9 @@ Auto-submit is intentionally not offered: approved packets always become an appl
 - **Job Insights**: every approved job gets source-backed research in the background — compensation (posting first, then recruiter, Glassdoor and PayScale through configurable Apify actors), official company values kept apart from employee-reported culture, reported vs generated interview questions, questions to ask, and stage-specific prep — see [14a. Job Insights](#14a-job-insights-company-compensation-and-interview-research)
 - **LiteLLM gateway**: per-worker model assignments, backups and failover, tiers, auto router, version history and rollback (AI Orchestration → Models & routing)
 - OpenAI, Anthropic, Gemini, **OpenRouter**, or no-cost mock provider
-- LLM monitoring (tokens, context size, latency, estimated cost, failures) and a recommend-only AI Optimization Advisor
+- LLM monitoring (tokens, context size, latency, estimated cost, failures) and an AI Optimization Advisor whose
+  recommendations come with decision briefs, one-click configuration changes (reviewed, versioned, undoable) and
+  coding-assistant prompts for code changes
 - Claude Desktop + MCP: bulk tailoring and review with your Claude subscription, validated by the backend
 - OpenRouter `openrouter/free` support plus arbitrary `:free` model slugs
 - Per-stage OpenRouter models for ranking, tailoring, review, and follow-up
@@ -1561,9 +1563,39 @@ Monitoring has seven sections, each loading only what it shows:
 - **Logs** — operational events (timestamp, level, category, provider, workflow, trace, entity, message,
   duration, status), searchable and filterable, with a detail view that links to the call it describes and to
   everything else in the same trace.
-- **AI optimization** — the Advisor's recommendations.
+- **AI optimization** — the Advisor's recommendations, each with a decision brief and, where possible, a one-click
+  change (below).
 
 Each account sees its own telemetry; the admin can switch to all accounts.
+
+#### One-click changes from AI optimization
+
+The Advisor itself only writes advice. `app/services/advisor_actions.py` turns each recommendation into something a
+person can act on — only when that person clicks:
+
+- **Decision brief** — how sure the recommendation is (from the stage's request count), its upside and risk, how
+  to check it worked and how to undo it. When the write-up came from a model, the brief says so; the numbers next
+  to each change are counted straight from `llm_request_logs`, keyed by the model the worker *requested* (a router's
+  successes are logged under the member that answered, so the router's own rows alone would look 100% failing).
+- **Configuration changes** — derived by deterministic rules from the current AI configuration draft and the
+  request log for the report's period, never by the model: remove backup models that fail ≥ 80% of their requests;
+  replace a failing primary with a configured model that fails ≤ 15%; turn off (or retarget) an escalation whose
+  target fails ≥ 50%; promote a healthy escalation model that answers most requests; cap prompt tokens on workers
+  that trim (`TRIMMED_WORKERS`). A model needs at least 20 requests on that worker to be judged.
+  *Review & apply* writes the change into the configuration draft and shows the preview diff and validation;
+  *Apply* runs the normal `ai_model_config.apply` (a new, audited configuration version); *Cancel* puts the draft
+  back; *Undo* restores the version before it while it is still the active one. A draft with someone's unapplied
+  edits is never touched, and actions are recomputed on every click, so a change that no longer fits the current
+  configuration is refused.
+- **Code changes** — a copyable (or downloadable `.md`) prompt for a coding assistant with the finding, the files
+  that own the stage, the invariants from `AGENTS.md` and the tests to add. Built from a template; it carries
+  telemetry numbers and file pointers only.
+- **Dismiss** hides a recommendation, and the same advice in later reports, for 30 days.
+
+Decisions are stored per account in `ai_optimization_decisions` (migration `0070`). API:
+`POST /api/monitoring/recommendations/{report_id}/actions/{action_id}/stage`,
+`POST /api/monitoring/recommendations/decisions/{id}/apply|cancel|undo|restore`,
+`POST /api/monitoring/recommendations/{report_id}/dismiss`.
 
 #### Model performance
 

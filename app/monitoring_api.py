@@ -2,16 +2,19 @@
 
 Every endpoint shows only the signed-in account's LLM telemetry. The admin may pass all_accounts=true to see every
 account. Nothing here returns API keys, prompt text (unless LLM_PROMPT_DEBUG stored it) or resume and job content.
-Analyses are queued for the scheduler and produce recommendations only.
+Analyses are queued for the scheduler and produce recommendations only. A recommendation's one-click change is made
+only when the person clicks, and only through the AI configuration's draft → preview → apply
+(app.services.advisor_actions).
 """
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Path, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -25,10 +28,18 @@ from app.models import (
     AIOptimizationTask,
 )
 from app.scheduler_hooks import run_soon
-from app.services import ai_advisor, external_monitoring, model_performance, monitoring
+from app.services import (
+    advisor_actions,
+    ai_advisor,
+    ai_model_config,
+    external_monitoring,
+    model_performance,
+    monitoring,
+)
 from app.services.user_settings import lock_settings_row, settings_for
 
 router = APIRouter(prefix="/api/monitoring")
+log = logging.getLogger("jobhunt.monitoring_api")
 
 
 def monitoring_filter(
@@ -425,7 +436,68 @@ def recommendations(db: Session = Depends(get_user_db), user: CurrentUser = Depe
             "tasks": [ai_advisor.task_dict(t) for t in tasks],
             "active": any(t.status in ai_advisor.ACTIVE for t in tasks),
             "schedule": ai_advisor.schedule_of(db, user.id),
-            "notice": "Recommendations only. Nothing is changed automatically; apply them yourself if you agree."}
+            "actions": _overview(db, user.id, report),
+            "notice": "Nothing changes on its own. Review a suggested change, then apply it with one click; every "
+                      "applied change is a configuration version you can undo."}
+
+
+def _overview(db: Session, user_id: int, report: AIOptimizationReport | None) -> dict[str, Any]:
+    """The one-click layer. If it cannot be built, the report still shows, just without its actions."""
+    try:
+        return advisor_actions.overview(db, user_id, report)
+    except Exception as exc:  # noqa: BLE001 - the recommendations themselves must stay readable
+        db.rollback()
+        log.warning("AI optimization actions unavailable for account %s: %s", user_id, type(exc).__name__)
+        return {"items": [], "blocked": "One-click changes are unavailable right now; the recommendations still apply.",
+                "staged": None, "decisions": []}
+
+
+def _actions_call(fn, *args: Any) -> Any:
+    try:
+        return fn(*args)
+    except advisor_actions.ActionError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
+    except ai_model_config.AIConfigError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
+
+
+@router.post("/recommendations/{report_id}/actions/{action_id}/stage")
+def stage_action(report_id: int, action_id: str = Path(max_length=160), db: Session = Depends(get_user_db),
+                 user: CurrentUser = Depends(current_user)):
+    """Put one suggested change into the AI configuration draft and preview it. Nothing is live until apply."""
+    return _actions_call(advisor_actions.stage, db, user.id, report_id, action_id)
+
+
+@router.post("/recommendations/decisions/{decision_id}/apply")
+def apply_action(decision_id: int, db: Session = Depends(get_user_db), user: CurrentUser = Depends(current_user)):
+    return _actions_call(advisor_actions.apply, db, user.id, decision_id)
+
+
+@router.post("/recommendations/decisions/{decision_id}/cancel")
+def cancel_action(decision_id: int, db: Session = Depends(get_user_db), user: CurrentUser = Depends(current_user)):
+    return _actions_call(advisor_actions.cancel, db, user.id, decision_id)
+
+
+@router.post("/recommendations/decisions/{decision_id}/undo")
+def undo_action(decision_id: int, db: Session = Depends(get_user_db), user: CurrentUser = Depends(current_user)):
+    return _actions_call(advisor_actions.undo, db, user.id, decision_id)
+
+
+class DismissIn(BaseModel):
+    key: str = Field(min_length=1, max_length=40)
+
+
+@router.post("/recommendations/{report_id}/dismiss")
+def dismiss_recommendation(report_id: int, payload: DismissIn, db: Session = Depends(get_user_db),
+                           user: CurrentUser = Depends(current_user)):
+    """Hide a recommendation (and the same advice in later reports) for 30 days."""
+    return _actions_call(advisor_actions.dismiss, db, user.id, report_id, payload.key)
+
+
+@router.post("/recommendations/decisions/{decision_id}/restore")
+def restore_recommendation(decision_id: int, db: Session = Depends(get_user_db),
+                           user: CurrentUser = Depends(current_user)):
+    return _actions_call(advisor_actions.restore_dismissed, db, user.id, decision_id)
 
 
 @router.get("/reports/{report_id}")
