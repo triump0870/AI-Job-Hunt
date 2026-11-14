@@ -139,6 +139,11 @@ class ModelStat:
         return self.failed / self.requests if self.requests else None
 
     @property
+    def own_failure_rate(self) -> float | None:
+        """Requests this model did not answer itself: failed, or rescued by an infrastructure fallback."""
+        return (self.failed + self.answered_by_backup) / self.requests if self.requests else None
+
+    @property
     def enough(self) -> bool:
         return self.requests >= MIN_SAMPLE
 
@@ -174,7 +179,9 @@ def _failing(stat: ModelStat | None, rate: float = FAILING_RATE) -> bool:
 
 
 def _healthy(stat: ModelStat | None) -> bool:
-    return bool(stat and stat.enough and (stat.failure_rate or 0) <= HEALTHY_RATE)
+    """Answers by itself. A request rescued by a fallback is not evidence for this model: an escalated request (and a
+    replacement primary's) may run without that fallback."""
+    return bool(stat and stat.enough and (stat.own_failure_rate or 0) <= HEALTHY_RATE)
 
 
 # ───────────── candidate configuration actions ─────────────
@@ -247,7 +254,7 @@ def candidate_actions(workers: dict[str, dict[str, Any]], stats: Stats,
         stat = lambda m, w=worker: stats.get((w, m))
         primary = cfg.get("primary_model") if cfg.get("mode") == "FIXED" else None
         backups = _backups(cfg)
-        healthy_backups = sorted((m for m in backups if _healthy(stat(m))), key=lambda m: stat(m).failure_rate or 0)
+        healthy_backups = sorted((m for m in backups if _healthy(stat(m))), key=lambda m: stat(m).own_failure_rate or 0)
 
         # 1. A failing primary, with a configured model that already works on this worker.
         if primary and _failing(stat(primary)) and healthy_backups:
@@ -570,6 +577,15 @@ def _owned_decision(db: Session, user_id: int, decision_id: int) -> AIOptimizati
     return row
 
 
+CONCURRENT_EDIT = "AI Models was edited at the same time, so this change was not staged."
+
+
+def _discard_if_ours(db: Session, user_id: int, revision: int) -> None:
+    """Reset the draft only while it holds exactly the edit made here, never someone else's later edits."""
+    if ai_model_config.connection_for(db, user_id).draft_revision == revision:
+        ai_model_config.discard_draft(db, user_id)
+
+
 def stage(db: Session, user_id: int, report_id: int, action_id: str) -> dict[str, Any]:
     """Write one action into the AI configuration draft and preview it. Nothing goes live until apply()."""
     report = _report(db, user_id, report_id)
@@ -584,16 +600,23 @@ def stage(db: Session, user_id: int, report_id: int, action_id: str) -> dict[str
     rec = (report.recommendations or [])[item["index"]]
     base = ai_model_config.active_version(db, user_id)
     revision = ai_model_config.connection_for(db, user_id).draft_revision
+    try:  # nothing is committed when this raises, so there is nothing to clean up
+        ours = ai_model_config.update_worker(db, user_id, action["worker_type"], action["payload"],
+                                             expected_revision=revision)["draft_revision"]
+    except ai_model_config.ConfigConflict:
+        raise ActionError(CONCURRENT_EDIT) from None
     try:
-        ai_model_config.update_worker(db, user_id, action["worker_type"], action["payload"],
-                                      expected_revision=revision)
         preview = ai_model_config.preview(db, user_id)
     except Exception:
         db.rollback()
-        ai_model_config.discard_draft(db, user_id)
+        _discard_if_ours(db, user_id, ours)
         raise
+    if preview["draft_revision"] != ours:
+        # Someone edited AI Models between the two calls: the preview (and an apply) would carry their edits too.
+        # Their edits are left alone; this change is not recorded as a one-click decision.
+        raise ActionError(CONCURRENT_EDIT + " Review the draft in AI Models.")
     if not preview["can_apply"]:
-        ai_model_config.discard_draft(db, user_id)  # never leave a refused change waiting in the draft
+        _discard_if_ours(db, user_id, ours)  # never leave a refused change waiting in the draft
         return {"decision": None, "action": action, "preview": preview}
     decision = AIOptimizationDecision(
         user_id=user_id, report_id=report.id, recommendation_key=recommendation_key(rec), action_id=action_id,

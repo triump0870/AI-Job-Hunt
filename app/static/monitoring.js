@@ -638,7 +638,9 @@ function monRecBody(x, item, blocked) {
   const brief = b ? `<div class="box soft mon-brief"><div class="row between wrap gap8"><div class="caps-sm">Decision brief</div>${monConfidence(b.confidence)}</div>
       <div class="small" style="line-height:1.5">${esc(b.doing)}</div>
       <div class="mon-action-grid">${monRecField('Upside', b.upside)}${monRecField('Risk', b.risk)}${monRecField('How to check it worked', b.verify)}${monRecField('How to undo', b.undo)}</div>
-      ${(b.notes || []).map(n => `<div class="xs muted">${esc(n)}</div>`).join('')}</div>` : '';
+      ${(b.notes || []).map(n => `<div class="xs muted">${esc(n)}</div>`).join('')}</div>`
+    // No brief (the one-click layer is unavailable): keep the report's own benefit, saving and risk.
+    : `${monRecField('Expected benefit', x.expected_benefit)}${monRecField('Estimated cost saving', x.estimated_cost_saving)}${monRecField('Risk', x.risk)}`;
   return `<div class="mon-rec-body">${monRecField('Finding', x.finding)}${monRecField('Evidence', x.evidence)}${monRecField('Recommended change', x.recommended_change)}
     ${brief}${monRecDecisions(item || {})}${actions}${prompt}
     <div class="row between wrap gap8"><span class="xs faint">Nothing changes on its own: every change above needs your click.</span>

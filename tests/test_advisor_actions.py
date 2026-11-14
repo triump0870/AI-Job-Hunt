@@ -14,6 +14,7 @@ from app.models import (
     WorkerModelConfig,
 )
 from app.services import advisor_actions as aa
+from app.services import ai_model_config
 
 
 def utcnow():
@@ -72,6 +73,15 @@ def test_a_failing_escalation_offers_off_or_a_healthy_retarget_as_alternatives()
     assert actions["escalation-off"]["payload"] == {"escalation": None}
     assert actions["escalation-retarget"]["payload"]["escalation"] == {**esc, "model": "steady"}
     assert actions["escalation-off"]["group"] == actions["escalation-retarget"]["group"] == "escalation.REVIEWER"
+
+
+def test_a_model_whose_successes_came_from_a_fallback_is_not_offered_as_a_replacement():
+    esc = {"model": "flaky", "tier": None, "conditions": ["LOW_CONFIDENCE"], "confidence_threshold": 0.9}
+    workers = {"REVIEWER": worker(fallback_model="rescued", escalation=esc)}
+    rescued = aa.ModelStat(requests=100, failed=0, rate_limited=0, answered_by_backup=100)  # never answered itself
+    stats = {("REVIEWER", "flaky"): stat(168, 140), ("REVIEWER", "rescued"): rescued, ("REVIEWER", "p"): stat(190, 17)}
+    actions = by_type(aa.candidate_actions(workers, stats))
+    assert "escalation-off" in actions and "escalation-retarget" not in actions
 
 
 def test_a_healthy_escalation_that_answers_most_requests_is_promoted():
@@ -280,6 +290,53 @@ def test_unapplied_edits_block_one_click_changes(account):
     with SessionLocal() as db:
         assert db.scalar(select(WorkerModelConfig.temperature).where(
             WorkerModelConfig.user_id == account.user_id, WorkerModelConfig.worker_type == "TAILOR")) == 0.3
+
+
+def _tailor_temperature(user_id):
+    with SessionLocal() as db:
+        return db.scalar(select(WorkerModelConfig.temperature).where(
+            WorkerModelConfig.user_id == user_id, WorkerModelConfig.worker_type == "TAILOR"))
+
+
+_REAL_UPDATE_WORKER = ai_model_config.update_worker
+
+
+def _edit_tailor_elsewhere(user_id):
+    with SessionLocal() as other:
+        _REAL_UPDATE_WORKER(other, user_id, "TAILOR", {"temperature": 0.3})
+
+
+def test_an_edit_made_while_staging_is_kept_and_nothing_is_staged(account, monkeypatch):
+    report_id = setup_reviewer(account)
+    action = recommendations(account)["actions"]["items"][0]["actions"][0]
+    real = ai_model_config.update_worker
+
+    def racing_update(db, user_id, *args, **kw):  # another tab saves just before this request writes
+        _edit_tailor_elsewhere(user_id)
+        return real(db, user_id, *args, **kw)
+
+    monkeypatch.setattr(ai_model_config, "update_worker", racing_update)
+    detail = post(account, f"/{report_id}/actions/{action['id']}/stage", expect=409)["detail"]
+    assert "edited at the same time" in detail
+    assert _tailor_temperature(account.user_id) == 0.3  # the other edit was not discarded
+    assert reviewer(account.user_id) == ("tier-1-fast", ["tier-2-reasoning"])  # this change was never written
+
+
+def test_an_edit_between_update_and_preview_is_not_adopted_by_the_staged_change(account, monkeypatch):
+    report_id = setup_reviewer(account)
+    action = recommendations(account)["actions"]["items"][0]["actions"][0]
+    real = ai_model_config.preview
+
+    def racing_preview(db, user_id, *args, **kw):
+        _edit_tailor_elsewhere(user_id)
+        return real(db, user_id, *args, **kw)
+
+    monkeypatch.setattr(ai_model_config, "preview", racing_preview)
+    post(account, f"/{report_id}/actions/{action['id']}/stage", expect=409)
+    assert _tailor_temperature(account.user_id) == 0.3  # left for the person to review in AI Models
+    with SessionLocal() as db:
+        assert not db.scalars(select(AIOptimizationDecision).where(
+            AIOptimizationDecision.user_id == account.user_id, AIOptimizationDecision.status == "STAGED")).all()
 
 
 def test_a_stale_action_is_refused(account):

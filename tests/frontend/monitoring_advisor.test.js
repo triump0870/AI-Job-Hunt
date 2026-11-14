@@ -135,5 +135,7 @@ describe('AI optimization · one-click changes', () => {
     const text = show().textContent;
     expect(text).toContain('Remove failing models from RANKER');
     expect(document.querySelector('[data-act="mon-act-stage"]')).toBeNull();
+    expect(text).toContain('Quality may change.');  // the report's own risk and benefit stay visible
+    expect(text).toContain('Fewer failures.');
   });
 });
