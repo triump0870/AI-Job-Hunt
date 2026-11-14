@@ -1592,7 +1592,7 @@ person can act on — only when that person clicks:
   telemetry numbers and file pointers only.
 - **Dismiss** hides a recommendation, and the same advice in later reports, for 30 days.
 
-Decisions are stored per account in `ai_optimization_decisions` (migration `0069`). API:
+Decisions are stored per account in `ai_optimization_decisions` (migration `0070`). API:
 `POST /api/monitoring/recommendations/{report_id}/actions/{action_id}/stage`,
 `POST /api/monitoring/recommendations/decisions/{id}/apply|cancel|undo|restore`,
 `POST /api/monitoring/recommendations/{report_id}/dismiss`.
