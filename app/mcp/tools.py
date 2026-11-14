@@ -833,3 +833,137 @@ def skip_followup(db: Session, followup_id: int | None = None, application_id: i
         raise ToolError(str(exc)) from exc
     return {"ok": True, "status": outcome.status, "application_id": app.id, "job_id": app.job_id,
             "followup_id": outcome.followup.id if outcome.followup else None}
+
+
+# ───────────── model market (read-only suggestions) ─────────────
+
+MARKET_SEARCH_LIMIT = 50
+MARKET_SUGGEST_LIMIT = 10
+MARKET_NOTE = ("Suggestions only: nothing here changes a worker's model. Apply a change in AI Orchestration → Models "
+               "(draft → preview → apply). A null figure is unknown, never zero.")
+
+
+def _account(db: Session) -> int:
+    user_id = db.info.get("user_id")
+    if not isinstance(user_id, int):
+        raise ToolError("This tool needs an account")
+    return user_id
+
+
+def _constraints(query: str | None = None, provider: str | list[str] | None = None,
+                 exclude_provider: str | list[str] | None = None, free_only: bool = False,
+                 min_context: int | None = None, needs_structured_output: bool = False, needs_tools: bool = False,
+                 needs_reasoning: bool = False, max_input_cost_per_million: float | None = None,
+                 max_cost_per_request: float | None = None, in_gateway_only: bool = False) -> Any:
+    from app.services.model_market import Constraints
+
+    def names(value: Any) -> tuple[str, ...]:
+        items = [value] if isinstance(value, str) else value or []
+        return tuple(str(v).strip().lower() for v in items if str(v).strip())[:20]
+
+    for label, value in (("min_context", min_context), ("max_input_cost_per_million", max_input_cost_per_million),
+                         ("max_cost_per_request", max_cost_per_request)):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0):
+            raise ToolError(f"{label} must be a number of at least 0")
+    return Constraints(query=(query or "").strip()[:100] or None, providers=names(provider),
+                       exclude_providers=names(exclude_provider), free_only=bool(free_only), min_context=min_context,
+                       needs_structured_output=bool(needs_structured_output), needs_tools=bool(needs_tools),
+                       needs_reasoning=bool(needs_reasoning), max_input_cost_per_million=max_input_cost_per_million,
+                       max_cost_per_request=max_cost_per_request, in_gateway_only=bool(in_gateway_only))
+
+
+def list_model_sources(db: Session, refresh: bool = False) -> dict[str, Any]:
+    from app.services import model_market
+
+    _account(db)
+    states = model_market.load(db.info["user_id"], refresh=bool(refresh))
+    return {"ok": True, "count": len(states), "sources": [s.public() for s in states.values()],
+            "cache_hours": get_settings().model_market_cache_hours, "note": MARKET_NOTE}
+
+
+def search_models(db: Session, query: str | None = None, provider: str | list[str] | None = None,
+                  free_only: bool = False, min_context: int | None = None, needs_structured_output: bool = False,
+                  needs_tools: bool = False, needs_reasoning: bool = False,
+                  max_input_cost_per_million: float | None = None, in_gateway_only: bool = False,
+                  limit: int = 20) -> dict[str, Any]:
+    from app.services import model_market
+
+    limit = _check_limit(limit, MARKET_SEARCH_LIMIT, f"at most {MARKET_SEARCH_LIMIT}")
+    constraints = _constraints(query=query, provider=provider, free_only=free_only, min_context=min_context,
+                               needs_structured_output=needs_structured_output, needs_tools=needs_tools,
+                               needs_reasoning=needs_reasoning, max_input_cost_per_million=max_input_cost_per_million,
+                               in_gateway_only=in_gateway_only)
+    found = model_market.catalog(db, _account(db))
+    rows = [row for row in found.rows if model_market.matches(row, constraints)[0]]
+    # Yours first, then the cheapest known input price; unknown prices last.
+    rows.sort(key=lambda r: (not r.in_gateway, r.input_per_million is None, r.input_per_million or 0,
+                             r.platform, r.model_id))
+    return {"ok": True, "count": len(rows), "models": [r.public() for r in rows[:limit]],
+            "truncated": len(rows) > limit, "sources": found.sources, "note": MARKET_NOTE}
+
+
+def suggest_models(db: Session, worker_type: str | None = None, use_case: str | None = None,
+                   objective: str = "balanced", provider: str | list[str] | None = None,
+                   exclude_provider: str | list[str] | None = None, free_only: bool = False,
+                   min_context: int | None = None, needs_structured_output: bool = False, needs_tools: bool = False,
+                   needs_reasoning: bool = False, max_cost_per_request: float | None = None,
+                   in_gateway_only: bool = False, limit: int = 5) -> dict[str, Any]:
+    from app.services import model_market, model_resolution
+
+    user_id = _account(db)
+    limit = _check_limit(limit, MARKET_SUGGEST_LIMIT, f"at most {MARKET_SUGGEST_LIMIT}")
+    objective = (objective or "balanced").strip().lower()
+    if objective not in model_market.OBJECTIVES:
+        raise ToolError(f"objective must be one of {', '.join(model_market.OBJECTIVES)}")
+    worker_type = worker_type.strip().upper() if isinstance(worker_type, str) and worker_type.strip() else None
+    constraints = _constraints(provider=provider, exclude_provider=exclude_provider, free_only=free_only,
+                               min_context=min_context, needs_structured_output=needs_structured_output,
+                               needs_tools=needs_tools, needs_reasoning=needs_reasoning,
+                               max_cost_per_request=max_cost_per_request, in_gateway_only=in_gateway_only)
+    found = model_market.catalog(db, user_id)
+    snapshot = model_resolution.active_snapshot(user_id)[1]
+    try:
+        needs = model_market.requirements_for(worker_type, found.telemetry, snapshot,
+                                              label=(use_case or "").strip()[:120] or None)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+    # OpenRouter's per-provider uptime for a bounded shortlist, so web models have a reliability figure too.
+    model_market.enrich_uptime(found.rows, constraints, needs, user_id)
+    ranked = model_market.rank(found.rows, objective, constraints, needs, limit=limit,
+                               free_quota_429s=found.telemetry.get("openrouter_free_quota_429s") or 0)
+    current = model_market.current_model(found.rows, user_id, worker_type, needs) if worker_type else None
+    model_market.compare(ranked["suggestions"], current)
+    for item in ranked["suggestions"][:model_market.ENDPOINTS_LIMIT]:
+        if item["platform"] == "openrouter":  # live per-provider uptime and latency, for the final few only
+            item["openrouter_endpoints"] = model_market.openrouter_endpoints(item["model_id"], user_id)
+    return {"ok": True, "worker_type": worker_type, "use_case": needs.label, "objective": objective,
+            "requirements": {"structured_output": needs.structured_output, "min_context": needs.min_context,
+                             "typical_input_tokens": needs.input_tokens, "typical_output_tokens": needs.output_tokens,
+                             "basis": needs.basis},
+            "current": current, **{k: ranked[k] for k in ("candidates", "suggestions", "insufficient_data",
+                                                         "weights", "notes")},
+            "sources": found.sources, "note": MARKET_NOTE}
+
+
+def get_model_details(db: Session, model_id: str) -> dict[str, Any]:
+    from app.services import model_market
+
+    if not isinstance(model_id, str) or not model_id.strip() or len(model_id) > 300:
+        raise ToolError("model_id must be an id from search_models or suggest_models, e.g. openrouter/openai/gpt-4o, "
+                        "or a gateway model name")
+    wanted = model_id.strip()
+    found = model_market.catalog(db, _account(db))
+    rows = [r for r in found.rows if f"{r.platform}/{r.model_id}".lower() == wanted.lower()
+            or wanted in r.gateway_names]
+    if not rows:  # the same model on every platform that serves it
+        base = model_market.base_name(wanted)
+        rows = [r for r in found.rows if model_market.base_name(r.model_id) == base][:20]
+    if not rows:
+        raise ToolError(f"No model {wanted} in any source; try search_models")
+    out = []
+    for row in rows:
+        item = row.public()
+        if row.platform == "openrouter":
+            item["openrouter_endpoints"] = model_market.openrouter_endpoints(row.model_id, db.info["user_id"])
+        out.append(item)
+    return {"ok": True, "count": len(out), "models": out, "sources": found.sources, "note": MARKET_NOTE}

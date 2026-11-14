@@ -101,6 +101,15 @@ class Settings(BaseSettings):
     llm_prompt_debug_retention_days: int = 7
     # Model prices and context windows (app.services.model_catalog). Blank uses app/model_catalog.json.
     model_catalog_file: str | None = None
+    # The model market (app.services.model_market, MCP search_models / suggest_models): public model catalogs read
+    # for suggestions only, cached in-process. Off: only your gateway, your local Ollama and your own telemetry.
+    model_market_enabled: bool = True
+    model_market_cache_hours: float = 6
+    # Optional catalog keys, used only to list models (never to call one). Without a key that source is "not
+    # configured" (Groq, Artificial Analysis) or tried without one (Ollama Cloud); nothing is guessed in its place.
+    artificial_analysis_api_key: str | None = None
+    groq_api_key: str | None = None
+    ollama_api_key: str | None = None
 
     # Google ADK / Vertex AI Agent Engine. Authentication and project/location
     # are read by the Google SDK from standard GOOGLE_* environment variables.

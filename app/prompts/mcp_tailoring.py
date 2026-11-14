@@ -85,6 +85,11 @@ MCP_SERVER_INSTRUCTIONS = instructions(
     "documents; only an approved packet may be submitted. "
     "Follow-ups: list_followups_due → save_followup_draft → (the candidate says yes and the message is sent) → "
     "record_followup_sent, or skip_followup. Job Hunt OS never sends a message.",
+    "Models: list_model_sources shows which catalogs answered; search_models lists models across OpenRouter, "
+    "Groq, Ollama, LiteLLM's price list and the user's own gateway; suggest_models ranks them for a worker "
+    "(e.g. RANKER) or use case with cost, latency, quality and reliability, compared with the model it uses now; "
+    "get_model_details shows one model on every platform. They only suggest: a change is applied by the user in "
+    "AI Orchestration. A null figure is unknown — say so, never estimate it.",
     "Batches are limited (see the error message when a batch is too large). A rejected item comes back with "
     "validation errors: fix only that item and save it again. Never invent facts to get past validation.",
 )

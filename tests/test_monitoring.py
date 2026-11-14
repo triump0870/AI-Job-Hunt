@@ -215,8 +215,14 @@ def test_catalog_file_is_the_only_source_of_prices():
     assert all(entry.get("source_url") and entry.get("effective_from") for entry in data["models"])
     from pathlib import Path
     root = Path(__file__).resolve().parents[1] / "app"
-    offenders = [p.name for p in root.rglob("*.py") if "per_million" in p.read_text() and p.name != "model_catalog.py"]
+    # The model market (and the MCP tools that expose it) reports catalogs' list prices for suggestions; it never
+    # computes a recorded cost, which still comes only from model_catalog.
+    reporting = {root / "services" / "model_market.py", root / "mcp" / "tools.py", root / "mcp" / "server.py"}
+    offenders = [p.name for p in root.rglob("*.py") if "per_million" in p.read_text() and p.name != "model_catalog.py"
+                 and p not in reporting]
     assert offenders == []
+    from app.services import llm_telemetry
+    assert "model_market" not in Path(llm_telemetry.__file__).read_text()  # recorded cost never reads the market
 
 
 # ───────────── context size and attribution ─────────────

@@ -224,6 +224,15 @@ def _provider_error(provider: str, model: str, exc: Exception) -> LLMError:
     return LLMError(detail)
 
 
+def _unavailable(exc: BaseException) -> bool:
+    """The model never gave an answer (throttled, held, timed out, unreachable) — as opposed to giving a bad one or
+    our own configuration being wrong."""
+    if isinstance(exc, RateLimitedCooldown):
+        return True
+    return isinstance(exc, LLMError) and not isinstance(exc, (LLMResponseError, LLMConfigError,
+                                                              LLMContextOverflowError))
+
+
 def error_type(exc: BaseException, *, validation: bool = False) -> str:
     """The Monitoring tab's failure category for an exception raised while generating."""
     if validation or (isinstance(exc, LLMSchemaError) and exc.reason != "INVALID_JSON"):
@@ -528,6 +537,13 @@ class LLMClient:
         need = (llm_telemetry.estimate_tokens(system) + llm_telemetry.estimate_tokens(user)
                 + (resolved.max_output_tokens or 0))
         resolved = failover.apply(resolved, self.user_id, tokens_needed=need)
+        # Every model the worker could use is rate limited (its own 429 or its provider's): send nothing, and hold the
+        # task until the first one clears. Paced, so the caller gives the attempt back (ranker._paced).
+        held = failover.held_seconds(resolved, self.user_id)
+        if held:
+            raise RateLimitedCooldown(f"LITELLM:{resolved.model}", held,
+                                      f"every model {worker_label(resolved.worker_type)} can use is rate limited; "
+                                      f"nothing was sent, trying again in {held}s", paced=True)
         try:
             first = self._gateway_attempt(system, user, resolved.model, resolved, call, prompt_name, prompt_version)
         except Exception as exc:
@@ -536,10 +552,17 @@ class LLMClient:
                       if schema_failed and not call.no_escalation else None)
             if reason is None:
                 raise
+            target = failover.escalation_target(resolved, self.user_id, tokens_needed=need)
+            if target is None:  # nowhere to escalate to: the schema failure goes to its correction retry
+                self._escalation_skipped(resolved, call, reason, "RATE_LIMITED")
+                raise
             try:
-                return self._gateway_attempt(system, user, resolved.escalation.model, resolved, call, prompt_name,
+                return self._gateway_attempt(system, user, target, resolved, call, prompt_name,
                                              prompt_version, escalation=reason)
             except Exception as escalated:
+                if _unavailable(escalated):  # the stronger model never answered: the original failure stands
+                    self._escalation_skipped(resolved, call, reason, error_type(escalated), target)
+                    raise exc from None
                 try:
                     escalated._jobhunt_escalated = True  # a stronger model already had its try: no correction retry
                 except AttributeError:
@@ -549,9 +572,41 @@ class LLMClient:
                   else model_resolution.escalation_reason(resolved, data=first.data, manual=call.escalate))
         if reason is None:
             return first
-        return self._gateway_attempt(system, user, resolved.escalation.model, resolved, call, prompt_name,
-                                     prompt_version, escalation=reason,
-                                     previous_confidence=model_resolution.confidence_of(first.data))
+        target = failover.escalation_target(resolved, self.user_id, tokens_needed=need)
+        if target is None and reason != "MANUAL":
+            return self._keep_first(first, resolved, call, reason, "RATE_LIMITED")
+        try:
+            return self._gateway_attempt(system, user, target or resolved.escalation.model, resolved, call,
+                                         prompt_name, prompt_version, escalation=reason,
+                                         previous_confidence=model_resolution.confidence_of(first.data))
+        except Exception as escalated:
+            # A valid first answer is kept when the second opinion could not be had (invariant 9: preserve good
+            # results). A person's MANUAL escalation, or our own configuration error, is reported instead.
+            if reason == "MANUAL" or isinstance(escalated, LLMConfigError):
+                raise
+            return self._keep_first(first, resolved, call, reason, error_type(escalated), target)
+
+    def _keep_first(self, first: LLMResult, resolved: Any, call: LLMCall, reason: str, cause: str,
+                    model: str | None = None) -> LLMResult:
+        self._escalation_skipped(resolved, call, reason, cause, model)
+        routing = {**(first.routing or {}), "escalation_skipped": {
+            "reason": reason, "cause": cause, "model": model or resolved.escalation.model}}
+        return replace(first, routing=routing)
+
+    def _escalation_skipped(self, resolved: Any, call: LLMCall, reason: str, cause: str,
+                            model: str | None = None) -> None:
+        """Monitoring → Logs: the answer stands without the second opinion its policy asked for, and why."""
+        from app.services import system_log
+
+        target = model or (resolved.escalation.model if resolved.escalation else None)
+        system_log.log_event(
+            message=(f"{worker_label(resolved.worker_type)}: escalation ({reason}) to {target} skipped — "
+                     + ("it and its fallbacks are rate limited" if cause == "RATE_LIMITED" else f"it failed ({cause})")
+                     + "; the first answer stands"),
+            category="LLM", level="INFO", user_id=self.user_id, operation="escalation_skipped", status=cause,
+            workflow=call.workflow_type, entity_type=call.workflow_type, entity_id=call.entity_id,
+            details={"worker_type": resolved.worker_type, "escalation_reason": reason, "model": target,
+                     "fallbacks": list(resolved.escalation.fallbacks) if resolved.escalation else []})
 
     def _gateway_attempt(self, system: str, user: str, model: str | None, resolved: Any, call: LLMCall,
                          prompt_name: str | None, prompt_version: str | None, *, escalation: str | None = None,
@@ -619,6 +674,7 @@ class LLMClient:
         # already been judged; it gets no silent fallback to a weaker model.
         if resolved.chain() and escalation is None:
             body["fallbacks"] = resolved.chain()
+            attempt.fallbacks_sent = True
         if resolved.send_metadata:
             body["metadata"] = model_resolution.request_metadata(
                 resolved, workflow_type=call.workflow_type, entity_id=call.entity_id, attempt=call.attempt,

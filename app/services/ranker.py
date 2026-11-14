@@ -991,8 +991,9 @@ def _failed(db: Session, claimed: TaskClaim, exc: Exception, now: datetime) -> s
 
 
 def _paced(db: Session, claimed: TaskClaim, message: str, seconds: int, now: datetime) -> str:
-    """Token pacing held the request until the model's token window resets: nothing was sent, so the attempt is given
-    back and the task comes back at the reset, not on the failure backoff."""
+    """The request was held, not sent: the model's token window is spent, or every model the worker can use is rate
+    limited (app.services.failover.held_seconds). The attempt is given back and the task comes back at the reset,
+    not on the failure backoff."""
     task, job = _owned(db, claimed)
     _clear_lease(task)
     task.attempt_count = max(0, task.attempt_count - 1)
@@ -1000,7 +1001,7 @@ def _paced(db: Session, claimed: TaskClaim, message: str, seconds: int, now: dat
     task.last_error, task.error_category = message[:MAX_ERROR_LENGTH], ErrorCategory.RATE_LIMITED
     if job is not None and job.state is S.RANKING:
         transition(db, job, S.RANK_PENDING, actor=claimed.worker_id, now=now,
-                   reason=f"Waiting {seconds}s for the model's token window; no request was sent")
+                   reason=f"Waiting {seconds}s for a model to be available again; no request was sent")
     db.commit()
     return "retrying"
 
