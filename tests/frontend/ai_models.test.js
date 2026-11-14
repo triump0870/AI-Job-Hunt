@@ -83,9 +83,10 @@ describe('AI Orchestration → Models & routing', () => {
   it('chooses between LiteLLM and the direct provider in Settings → Route', async () => {
     routes['PUT /api/settings/ai/gateway'] = sent => ({ ...overview().gateway, gateway_enabled: sent.enabled });
     await open('settings');
-    const buttons = [...document.querySelectorAll('#view .seg[aria-label="AI gateway"] button')];
-    expect(buttons.map(b => b.textContent.trim())).toEqual(['LiteLLM gateway', 'OpenRouter (direct)']);
+    const buttons = [...document.querySelectorAll('#view .aim-routes[aria-label="AI gateway"] button')];
+    expect(buttons.map(b => b.querySelector('.aim-route-text b').textContent)).toEqual(['LiteLLM gateway', 'OpenRouter (direct)']);
     expect(buttons[0].getAttribute('aria-pressed')).toBe('true');
+    expect(buttons.map(b => b.querySelector('em').textContent)).toEqual(['In use', 'Switch']);
     expect(buttons.every(b => b.type === 'button')).toBe(true);  // inside the settings form: never a submit
     confirm.mockReturnValueOnce(false);
     buttons[1].click();  // cancelled: the route stays as it is
@@ -96,6 +97,29 @@ describe('AI Orchestration → Models & routing', () => {
     await flush(); await flush(); await flush();
     expect(body('PUT', '/api/settings/ai/gateway')).toEqual({ enabled: false });
     expect(call('GET', '/api/settings/ai').length).toBeGreaterThan(1);  // the tab reloads to show the new route
+  });
+  it('says why a route cannot be chosen yet instead of only greying it out', async () => {
+    routes['GET /api/settings/ai'] = () => ({ ...overview(), gateway: { ...overview().gateway, direct_ready: false } });
+    await open('settings');
+    const direct = document.querySelectorAll('#view .aim-route')[1];
+    expect(direct.disabled).toBe(true);
+    expect(direct.textContent).toContain('Not ready');
+    expect(direct.textContent).toContain('Save an API key for OpenRouter in Settings → API keys first');
+  });
+  it('shows the connection at a glance and folds a long version history', async () => {
+    const versions = Array.from({ length: 9 }, (_, i) => ({ id: 20 - i, version: 9 - i, changed_by: 'me', source: 'USER', summary: `Change ${9 - i}`, created_at: '2026-09-25T10:00:00' }));
+    routes['GET /api/settings/ai/versions'] = () => ({ versions });
+    routes['GET /api/settings/ai/audit'] = () => ({ entries: [] });
+    await open('settings'); await flush(); await flush();
+    expect([...document.querySelectorAll('#view .aim-conn-fact small')].map(x => x.textContent)).toEqual(['Connection', 'Version', 'Configuration', 'Last applied']);
+    expect(document.querySelector('#view .aim-conn-status').textContent).toContain('1.102.1');
+    expect(document.querySelectorAll('#view ol.aim-hist li')).toHaveLength(6);
+    expect(document.querySelector('#view ol.aim-hist li.on').textContent).toContain('Active');
+    const more = document.querySelector('#view [data-act="aim-history-all"]');
+    expect(more.textContent).toBe('Show all 9 versions');
+    ui.A['aim-history-all']();
+    expect(document.querySelectorAll('#view ol.aim-hist li')).toHaveLength(9);
+    expect(document.querySelectorAll('#view [data-act="aim-restore"]')).toHaveLength(8);  // every version but the active one
   });
   it('shows the route, connection, version and each worker’s model and backups in one place', async () => {
     routes['GET /api/settings/ai'] = () => ({ ...overview(), workers: [worker('RANKER', 'Ranker', { tier: 'PRIMARY_REASONING', fallback_model: 'local-fast', secondary_models: ['local-deep'] }, 'local-reasoning'), ...overview().workers.slice(1)] });

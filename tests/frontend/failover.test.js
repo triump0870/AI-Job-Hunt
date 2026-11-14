@@ -125,6 +125,36 @@ describe('failover settings and route health', () => {
     expect(rest).not.toBeNull(); expect(rest.closest('details')).toBeNull();
   });
 
+  it('counts routes by state and narrows the list to the ones that need attention', () => {
+    ui.FO.settings = settings();
+    ui.FO.routes = { routes: [route({ model: 'ok-model', state: 'HEALTHY', resting: false, reason: null, score: 96 }), route(),
+      route({ model: 'tired-model', state: 'DEGRADED' }), route({ model: 'probe-model', half_open: true })], resting: 3 };
+    const draw = () => { document.getElementById('view').innerHTML = ui.foPanel(); };
+    draw();
+    const stats = Object.fromEntries([...document.querySelectorAll('#view .fo-stat')].map(x => [x.querySelector('small').textContent, x.querySelector('b').textContent]));
+    expect(stats).toEqual({ Failover: 'On', 'In service': '1', 'Rate limited': '1', Resting: '1', Probing: '1' });
+    const names = () => [...document.querySelectorAll('#view .fo-route')].map(x => x.dataset.route);
+    expect(names().at(-1)).toBe('ok-model');  // the ones that need attention come first
+    expect(document.querySelector('#view .fo-route[data-route="probe-model"]').textContent).toContain('Probing');
+    ui.SETTINGS_ACTIONS['fo-attention']();
+    draw();
+    expect(names()).toEqual(['big-model', 'tired-model', 'probe-model']);
+    ui.SETTINGS_ACTIONS['fo-clear']();
+    draw();
+    expect(names()).toHaveLength(4);
+  });
+
+  it('shows a switch for on/off settings and the unit beside a number', () => {
+    ui.FO.settings = settings(); ui.FO.routes = { routes: [], resting: 0 };
+    document.getElementById('view').innerHTML = ui.foPanel();
+    expect(document.querySelector('#view label.aim-switch #fo-enabled').checked).toBe(true);
+    const rest = document.querySelector('#view label[for="fo-rate_limit_rest_minutes"]');
+    expect(rest.querySelector('span').textContent).toBe('Rest after a rate limit');
+    expect(rest.querySelector('.fo-num em').textContent).toBe('min0 = cooldown');  // the unit, then the label's own hint
+    expect(document.querySelector('#view label[for="fo-max_failure_pct"] .fo-num em').textContent).toBe('%');
+    expect(document.querySelector('#view .fo-empty').textContent).toContain('No model has been judged yet');
+  });
+
   it('saves only the changed settings and shows the saved values', async () => {
     ui.FO.settings = settings(); ui.FO.routes = { routes: [], resting: 0 };
     routes['PUT /api/failover/settings'] = ({ values }) => ({ ...settings(), values: { ...settings().values, ...values } });
