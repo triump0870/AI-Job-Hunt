@@ -134,6 +134,16 @@ def ai_overview(db: Session = Depends(get_user_db)):
     return _call(config.overview, db, require_user_id(db))
 
 
+@router.get("/insights")
+def ai_insights(db: Session = Depends(get_user_db)):
+    """Per worker: context used, the models that did best, and models worth trying, each with the change that
+    switches to it. Separate from the overview so the Workers tab paints first; read-only."""
+    from app.services import worker_insights
+
+    user_id = require_user_id(db)
+    return worker_insights.report(db, user_id, config.draft_snapshot(db, user_id))
+
+
 # ───────────── LiteLLM connection and gateway mode ─────────────
 
 @router.put("/connection")

@@ -61,52 +61,78 @@ async function foLoad() {
   finally { FO.loading = false; render(); }
 }
 const foWhen = iso => iso ? fmtDateTime(iso) : '—';
+// A unit written into a label ("Rest after a rate limit (minutes, 0 = cooldown)") is shown beside the input instead.
+const FO_UNITS = [[/minutes?/i, 'min'], [/seconds?/i, 'sec'], [/hours?/i, 'h'], [/%/, '%'], [/\bms\b/i, 'ms']];
+function foLabel(label) {
+  const note = /\s*\(([^)]*)\)\s*$/.exec(label || ''), parts = note ? note[1].split(',').map(x => x.trim()) : [];
+  const unit = parts.length ? (FO_UNITS.find(([re]) => re.test(parts[0])) || [])[1] : '';
+  return unit ? { text: label.slice(0, note.index), unit, hint: parts.slice(1).join(', ') } : { text: label || '', unit: '', hint: '' };
+}
 function foField(f, values) {
   const id = `fo-${f.name}`, value = fv('fo', f.name, values[f.name]);
-  if (f.type === 'bool') return `<div class="field">${checkF('fo', f.name, values[f.name], esc(f.label))}<span class="settings-help">${esc(f.help)}</span></div>`;
-  if (f.type === 'choice') return `<label class="field" for="${id}"><span>${esc(f.label)}</span><select class="select" id="${id}" data-form="fo" data-field="${attr(f.name)}">${(FO.settings.algorithms || []).map(a => aimOpt(a.name, a.label, value)).join('')}</select><span class="settings-help">${esc(f.help)}</span></label>`;
-  return `<label class="field" for="${id}"><span>${esc(f.label)}</span>${inputF('fo', f.name, values[f.name], `type="number" min="${f.min}" max="${f.max}" step="1"`)}<span class="settings-help">${esc(f.help)}</span></label>`;
+  if (f.type === 'bool') return `<label class="aim-switch fo-switch" for="${id}"><input type="checkbox" id="${id}" data-form="fo" data-field="${attr(f.name)}" ${fv('fo', f.name, !!values[f.name]) ? 'checked' : ''}><i aria-hidden="true"></i><span><b>${esc(f.label)}</b><small>${esc(f.help)}</small></span></label>`;
+  if (f.type === 'choice') return `<label class="field fo-field" for="${id}"><span>${esc(f.label)}</span><select class="select" id="${id}" data-form="fo" data-field="${attr(f.name)}">${(FO.settings.algorithms || []).map(a => aimOpt(a.name, a.label, value)).join('')}</select><span class="settings-help">${esc(f.help)}</span></label>`;
+  const { text, unit, hint } = foLabel(f.label);
+  return `<label class="field fo-field" for="${id}"><span>${esc(text)}</span><span class="fo-num">${inputF('fo', f.name, values[f.name], `type="number" inputmode="numeric" min="${f.min}" max="${f.max}" step="1"`)}${unit ? `<em>${unit}${hint ? `<i>${esc(hint)}</i>` : ''}</em>` : ''}</span><span class="settings-help">${esc(f.help)}</span></label>`;
 }
 const FO_STATE = { HEALTHY: ['Healthy', 'good'], DEGRADED: ['Resting', 'bad'], COOLING: ['Rate limited', 'bad'] };
+const foState = r => r.half_open ? ['Probing', 'warn'] : (FO_STATE[r.state] || FO_STATE.HEALTHY);
+const foMs = ms => ms < 1000 ? `${ms} ms` : `${Math.round(ms / 100) / 10} s`;
 // What this model falls back to (its own fallbacks, set on its card in Models), when Models & routing is loaded.
 function foFallbacks(model) {
   const list = (typeof aimModel === 'function' && aimModel(model)?.fallback_models) || [];
-  return list.length ? `<div class="settings-help">Falls back to ${list.map(n => `<span class="mono">${esc(n)}</span>`).join(' → ')}</div>` : '';
+  return list.length ? `<div class="fo-route-note">Falls back to ${list.map(n => `<span class="mono">${esc(n)}</span>`).join(' → ')}</div>` : '';
 }
+const foMetric = (label, value, tone = '') => `<div class="fo-metric ${tone}"><small>${label}</small><b>${value}</b></div>`;
+function foRoute(r) {
+  const [label, tone] = foState(r);
+  // A provider-wide rest: every model that provider serves (and the aliases seen using it), for every worker.
+  const name = r.provider ? `${esc(r.provider)} — whole provider${r.free_only ? ' (free models)' : ''}` : esc(r.model);
+  const scope = r.worker_type ? esc(r.worker_type.replace(/_/g, ' ').toLowerCase()) : 'all workers';
+  const fail = r.samples != null ? Number(r.failure_pct ?? 0) : null;
+  const score = r.score != null ? `<span class="fo-score ${r.score >= 80 ? 'good' : r.score >= 50 ? 'warn' : 'bad'}" title="Health score ${attr(String(r.score))} of 100"><i style="width:${Math.max(0, Math.min(100, Number(r.score) || 0))}%"></i></span>` : '';
+  return `<li class="fo-route ${tone}" data-route="${attr(r.model)}">
+    <div class="fo-route-main"><div class="fo-route-name"><span class="fo-dot" aria-hidden="true"></span><b class="mono">${name}</b><span class="fo-scope">${scope}</span></div>
+      ${r.reason ? `<div class="fo-route-reason">${esc(r.reason)}</div>` : ''}${r.provider && r.members?.length ? `<div class="fo-route-note">Includes ${r.members.map(m => `<span class="mono">${esc(m)}</span>`).join(', ')}</div>` : ''}${foFallbacks(r.model)}</div>
+    <div class="fo-metrics">${foMetric('Score', r.score != null ? `${esc(String(r.score))}${score}` : '—')}${foMetric('Failures', fail != null ? `${esc(String(fail))}% <em>of ${esc(String(r.samples))}</em>` : '—', fail >= 50 ? 'bad' : '')}${foMetric('p95', r.p95_ms != null ? esc(foMs(Number(r.p95_ms))) : '—')}${r.resting ? foMetric('Back at', esc(foWhen(r.cooling_until))) : ''}</div>
+    <div class="fo-route-act">${pill(label, tone)}${r.state !== 'HEALTHY' ? btn('Put back in service', 'fo-reset', { model: r.model, worker: r.worker_type || '' }, 'sm', isBusy('fo-reset')) : ''}</div></li>`;
+}
+const foAttention = r => r.half_open || r.state !== 'HEALTHY';
 function foRoutes() {
-  const rows = (FO.routes?.routes || []).map(r => {
-    const [label, tone] = r.half_open ? ['Probing', 'warn'] : (FO_STATE[r.state] || FO_STATE.HEALTHY);
-    // A provider-wide rest: every model that provider serves (and the aliases seen using it), for every worker.
-    const name = r.provider
-      ? `<span>${esc(r.provider)} — whole provider${r.free_only ? ' (free models)' : ''}</span>${r.members?.length
-        ? `<div class="settings-help">Includes ${r.members.map(m => `<span class="mono">${esc(m)}</span>`).join(', ')}</div>` : ''}`
-      : esc(r.model);
-    return `<tr><td class="mono">${name}</td><td>${r.worker_type ? esc(r.worker_type.replace(/_/g, ' ').toLowerCase()) : '<span class="muted">all workers</span>'}</td>
-      <td>${pill(label, tone)}${r.reason ? `<div class="settings-help">${esc(r.reason)}</div>` : ''}${foFallbacks(r.model)}</td>
-      <td>${r.score != null ? esc(String(r.score)) : '—'}</td><td>${r.samples != null ? `${esc(String(r.failure_pct ?? 0))}% of ${esc(String(r.samples))}` : '—'}</td>
-      <td>${r.p95_ms != null ? `${esc(String(r.p95_ms))} ms` : '—'}</td><td>${r.resting ? esc(foWhen(r.cooling_until)) : '—'}</td>
-      <td>${r.state !== 'HEALTHY' ? btn('Put back in service', 'fo-reset', { model: r.model, worker: r.worker_type || '' }, 'sm', isBusy('fo-reset')) : ''}</td></tr>`;
-  }).join('');
-  return rows ? `<div class="mon-table-wrap aim-wide"><table class="mon-table"><thead><tr><th>Model</th><th>Worker</th><th>State</th><th>Score</th><th>Failures</th><th>p95</th><th>Resting until</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`
-    : '<p class="settings-help">No model has been judged yet. Routes appear here once workers have made requests through LiteLLM.</p>';
+  const all = FO.routes?.routes || [];
+  if (!all.length) return '<div class="fo-empty"><b>No model has been judged yet</b><span>Routes appear here once workers have made requests through LiteLLM.</span></div>';
+  const q = String(fv('fo-f', 'q', '')).toLowerCase().trim(), only = !!fv('fo-f', 'attention', false), flagged = all.filter(foAttention).length;
+  const shown = all.filter(r => (!only || foAttention(r)) && (!q || `${r.model} ${r.provider || ''} ${r.worker_type || ''} ${(r.members || []).join(' ')} ${r.reason || ''}`.toLowerCase().includes(q)))
+    .sort((a, b) => foAttention(b) - foAttention(a));
+  const tools = all.length > 5 || flagged ? `<div class="fo-tools" role="search">${all.length > 5 ? `<label class="aim-mf-search"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10.5 10.5L14 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg><input type="search" id="fo-f-q" data-form="fo-f" data-field="q" data-live="1" value="${attr(fv('fo-f', 'q', ''))}" placeholder="Search ${all.length} routes by model or worker" aria-label="Search routes" autocomplete="off" spellcheck="false"></label>` : ''}${flagged && flagged < all.length ? `<button type="button" class="aim-mf-chip unhealthy ${only ? 'on' : ''}" data-act="fo-attention" aria-pressed="${only}">Needs attention<b>${flagged}</b></button>` : ''}</div>` : '';
+  return `${tools}${shown.length ? `<ul class="fo-routes">${shown.map(foRoute).join('')}</ul>` : `<div class="fo-empty"><b>No routes match</b>${btn('Clear', 'fo-clear', {}, 'sm')}</div>`}`;
+}
+function foSummary() {
+  const all = FO.routes?.routes || [], on = fv('fo', 'enabled', !!FO.settings.values?.enabled);
+  const count = fn => all.filter(fn).length;
+  const tiles = [['In service', count(r => !foAttention(r)), 'good'], ['Rate limited', count(r => !r.half_open && r.state === 'COOLING'), 'bad'],
+    ['Resting', count(r => !r.half_open && r.state === 'DEGRADED'), 'bad'], ['Probing', count(r => r.half_open), 'warn']];
+  return `<div class="fo-stats"><div class="fo-stat ${on ? 'brand' : 'off'}"><small>Failover</small><b>${on ? 'On' : 'Off'}</b></div>${tiles.map(([label, n, tone]) => `<div class="fo-stat ${n ? tone : 'zero'}"><small>${label}</small><b>${n}</b></div>`).join('')}</div>`;
 }
 function foPanel() {
   if (FO.settings === null && !FO.loading) { FO.loading = true; foLoad(); }
   if (!FO.settings) return settingsGroup('Automatic failover', '', loading());
   const values = FO.settings.values || {}, perm = notifyPermission(), wanted = foWanted();
-  const fields = Object.fromEntries((FO.settings.fields || []).map(f => [f.name, f]));
+  const all = FO.settings.fields || [], fields = Object.fromEntries(all.map(f => [f.name, f]));
+  const main = FO_MAIN.map(name => fields[name]).filter(Boolean), rest = all.filter(f => !FO_MAIN.includes(f.name));
+  const switches = main.filter(f => f.type === 'bool'), inputs = main.filter(f => f.type !== 'bool');
   const alerts = perm === 'unsupported' ? 'This browser has no desktop notifications; you will see a message in the app instead.'
     : perm === 'denied' ? 'Notifications are blocked for this site in your browser settings; you will see a message in the app instead.'
       : wanted && perm === 'granted' ? 'Browser notifications are on.' : wanted ? 'Press the button to allow browser notifications.' : 'Browser notifications are off on this device.';
   return settingsGroup('Automatic failover', 'When a worker’s model is rate limited or keeps failing, its requests move to its backups (set per worker on the Workers tab). A resting model is tried again after a cooldown and returns when it recovers.',
-    `${FO.error ? `<p class="settings-error" role="alert">${esc(FO.error)}</p>` : ''}
-    <div class="settings-grid">${FO_MAIN.map(name => fields[name]).filter(Boolean).map(f => foField(f, values)).join('')}</div>
-    ${settingsDetails('fo-thresholds', 'Thresholds', `<p class="settings-help">When a model counts as failing, and how long it rests.</p><div class="settings-grid">${(FO.settings.fields || []).filter(f => !FO_MAIN.includes(f.name)).map(f => foField(f, values)).join('')}</div>`)}
-    <div class="row gap8 wrap">${btn(isBusy('fo-save') ? 'Saving…' : 'Save failover settings', 'fo-save', {}, 'primary sm', isBusy('fo-save'))}
-      ${btn(wanted ? 'Turn browser alerts off' : 'Turn browser alerts on', 'fo-notify', { on: wanted ? '' : '1' }, 'sm')}</div>
-    <p class="settings-help" role="status">${esc(alerts)}</p>
-    <h4 class="mt14">Model health</h4>${foRoutes()}
-    <p class="settings-help">A worker without backups never fails over.</p>`);
+    `${FO.error ? `<p class="settings-error" role="alert">${esc(FO.error)}</p>` : ''}${foSummary()}
+    <section class="fo-block"><div class="fo-block-head"><h4>Model health</h4><span>A worker without backups never fails over.</span></div>${foRoutes()}</section>
+    <section class="fo-block"><div class="fo-block-head"><h4>Failover settings</h4><span>Apply to every worker, straight away.</span></div>
+      ${switches.length ? `<div class="fo-switches">${switches.map(f => foField(f, values)).join('')}</div>` : ''}
+      ${inputs.length ? `<div class="fo-fields">${inputs.map(f => foField(f, values)).join('')}</div>` : ''}
+      ${rest.length ? settingsDetails('fo-thresholds', 'Thresholds', `<p class="settings-help">When a model counts as failing, and how long it rests.</p><div class="fo-fields">${rest.map(f => foField(f, values)).join('')}</div>`) : ''}
+      <div class="fo-foot"><div class="fo-alerts"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.2a3.6 3.6 0 0 0-3.6 3.6c0 3-1.4 4.2-1.4 4.2h10s-1.4-1.2-1.4-4.2A3.6 3.6 0 0 0 8 2.2zM6.6 12.4a1.5 1.5 0 0 0 2.8 0" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg><p class="settings-help" role="status">${esc(alerts)}</p>${btn(wanted ? 'Turn browser alerts off' : 'Turn browser alerts on', 'fo-notify', { on: wanted ? '' : '1' }, 'sm ghost')}</div>
+        ${btn(isBusy('fo-save') ? 'Saving…' : 'Save failover settings', 'fo-save', {}, 'primary sm', isBusy('fo-save'))}</div></section>`);
 }
 
 const FAILOVER_ACTIONS = {
@@ -117,6 +143,8 @@ const FAILOVER_ACTIONS = {
     FO.settings = await api('/api/failover/settings', { method: 'PUT', body: { values } });
     delete S.forms.fo; render();
   }, 'Failover settings saved'),
+  'fo-attention': () => { setF('fo-f', 'attention', !fv('fo-f', 'attention', false)); render(); },
+  'fo-clear': () => { delete S.forms['fo-f']; render(); },
   'fo-notify': async el => { const perm = await setNotifyFailover(!!el.dataset.on); toast(el.dataset.on ? (perm === 'granted' ? 'Browser alerts on' : 'Alerts on; you will see messages in the app') : 'Browser alerts off'); render(); },
   'fo-reset': el => busy('fo-reset', async () => {
     await api('/api/failover/routes/reset', { method: 'POST', body: { model: el.dataset.model, worker_type: el.dataset.worker || '' } });

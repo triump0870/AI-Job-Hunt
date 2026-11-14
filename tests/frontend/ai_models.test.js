@@ -83,9 +83,10 @@ describe('AI Orchestration → Models & routing', () => {
   it('chooses between LiteLLM and the direct provider in Settings → Route', async () => {
     routes['PUT /api/settings/ai/gateway'] = sent => ({ ...overview().gateway, gateway_enabled: sent.enabled });
     await open('settings');
-    const buttons = [...document.querySelectorAll('#view .seg[aria-label="AI gateway"] button')];
-    expect(buttons.map(b => b.textContent.trim())).toEqual(['LiteLLM gateway', 'OpenRouter (direct)']);
+    const buttons = [...document.querySelectorAll('#view .aim-routes[aria-label="AI gateway"] button')];
+    expect(buttons.map(b => b.querySelector('.aim-route-text b').textContent)).toEqual(['LiteLLM gateway', 'OpenRouter (direct)']);
     expect(buttons[0].getAttribute('aria-pressed')).toBe('true');
+    expect(buttons.map(b => b.querySelector('em').textContent)).toEqual(['In use', 'Switch']);
     expect(buttons.every(b => b.type === 'button')).toBe(true);  // inside the settings form: never a submit
     confirm.mockReturnValueOnce(false);
     buttons[1].click();  // cancelled: the route stays as it is
@@ -96,6 +97,29 @@ describe('AI Orchestration → Models & routing', () => {
     await flush(); await flush(); await flush();
     expect(body('PUT', '/api/settings/ai/gateway')).toEqual({ enabled: false });
     expect(call('GET', '/api/settings/ai').length).toBeGreaterThan(1);  // the tab reloads to show the new route
+  });
+  it('says why a route cannot be chosen yet instead of only greying it out', async () => {
+    routes['GET /api/settings/ai'] = () => ({ ...overview(), gateway: { ...overview().gateway, direct_ready: false } });
+    await open('settings');
+    const direct = document.querySelectorAll('#view .aim-route')[1];
+    expect(direct.disabled).toBe(true);
+    expect(direct.textContent).toContain('Not ready');
+    expect(direct.textContent).toContain('Save an API key for OpenRouter in Settings → API keys first');
+  });
+  it('shows the connection at a glance and folds a long version history', async () => {
+    const versions = Array.from({ length: 9 }, (_, i) => ({ id: 20 - i, version: 9 - i, changed_by: 'me', source: 'USER', summary: `Change ${9 - i}`, created_at: '2026-09-25T10:00:00' }));
+    routes['GET /api/settings/ai/versions'] = () => ({ versions });
+    routes['GET /api/settings/ai/audit'] = () => ({ entries: [] });
+    await open('settings'); await flush(); await flush();
+    expect([...document.querySelectorAll('#view .aim-conn-fact small')].map(x => x.textContent)).toEqual(['Connection', 'Version', 'Configuration', 'Last applied']);
+    expect(document.querySelector('#view .aim-conn-status').textContent).toContain('1.102.1');
+    expect(document.querySelectorAll('#view ol.aim-hist li')).toHaveLength(6);
+    expect(document.querySelector('#view ol.aim-hist li.on').textContent).toContain('Active');
+    const more = document.querySelector('#view [data-act="aim-history-all"]');
+    expect(more.textContent).toBe('Show all 9 versions');
+    ui.A['aim-history-all']();
+    expect(document.querySelectorAll('#view ol.aim-hist li')).toHaveLength(9);
+    expect(document.querySelectorAll('#view [data-act="aim-restore"]')).toHaveLength(8);  // every version but the active one
   });
   it('shows the route, connection, version and each worker’s model and backups in one place', async () => {
     routes['GET /api/settings/ai'] = () => ({ ...overview(), workers: [worker('RANKER', 'Ranker', { tier: 'PRIMARY_REASONING', fallback_model: 'local-fast', secondary_models: ['local-deep'] }, 'local-reasoning'), ...overview().workers.slice(1)] });
@@ -471,6 +495,196 @@ describe('AI Orchestration → Models & routing', () => {
     await ui.A['aim-model-test']({ dataset: { name: 'mystery' } });
     expect(ui.AIM.tests['model:mystery'].latency_ms).toBe(420);
     expect(text()).toContain('420 ms');
+  });
+
+  it('a failed model test shows a top notification and a one-line tooltip on the card, not a block', async () => {
+    const error = 'litellm.PaymentRequiredError: Ollama_chatException - {"error":"Add usage credits"} LiteLLM: model group \'mystery\' failed';
+    routes['POST /api/settings/ai/models/mystery/test'] = () => ({ success: false, error });
+    await open('models');
+    await ui.A['aim-model-test']({ dataset: { name: 'mystery' } });
+    const t = document.getElementById('toast');
+    expect(t.className).toBe('toast bad at-top');
+    expect(t.querySelector('strong').textContent).toBe('mystery · Payment required');
+    expect(t.querySelector('span').textContent).toBe(error);
+    const line = document.querySelector('[data-model="mystery"] .aim-mcard-err');
+    expect(line.dataset.tip).toBe(error);
+    expect(line.querySelector('b').textContent).toBe('Payment required');
+    expect(document.querySelector('[data-model="mystery"] .settings-error')).toBeNull();
+    t.click();
+    expect(t.hidden).toBe(true);
+  });
+
+  const insights = () => ({ window_days: 30, min_samples: 20, min_success_pct: 90, platform: false, workers: {
+    RANKER: { requests: 120, current: 'local-reasoning', context: { samples: 110, avg_input_tokens: 6200, p90_input_tokens: 21000, window: 24576, model: 'local-reasoning', utilization_pct: 25.2, near_limit: true },
+      best: [{ model: 'local-deep', samples: 60, success_pct: 99, schema_valid_pct: 100, p50_ms: 1400, score: 99.4, is_current: false, apply: { model_mode: 'FIXED', primary_model: 'local-deep', fallback_model: 'local-reasoning', secondary_models: ['local-fast'] } },
+        { model: 'local-reasoning', samples: 60, success_pct: 80, schema_valid_pct: null, p50_ms: 900, score: 88, is_current: true, apply: null }],
+      suggestions: [{ model: 'mystery', basis: 'OTHER_WORKERS', score: 99, flags: ['CAPACITY_PROVEN'], workers: ['Reviewer'], stats: { samples: 40, success_pct: 100, schema_valid_pct: 98, p50_ms: 700 }, apply: { model_mode: 'FIXED', primary_model: 'mystery', fallback_model: 'local-reasoning', secondary_models: [] } },
+        { model: 'local-fast', basis: 'PLATFORM', score: 97, flags: [], stats: { success_pct: 97, schema_valid_pct: null, avg_ms: 12000 }, apply: { model_mode: 'FIXED', primary_model: 'local-fast', fallback_model: null, secondary_models: [] } },
+        { model: 'local-deep', basis: 'CATALOG', score: 80, flags: [], catalog_score: 80, current_catalog_score: 40, apply: { model_mode: 'FIXED', primary_model: 'local-deep', fallback_model: null, secondary_models: [] } }],
+      needs: { context_tokens: 26000, typical_request_tokens: 26000, structured_output: true }, screened: { considered: 9, rejected: { CONTEXT_UNKNOWN: 2, REFUSED_AS_TOO_LARGE: 1, LOW_SUCCESS: 2, NO_EVIDENCE: 1 } } },
+    REVIEWER: { requests: 0, current: 'local-deep', context: { samples: 0, avg_input_tokens: null, p90_input_tokens: null, window: 24576, model: 'local-deep', utilization_pct: null, near_limit: false }, best: [], suggestions: [], needs: { context_tokens: 16384, typical_request_tokens: null, structured_output: true }, screened: { considered: 4, rejected: { STRUCTURED_OUTPUT_UNKNOWN: 1, NOT_BETTER: 3 } } },
+    INBOX_CLASSIFIER: { requests: 9, current: 'jobhunt-auto', context: { samples: 9, avg_input_tokens: 800, p90_input_tokens: 900, window: null, model: 'jobhunt-auto', utilization_pct: null, near_limit: false }, best: [], suggestions: [] } } });
+  const withInsights = async (data = insights()) => { routes['GET /api/settings/ai/insights'] = () => data; ui.AIM.insights = undefined; ui.AIM.insightsStale = false; ui.AIM.insightOpen = {}; await open('workers'); await flush(); };
+  const row = type => document.querySelector(`[data-worker-row="${type}"]`);
+
+  it('shows each worker’s average context against its model’s window', async () => {
+    await withInsights();
+    const meter = row('RANKER').querySelector('.aim-ctx');
+    expect(meter.textContent).toBe('6.1K avg prompt · 25.2% of 24K');
+    expect(meter.className).toContain('warn');  // its larger requests are close to the window
+    expect(meter.title).toContain('9 in 10 are under 21,000');
+    expect(meter.querySelector('i').style.width).toBe('25.2%');
+    expect(row('REVIEWER').querySelector('.aim-ctx')).toBeNull();  // nothing sent lately: nothing to show
+    const unknown = row('INBOX_CLASSIFIER').querySelector('.aim-ctx');
+    expect(unknown.textContent).toBe('800 avg prompt');
+    expect(unknown.querySelector('.aim-ctx-bar')).toBeNull();  // no window known: no empty bar
+  });
+
+  it('opens a worker’s insights: best models, models worth trying and why', async () => {
+    await withInsights();
+    const toggle = row('RANKER').querySelector('.aim-ins-toggle');
+    expect(toggle.textContent).toBe('✦2');  // measured suggestions only; the catalog idea waits in the panel
+    expect(toggle.getAttribute('aria-label')).toBe('Insights for Ranker, 2 suggestions');
+    expect(row('REVIEWER').querySelector('.aim-ins-toggle').textContent).toBe('Insights');
+    expect(document.querySelector('.aim-ins')).toBeNull();
+    await ui.A['aim-insight-toggle']({ dataset: { worker: 'RANKER' } });
+    const panel = document.getElementById('aim-ins-RANKER').textContent;
+    expect(panel).toContain('Average prompt6.1K');
+    expect(panel).toContain('99% ok · JSON 100% · 1.4 s typical · 60 requests');
+    expect(panel).toContain('In use');
+    expect(panel).toContain('On requests this size in Reviewer: 100% ok · JSON 98% · 700 ms typical · 40 requests');
+    expect(panel).toContain('window not reported, but it has answered requests this large');
+    // Every other model is accounted for, by the check it failed.
+    expect(panel).toContain('Not suggested: 3 not shown to fit a 25.4K-token request; 2 under 90% success on comparable requests; 1 with no requests of this size yet.');
+    expect(panel).toContain('answers at least 90% of comparable ones and beats the model in use');
+    expect(panel).toContain('Across accounts on this server: 97% ok · 12 s typical');
+    expect(panel).toContain('Catalog score 80 vs 40 for the current model');
+    expect(panel).toContain('then local-reasoning → local-fast');
+    expect(document.querySelectorAll('#aim-ins-RANKER [data-act="aim-insight-apply"]')).toHaveLength(4);  // not the model in use
+    await ui.A['aim-insight-toggle']({ dataset: { worker: 'REVIEWER' } });
+    const empty = document.getElementById('aim-ins-REVIEWER').textContent;
+    expect(empty).toContain('No answered requests in the last 30 days');
+    expect(empty).toContain('No model has 20 requests from Reviewer yet');
+    expect(empty).toContain('Nothing looks better than what it uses now');
+    expect(empty).toContain('Checked 4 other models: 1 without proven JSON output; 3 no better than the model in use.');
+    await ui.A['aim-insight-toggle']({ dataset: { worker: 'RANKER' } });
+    expect(document.getElementById('aim-ins-RANKER')).toBeNull();
+  });
+
+  it('switches a worker’s model and backups in one tap, as one save', async () => {
+    routes['PUT /api/settings/ai/workers/RANKER'] = () => ({ draft_revision: 8 });
+    routes['POST /api/settings/ai/apply'] = () => ({ status: 'SYNCED', version: 5 });
+    await withInsights();
+    await ui.A['aim-insight-toggle']({ dataset: { worker: 'RANKER' } });
+    await ui.A['aim-insight-apply']({ dataset: { worker: 'RANKER', kind: 'best', index: '0' } });
+    expect(call('PUT', '/api/settings/ai/workers/RANKER')).toHaveLength(1);
+    expect(body('PUT', '/api/settings/ai/workers/RANKER')).toEqual({ revision: 7, model_mode: 'FIXED', primary_model: 'local-deep', fallback_model: 'local-reasoning', secondary_models: ['local-fast'] });
+    expect(document.getElementById('toast').textContent).toBe('Ranker now uses local-deep, then local-reasoning → local-fast · v5');
+    await flush();
+    expect(call('GET', '/api/settings/ai/insights').length).toBeGreaterThan(1);  // read again after the change
+    await ui.A['aim-insight-apply']({ dataset: { worker: 'RANKER', kind: 'suggestions', index: '1' } });
+    expect(body('PUT', '/api/settings/ai/workers/RANKER').primary_model).toBe('local-fast');
+    expect(document.getElementById('toast').textContent).toBe('Ranker now uses local-fast · v5');
+    await ui.A['aim-insight-apply']({ dataset: { worker: 'RANKER', kind: 'best', index: '1' } });  // the model in use: nothing to do
+    expect(call('PUT', '/api/settings/ai/workers/RANKER')).toHaveLength(2);
+  });
+
+  it('a refused switch is explained like any refused save', async () => {
+    routes['PUT /api/settings/ai/workers/RANKER'] = () => ({ draft_revision: 8 });
+    routes['POST /api/settings/ai/apply'] = () => [{ detail: { message: 'The configuration is not valid', validation: { errors: [{ path: 'workers.RANKER.primary_model', message: 'mystery is not served by LiteLLM', subject: 'Ranker' }], warnings: [] } } }, 422];
+    await withInsights();
+    await ui.A['aim-insight-apply']({ dataset: { worker: 'RANKER', kind: 'suggestions', index: '0' } });
+    expect(text()).toContain('Not saved.');
+    expect(text()).toContain('Ranker: mystery is not served by LiteLLM');
+  });
+
+  it('finds workers by name or model and narrows to those with a suggestion', async () => {
+    await withInsights();
+    const shown = () => [...document.querySelectorAll('[data-worker-row]')].map(r => r.dataset.workerRow);
+    expect(shown()).toEqual(['RANKER', 'REVIEWER', 'INBOX_CLASSIFIER']);
+    expect(document.querySelector('[data-chip="suggest"] b').textContent).toBe('1');
+    expect(document.querySelector('[data-chip="near"] b').textContent).toBe('1');
+    expect(document.querySelector('[data-chip="unhealthy"]')).toBeNull();
+    ui.setF('aim-wf', 'q', 'local-deep'); ui.render();
+    expect(shown()).toEqual(['REVIEWER']);
+    expect(text()).toContain('Showing 1 of 3');
+    ui.setF('aim-wf', 'q', 'zzz'); ui.render();
+    expect(text()).toContain('No workers match');
+    await ui.A['aim-wf-clear']();
+    await ui.A['aim-wf-chip']({ dataset: { chip: 'suggest' } });
+    expect(shown()).toEqual(['RANKER']);
+    await ui.A['aim-wf-chip']({ dataset: { chip: 'suggest' } });
+    expect(shown()).toHaveLength(3);
+  });
+
+  it('keeps a long backup chain to one line and flags only measured suggestions', async () => {
+    routes['GET /api/settings/ai'] = () => { const o = overview(); Object.assign(o.workers[0].config, { fallback_model: 'local-fast', secondary_models: ['local-deep', 'mystery', 'spare'] }); return o; };
+    const data = insights(); data.workers.REVIEWER.suggestions = [data.workers.RANKER.suggestions[2]];  // a catalog idea only
+    await withInsights(data);
+    const chain = [...row('RANKER').querySelectorAll('.aim-chain li')].map(li => li.textContent);
+    expect(chain).toEqual(['1local-fast', '2local-deep', '+2']);
+    expect(row('RANKER').querySelector('.aim-chain-more').title).toBe('Backup 3: mystery\nBackup 4: spare');
+    expect(row('REVIEWER').querySelector('.aim-ins-toggle').className).not.toContain('has');
+    expect(document.querySelector('[data-chip="suggest"] b').textContent).toBe('1');
+    await ui.A['aim-insight-toggle']({ dataset: { worker: 'REVIEWER' } });
+    expect(document.getElementById('aim-ins-REVIEWER').textContent).toContain('Catalog score 80');
+  });
+
+  it('leaves the extras out when insights cannot be read', async () => {
+    routes['GET /api/settings/ai/insights'] = () => [{ detail: 'boom' }, 500];
+    ui.AIM.insights = undefined; await open('workers'); await flush();
+    expect(ui.AIM.insights).toBeNull();
+    expect(document.querySelector('.aim-ctx')).toBeNull();
+    expect(document.querySelector('.aim-ins-toggle')).toBeNull();
+    expect(document.querySelectorAll('[data-worker-row]')).toHaveLength(3);
+  });
+
+  it('searches, filters and sorts the model catalog', async () => {
+    routes['GET /api/settings/ai'] = () => { const o = overview(); o.models[0].health_status = 'UNHEALTHY'; o.models[0].hosting = 'LOCAL'; o.models[2].hosting = 'CLOUD'; o.models[2].health_status = 'HEALTHY'; o.models[2].health_latency_ms = 90; return o; };
+    await open('models');
+    const cards = () => [...document.querySelectorAll('.aim-mcard')].map(c => c.dataset.model);
+    expect(cards()).toEqual(['local-fast', 'local-reasoning', 'local-deep', 'mystery']);
+    expect(document.querySelector('[data-chip="use:USED"] b').textContent).toBe('1');
+    expect(document.querySelector('.aim-mf-status')).toBeNull();
+    // A worker's name finds the model it uses; every word must match.
+    ui.setF('aim-mf', 'q', 'ranker'); ui.render();
+    expect(cards()).toEqual(['local-reasoning']);
+    expect(document.querySelector('.aim-mf-status').textContent).toContain('Showing 1 of 4');
+    ui.setF('aim-mf', 'q', 'local deep'); ui.render();
+    expect(cards()).toEqual(['local-deep']);
+    ui.setF('aim-mf', 'q', 'nothing-here'); ui.render();
+    expect(cards()).toEqual([]);
+    expect(text()).toContain('No models match');
+    await ui.A['aim-mf-clear']();
+    expect(cards()).toHaveLength(4);
+    // Chips: any within a group, all across groups.
+    await ui.A['aim-mf-chip']({ dataset: { chip: 'use:UNUSED' } });
+    expect(cards()).toEqual(['local-fast', 'local-deep', 'mystery']);
+    await ui.A['aim-mf-chip']({ dataset: { chip: 'host:LOCAL' } });
+    await ui.A['aim-mf-chip']({ dataset: { chip: 'host:CLOUD' } });
+    expect(cards()).toEqual(['local-fast', 'local-deep']);
+    expect(document.querySelector('[data-chip="host:LOCAL"]').getAttribute('aria-pressed')).toBe('true');
+    await ui.A['aim-mf-chip']({ dataset: { chip: 'use:UNUSED' } });  // off again
+    expect(cards()).toEqual(['local-fast', 'local-deep']);
+    await ui.A['aim-mf-clear']();
+    // Sorting: problems first by health, then the fastest known latency first.
+    ui.setF('aim-mf', 'sort', 'health'); ui.render();
+    expect(cards()).toEqual(['local-fast', 'local-reasoning', 'mystery', 'local-deep']);
+    ui.setF('aim-mf', 'sort', 'latency'); ui.render();
+    expect(cards()[0]).toBe('local-deep');
+    ui.setF('aim-mf', 'sort', 'used'); ui.render();
+    expect(cards()[0]).toBe('local-reasoning');
+    ui.setF('aim-mf', 'sort', 'name'); ui.render();
+    expect(cards()).toEqual(['local-deep', 'local-fast', 'local-reasoning', 'mystery']);
+    ui.setF('aim-mf', 'sort', 'catalog'); ui.render();
+  });
+
+  it('names errors it cannot read as a plain failure', async () => {
+    routes['POST /api/settings/ai/models/mystery/test'] = () => ({ success: false, error: 'connection reset' });
+    await open('models');
+    await ui.A['aim-model-test']({ dataset: { name: 'mystery' } });
+    expect(document.getElementById('toast').querySelector('strong').textContent).toBe('mystery · Test failed');
+    expect(document.querySelector('[data-model="mystery"] .aim-mcard-err b').textContent).toBe('hover for details');
   });
 
   it('adds a local Ollama model from the server Ollama list', async () => {

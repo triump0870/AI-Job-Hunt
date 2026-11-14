@@ -68,9 +68,15 @@ const locationOptions = facets => [['all', 'All locations'], ...(facets || []).m
 const locationKey = loc => { const l = (loc || '').trim(); return !l ? 'Not listed' : /remote/i.test(l) ? 'Remote' : l.split(',')[0].trim(); };
 const qs = obj => new URLSearchParams(Object.entries(obj).filter(([, v]) => v !== '' && v !== null && v !== undefined)).toString();
 let toastTimer;
-function toast(msg, bad = false) {
-  const t = $('#toast'); t.textContent = msg; t.className = 'toast' + (bad ? ' bad' : ''); t.hidden = false;
-  clearTimeout(toastTimer); toastTimer = setTimeout(() => { t.hidden = true; }, 4000);
+// `opts.title` adds a bold first line; `opts.top` shows it at the top of the screen (click to dismiss); `opts.ms` how long.
+function toast(msg, bad = false, opts = {}) {
+  const t = $('#toast'); t.className = 'toast' + (bad ? ' bad' : '') + (opts.top ? ' at-top' : ''); t.hidden = false;
+  if (opts.title) {
+    const head = document.createElement('strong'), body = document.createElement('span');
+    head.textContent = opts.title; body.textContent = msg; t.replaceChildren(head, body);
+  } else t.textContent = msg;
+  t.onclick = opts.top ? () => { t.hidden = true; } : null;
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => { t.hidden = true; }, opts.ms || 4000);
 }
 async function busy(key, fn, okMsg) {
   if (S.busy[key]) return;

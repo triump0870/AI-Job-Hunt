@@ -35,7 +35,7 @@ Before implementing a change, locate its owner and search all callers. Do not cr
 
 ## 3. Non-negotiable invariants
 
-1. **Tenant isolation.** User-owned models are registered in `app/tenancy.py::OWNED_MODELS`; explicitly filter telemetry and any intentionally unregistered tables by `user_id`. Never leak one account's resume, answers, credentials, cookies, postings, or traces to another.
+1. **Tenant isolation.** User-owned models are registered in `app/tenancy.py::OWNED_MODELS`; explicitly filter telemetry and any intentionally unregistered tables by `user_id`. Never leak one account's resume, answers, credentials, cookies, postings, or traces to another. The single reviewed exception is `worker_insights.platform_model_stats`: per-provider-model rates only, behind a minimum-accounts threshold and `PLATFORM_MODEL_STATS_ENABLED`; do not widen it or add another cross-account read without the same safeguards and tests.
 2. **Instrumented outbound calls.** Production HTTP uses `external_client` and SDK boundaries use `external_operation` / `track_external_call`. No unmanaged HTTP clients in `app/`; preserve `tests/test_external_api_guard.py`.
 3. **Centralized generation.** All production model generation uses `LLMClient.generate_prompt` and registered prompts; LangGraph uses `GatewayChatModel`. Models, parameters, fallbacks and escalation are configuration, never hard-coded worker choices. Preserve LiteLLM routing when enabled.
 4. **Grounded candidate facts.** Resume extraction preserves source text and provenance. Unverified, rejected, or held-back facts must not become applicant claims. Tailoring cannot invent qualifications, dates, achievements, work authorization, salary, degrees, or certifications.

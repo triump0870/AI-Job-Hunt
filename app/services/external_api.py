@@ -739,7 +739,9 @@ class ExportBlocked(Exception):
 
 def requests_session(provider: str, *, service: str = "", operation: str = "",
                      pre_send: Callable[[bytes | None], str | None] | None = None,
-                     pre_send_request: Callable[[str, Any], str | None] | None = None) -> Any:
+                     pre_send_request: Callable[[str, Any], str | None] | None = None,
+                     paused: Callable[[], str | None] | None = None,
+                     on_response: Callable[[Any], None] | None = None) -> Any:
     """A `requests.Session` for a vendor SDK that only accepts one (LangSmith), measured like `external_client`.
 
     `Session.send` is the funnel for every request the SDK makes, whatever adapters it mounts, so nothing gets past:
@@ -747,11 +749,18 @@ def requests_session(provider: str, *, service: str = "", operation: str = "",
     the refusal is recorded as a CLIENT_ERROR with `blocked_by`); `pre_send_request(url, headers)` may refuse it the same
     way for its URL or headers; a transport failure is recorded and answered with a 503 instead of raising,
     so an outage of the provider never reaches the code that called the SDK. Bodies are never stored.
+
+    `paused()` lets the owner stop sending for a while (the provider said its quota is spent): while it returns a
+    reason nothing is sent and nothing is stored — the owner logs the pause once instead of a row per request — and
+    the SDK gets a 400, which it does not retry. `on_response(response)` shows the owner each real answer so it can
+    start such a pause; what it raises is logged and ignored.
     """
     import requests
 
     class InstrumentedSession(requests.Session):
         def send(self, request: Any, **kwargs: Any) -> Any:
+            if paused is not None and (why := paused()):
+                return _synthetic(request, 400, why)
             call = ExternalCall(provider=provider, service=service, operation=operation)
             started, clock = utcnow(), time.monotonic()
             body = request.body.encode() if isinstance(request.body, str) else request.body
@@ -777,6 +786,11 @@ def requests_session(provider: str, *, service: str = "", operation: str = "",
                 return _synthetic(request, 503, "provider unavailable")
             record(call, started_at=started, completed_at=_finished(started, clock), status_code=response.status_code,
                    response_bytes=len(response.content or b""), headers=response.headers, **measured)
+            if on_response is not None:
+                try:
+                    on_response(response)
+                except Exception:  # noqa: BLE001  the owner's bookkeeping must not reach the SDK's caller
+                    log.warning("could not handle a %s response", provider, exc_info=True)
             return response
 
     return InstrumentedSession()
