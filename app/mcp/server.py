@@ -26,9 +26,16 @@ TOOL_NAMES = ("list_jobs_for_tailoring", "get_tailoring_context", "save_tailored
               "get_bulk_operation_status", "list_jobs_for_application", "get_job_packet",
               "search_application_knowledge", "request_human_answer", "begin_application_submission",
               "release_application_claim", "record_application_result", "find_jobs", "get_job_documents",
-              "list_followups_due", "save_followup_draft", "record_followup_sent", "skip_followup")
+              "list_followups_due", "save_followup_draft", "record_followup_sent", "skip_followup",
+              "list_model_sources", "search_models", "suggest_models", "get_model_details")
+# Read-only tools about models, not about any job, application or follow-up: audited with no entity.
+NO_ENTITY_TOOLS = ("get_bulk_operation_status", "search_application_knowledge", "list_model_sources",
+                   "search_models", "suggest_models", "get_model_details")
 
 JobIds = Annotated[list[int], Field(description="Job IDs from list_jobs_for_tailoring or list_jobs_for_review")]
+Providers = Annotated[str | list[str] | None, Field(description=(
+    "Platforms, e.g. openrouter, groq, ollama (cloud and local), ollama_cloud, ollama_local, openai, anthropic, "
+    "gemini, gateway"))]
 
 
 def run_tool(sessions: SessionFactory, user_id: int, name: str, handler: Callable[..., dict[str, Any]],
@@ -49,7 +56,7 @@ def run_tool(sessions: SessionFactory, user_id: int, name: str, handler: Callabl
             items = result.get("results")
             job_id = arguments.get("job_id") or next(
                 (a.get("job_id") for a in arguments.values() if isinstance(a, dict)), None)
-            entity_type = None if name in ("get_bulk_operation_status", "search_application_knowledge") else "job"
+            entity_type = None if name in NO_ENTITY_TOOLS else "job"
             if not isinstance(job_id, int):
                 # Follow-up tools name a follow-up or an application, never a job.
                 entity_type, job_id = next(((kind, arguments[key]) for key, kind in
@@ -326,6 +333,75 @@ def build_server(user_id: int, sessions: SessionFactory | None = None) -> MCPSer
     ) -> dict[str, Any]:
         """The candidate decided not to follow up: cancels the draft and clears the follow-up date."""
         return call("skip_followup", followup_id=followup_id, application_id=application_id, reason=reason)
+
+    # ───────────── model market: read-only suggestions ─────────────
+
+    @server.tool()
+    def list_model_sources(
+            refresh: Annotated[bool, Field(description="Fetch every catalog again now instead of using the cache")] = False,
+    ) -> dict[str, Any]:
+        """The model catalogs the suggestions draw on (OpenRouter, LiteLLM price list, Artificial Analysis, Groq,
+        Ollama Cloud, local Ollama): configured or not, how many models each listed, when, and any error."""
+        return call("list_model_sources", refresh=refresh)
+
+    @server.tool()
+    def search_models(
+            query: Annotated[str | None, Field(description="Substring of the model id or name, e.g. gpt-oss")] = None,
+            provider: Providers = None,
+            free_only: Annotated[bool, Field(description="Only models that cost nothing per token")] = False,
+            min_context: Annotated[int | None, Field(description="Smallest context window, in tokens")] = None,
+            needs_structured_output: Annotated[bool, Field(description="Exclude models known not to support JSON "
+                                                                       "schema output")] = False,
+            needs_tools: Annotated[bool, Field(description="Exclude models known not to support tool calls")] = False,
+            needs_reasoning: Annotated[bool, Field(description="Exclude models known not to reason")] = False,
+            max_input_cost_per_million: Annotated[float | None, Field(description="USD per 1M input tokens")] = None,
+            in_gateway_only: Annotated[bool, Field(description="Only models your LiteLLM gateway already serves")] = False,
+            limit: Annotated[int, Field(description="Maximum models (default 20, at most 50)")] = 20,
+    ) -> dict[str, Any]:
+        """Models on offer across platforms with price per 1M tokens, context window, capabilities, benchmark speed
+        and quality where known, and — for your gateway's models — health, which workers use them and what your own
+        requests measured. Your gateway's models first, then cheapest. Unknown figures are null."""
+        return call("search_models", query=query, provider=provider, free_only=free_only, min_context=min_context,
+                    needs_structured_output=needs_structured_output, needs_tools=needs_tools,
+                    needs_reasoning=needs_reasoning, max_input_cost_per_million=max_input_cost_per_million,
+                    in_gateway_only=in_gateway_only, limit=limit)
+
+    @server.tool()
+    def suggest_models(
+            worker_type: Annotated[str | None, Field(description=(
+                "A Job Hunt OS worker, e.g. RANKER, REVIEWER, TAILOR, JD_PARSER: its needs and typical request size "
+                "come from its configuration and your own requests, and the answer compares with its current model"))] = None,
+            use_case: Annotated[str | None, Field(description="A label for what the model is for (not interpreted)")] = None,
+            objective: Annotated[str, Field(description="balanced, cheapest, fastest, quality or reliable")] = "balanced",
+            provider: Providers = None,
+            exclude_provider: Providers = None,
+            free_only: Annotated[bool, Field(description="Only models that cost nothing per token")] = False,
+            min_context: Annotated[int | None, Field(description="Smallest context window, in tokens")] = None,
+            needs_structured_output: Annotated[bool, Field(description="Require JSON schema output support")] = False,
+            needs_tools: Annotated[bool, Field(description="Require tool calling")] = False,
+            needs_reasoning: Annotated[bool, Field(description="Require a reasoning model")] = False,
+            max_cost_per_request: Annotated[float | None, Field(description="USD per request, at the typical size")] = None,
+            in_gateway_only: Annotated[bool, Field(description="Only models your LiteLLM gateway already serves")] = False,
+            limit: Annotated[int, Field(description="How many suggestions (default 5, at most 10)")] = 5,
+    ) -> dict[str, Any]:
+        """The top models for a worker or use case, ranked deterministically by the objective over cost per request,
+        latency, benchmark quality, reliability and schema validity. Each comes with its figures and their sources,
+        how many metrics were known, reasons, and the difference from the worker's current model. Read-only."""
+        return call("suggest_models", worker_type=worker_type, use_case=use_case, objective=objective,
+                    provider=provider, exclude_provider=exclude_provider, free_only=free_only,
+                    min_context=min_context, needs_structured_output=needs_structured_output,
+                    needs_tools=needs_tools, needs_reasoning=needs_reasoning,
+                    max_cost_per_request=max_cost_per_request, in_gateway_only=in_gateway_only, limit=limit)
+
+    @server.tool()
+    def get_model_details(
+            model_id: Annotated[str, Field(description=(
+                "An id from search_models or suggest_models (platform/model, e.g. openrouter/openai/gpt-oss-120b), "
+                "or one of your gateway model names"))],
+    ) -> dict[str, Any]:
+        """Everything known about one model on every platform that serves it, including OpenRouter's live
+        per-provider price, uptime and latency, and your gateway's health and measurements for it."""
+        return call("get_model_details", model_id=model_id)
 
     @server.prompt()
     def tailor_jobs(minimum_fit_score: float | None = None, limit: int = 5) -> str:

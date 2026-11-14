@@ -880,6 +880,21 @@ row, latency, cooldowns, recovery) are yours to set; a route with too few reques
 (`model_health`, every 2 minutes) judges the windows. Failover is an overlay: it does not create configuration
 versions, and Route health lists every resting model with a *Put back in service* button.
 
+**Rate limits are shared across workers and models.**
+- **Whole provider.** A 429 that names its provider (LiteLLM's `OpenrouterException - …`) rests that whole provider for every worker, until the time the provider named, or else for your rest setting. Route health shows it as *openrouter — whole provider*.
+- **Which models it covers.** The rest covers every model the configuration says that provider serves. It also covers each gateway alias (such as a LiteLLM complexity router) seen refusing with that provider's 429 on a request sent without fallbacks.
+- **Free quota.** OpenRouter's shared free-model quota (`free-models-per-day`) rests only its free models; paid OpenRouter models stay in use.
+- **Ollama.** Usage caps on Ollama's hosted (cloud) models never rest local Ollama models.
+- **No provider named.** A 429 that names no provider rests just that model, as before.
+
+**While a model is rate limited:**
+- It is not sent as a LiteLLM fallback, and it is not called while another model can answer.
+- A model resting for errors, not a rate limit, stays a last resort.
+- When every model a worker can use is rate limited, nothing is sent. The task waits for the first reset without using an attempt.
+- *Run now* still sends.
+
+**Quality escalation** goes to the escalation model, or to that model's own fallbacks while it is rate limited, never to a worker backup. If none of them can answer, or the escalated request fails, the first valid answer is kept, and Monitoring → Logs records `escalation_skipped`. A schema failure with nowhere to escalate goes to its correction retry, and a manual escalation reports its failure.
+
 **Deleting a model.** On a model's card, ⋯ → **Delete model** removes it from Job Hunt OS: it leaves every picker and
 the configuration, and **Sync from LiteLLM** does not bring it back (a model Job Hunt OS deployed is also removed from
 LiteLLM; one LiteLLM serves on its own stays there). While anything still uses it (a worker, a tier, another model's
@@ -2471,6 +2486,19 @@ A valid token starts the server and it waits silently for a client (stop it with
 revoked token prints why and exits. Then `claude mcp list` should show `job-hunt-os` as connected, and `/mcp` inside
 a session lists its tools and prompts. The prompts run as slash commands, e.g. `/mcp__job-hunt-os__follow_up`.
 
+### Connecting Codex
+
+[Codex](https://developers.openai.com/codex) starts the same stdio server. Add it to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.job-hunt-os]
+command = "/absolute/path/to/AI-Job-Hunt/.venv/bin/python"
+args = ["-m", "app.mcp"]
+env = { PYTHONPATH = "/absolute/path/to/AI-Job-Hunt", JOBHUNT_MCP_TOKEN = "jhos_mcp_paste-your-token-here" }
+```
+
+Each token belongs to one account, so Codex sees only that account's data, exactly like Claude.
+
 ### Verifying the connection
 
 In a new Claude Desktop chat, the tools menu should list **job-hunt-os**. Ask:
@@ -2479,7 +2507,7 @@ In a new Claude Desktop chat, the tools menu should list **job-hunt-os**. Ask:
 Show me the available Job Hunt OS tools.
 ```
 
-You should see `list_jobs_for_tailoring`, `get_tailoring_context`, `save_tailored_resume`, `save_bulk_tailored_resumes`, `list_jobs_for_review`, `get_review_context`, `save_review`, `save_bulk_reviews`, `get_bulk_operation_status`, `list_jobs_for_application`, `get_job_packet`, `find_jobs`, `get_job_documents`, `search_application_knowledge`, `request_human_answer`, `begin_application_submission`, `release_application_claim`, `record_application_result`, `list_followups_due`, `save_followup_draft`, `record_followup_sent` and `skip_followup`, plus the prompts `tailor_jobs`, `review_applications`, `apply_to_jobs` and `follow_up`. Then ask:
+You should see `list_jobs_for_tailoring`, `get_tailoring_context`, `save_tailored_resume`, `save_bulk_tailored_resumes`, `list_jobs_for_review`, `get_review_context`, `save_review`, `save_bulk_reviews`, `get_bulk_operation_status`, `list_jobs_for_application`, `get_job_packet`, `find_jobs`, `get_job_documents`, `search_application_knowledge`, `request_human_answer`, `begin_application_submission`, `release_application_claim`, `record_application_result`, `list_followups_due`, `save_followup_draft`, `record_followup_sent`, `skip_followup`, `list_model_sources`, `search_models`, `suggest_models` and `get_model_details`, plus the prompts `tailor_jobs`, `review_applications`, `apply_to_jobs` and `follow_up`. Then ask:
 
 ```text
 Show me the top 5 jobs waiting for tailoring.
@@ -2624,6 +2652,40 @@ Claude
 The Tracker does the same with **Mark sent** and **Skip** beside *Review & copy*, through the same service
 (`app/services/followups.py`), so both write the same rows. The `follow_up` prompt starts the workflow with the rules
 included. Audit rows for these tools keep IDs, counts and statuses only, never the message.
+
+### Model suggestions (model market)
+
+Four read-only tools let Claude or Codex answer "which model should this worker use?" with real figures:
+
+| Tool | What it answers |
+|---|---|
+| `list_model_sources` | which catalogs answered, how many models each listed, when, and any error (`refresh: true` refetches) |
+| `search_models` | models across platforms: price per 1M tokens, context window, structured output / tools / reasoning support, benchmark quality and speed, and — for your gateway's models — health, the workers using them and what your own requests measured |
+| `suggest_models` | the top models for a worker (`worker_type: RANKER`) or a use case, ranked by `objective` (`balanced`, `cheapest`, `fastest`, `quality`, `reliable`), each with cost per request and per 1,000 requests, latency, reasons, how many metrics were known, and the difference from the worker's current model |
+| `get_model_details` | one model on every platform that serves it, with OpenRouter's live per-provider price and uptime |
+
+Sources, each cached in-process for `MODEL_MARKET_CACHE_HOURS` (6 by default):
+
+| Source | Key | Gives |
+|---|---|---|
+| OpenRouter models API | none | prices, context, capabilities; per-provider uptime for a short list when suggesting |
+| LiteLLM price list (GitHub) | none | prices and context across OpenAI, Anthropic, Gemini, Groq, Bedrock … |
+| Groq models API | `GROQ_API_KEY` | the models Groq serves now; prices from the LiteLLM list's exact `groq/<id>` row |
+| Ollama Cloud catalog | `OLLAMA_API_KEY` (optional) | hosted models; a subscription, so no per-token price |
+| Your local Ollama | none (`OLLAMA_BASE_URL`) | installed models, `$0` |
+| Artificial Analysis | `ARTIFICIAL_ANALYSIS_API_KEY` | benchmark quality index, output speed, time to first token |
+| Your gateway and telemetry | — | which models you can call, their health, and your own 7-day latency, failure rate, schema validity and cost |
+
+How a suggestion is made (`app/services/model_market.py`): hard filters first (context window, required capabilities,
+price limits, platforms). Only a *known* shortfall excludes; unknown support is kept and flagged. Each known metric is
+then ranked among the candidates and weighted by the objective. A metric nobody reported is left out, never counted as
+zero, and a model with too few known metrics is listed as insufficient data instead of ranked. Your own measurements
+replace web figures once a model has 20 requests. Without an Artificial Analysis key no quality score is known, so
+rankings favour cheap, available models and say so. Free OpenRouter models are flagged as sharing one daily quota per
+account. Rows from different sources are joined only on exact ids, and each row lists its sources.
+
+The tools never change a worker's model: apply a suggestion in AI Orchestration → Models (draft → preview → apply).
+`MODEL_MARKET_ENABLED=false` stops the web fetches; your gateway, local Ollama and telemetry still answer.
 
 ### 10a. Pre-submit claims and the application worker (Phase 5)
 

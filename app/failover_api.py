@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from app.auth import get_user_db
 from app.models import FailoverEvent, ModelRouteState
 from app.services import failover_settings, model_health
+from app.services.model_health import PROVIDER_PREFIX, provider_name
 from app.services.redaction import redact_text
 from app.tenancy import require_user_id
 
@@ -46,6 +47,10 @@ def _route(row: ModelRouteState, now: datetime) -> dict[str, Any]:
             "failure_pct": stats.get("failure_pct"), "rate_limits": stats.get("rate_limits"),
             "p95_ms": stats.get("p95_ms"), "baseline_p95_ms": stats.get("baseline_p95_ms"),
             "probe_successes": row.probe_successes, "trips": stats.get("trips", 0),
+            # A provider-wide rest (model_health.PROVIDER_PREFIX): which provider, and the aliases seen using it.
+            "provider": provider_name(row.model),
+            "members": [m for m in stats.get("members") or [] if isinstance(m, str)][:50],
+            "free_only": bool(stats.get("free_only")) if row.model.startswith(PROVIDER_PREFIX) else None,
             "changed_at": row.last_changed_at.isoformat() + "Z" if row.last_changed_at else None}
 
 

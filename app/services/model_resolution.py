@@ -15,7 +15,8 @@ Routing policy lives here and nowhere else:
 * Infrastructure fallback (timeouts, 429, outages) is LiteLLM's job: the worker's fallback model is sent with the
   request as a client-side fallback.
 * Quality escalation (low confidence, schema failure, ambiguity) is Job Hunt OS's job: `escalation_reason` decides,
-  after an answer arrived, whether a stronger model should answer instead. The two never substitute for each other.
+  after an answer arrived, whether a stronger model should answer instead. The two never substitute for each other:
+  a rate-limited escalation model is replaced only by its own configured fallbacks, never by the worker's backups.
 """
 from __future__ import annotations
 
@@ -45,6 +46,8 @@ class Escalation:
     conditions: tuple[str, ...]
     confidence_threshold: float | None
     label: str = ""
+    # The escalation model's own fallbacks (AIModel.fallback_models): tried, in order, only when it is rate limited.
+    fallbacks: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -190,12 +193,14 @@ def resolve(snapshot: dict[str, Any], worker_type: str | None, version: int | No
         target = escalation_model(snapshot, policy)
         escalation = Escalation(model=target, conditions=tuple(policy.get("conditions") or ()),
                                 confidence_threshold=policy.get("confidence_threshold"),
-                                label=policy.get("model") or policy.get("tier") or "")
+                                label=policy.get("model") or policy.get("tier") or "",
+                                fallbacks=model_fallbacks_of(snapshot, target) if target else ())
     fallback = config.get("fallback_model") or None
     secondary = tuple(m for m in (config.get("secondary_models") or ()) if isinstance(m, str) and m)
     model_fallbacks = model_fallbacks_of(snapshot, model)
     routing = snapshot.get("routing") or {}
-    names = {model, fallback, *secondary, *model_fallbacks, escalation.model if escalation else None} - {None}
+    names = {model, fallback, *secondary, *model_fallbacks, escalation.model if escalation else None,
+             *(escalation.fallbacks if escalation else ())} - {None}
     worker = WORKERS.get(worker_type)
     return ResolvedWorker(
         worker_type=worker_type, mode=config.get("mode"), configured=configured, model=model, note=note,

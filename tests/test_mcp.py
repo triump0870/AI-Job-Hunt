@@ -512,6 +512,52 @@ def test_every_tool_call_is_audited_without_content(account):
     assert call(uid, "get_bulk_operation_status", operation_id="nope")["ok"] is False
 
 
+# ───────────── model market ─────────────
+
+def test_model_market_tools_are_registered_read_only_and_audited_without_an_entity(account, monkeypatch):
+    import httpx
+
+    from app.services import model_market
+    from tests.test_model_market import OLLAMA_CLOUD, OPENROUTER
+
+    def catalogs(request):
+        if "openrouter.ai" in str(request.url):
+            return httpx.Response(200, json=OPENROUTER)
+        if "ollama.com" in str(request.url):
+            return httpx.Response(200, json=OLLAMA_CLOUD)
+        return httpx.Response(503)
+
+    model_market.reset_cache()
+    monkeypatch.setattr(model_market, "_transport", httpx.MockTransport(catalogs))
+    monkeypatch.setattr(get_settings(), "ollama_base_url", "")
+    uid = account["user_id"]
+    server = build_server(uid)
+    tools_by_name = {tool.name: tool for tool in asyncio.run(server.list_tools())}
+    assert {"list_model_sources", "search_models", "suggest_models", "get_model_details"} <= set(tools_by_name)
+    assert {"worker_type", "objective", "max_cost_per_request", "in_gateway_only"} <= set(
+        tools_by_name["suggest_models"].input_schema["properties"])
+
+    sources = call(uid, "list_model_sources")
+    by_name = {s["source"]: s for s in sources["sources"]}
+    assert by_name["openrouter"]["models"] == 3 and by_name["litellm_prices"]["error"] == "answered HTTP 503"
+    found = call(uid, "search_models", query="gpt-oss", limit=5)
+    assert found["ok"] and {m["id"] for m in found["models"]} == {"openrouter/openai/gpt-oss-120b",
+                                                                 "ollama_cloud/gpt-oss:120b"}
+    suggested = call(uid, "suggest_models", worker_type="ranker", objective="cheapest", limit=3)
+    assert suggested["ok"] and suggested["worker_type"] == "RANKER" and suggested["requirements"]["structured_output"]
+    assert "Suggestions only" in suggested["note"]
+    assert call(uid, "suggest_models", objective="best")["ok"] is False
+    assert call(uid, "suggest_models", worker_type="NOPE")["ok"] is False
+    assert call(uid, "search_models", limit=500)["ok"] is False
+    assert call(uid, "get_model_details", model_id="openrouter/openai/gpt-oss-120b")["count"] == 1
+    assert call(uid, "get_model_details", model_id="nothing-like-it")["ok"] is False
+    with session(uid) as db:
+        rows = db.scalars(select(ConversationAction).where(ConversationAction.tool_name.in_(
+            ("list_model_sources", "search_models", "suggest_models", "get_model_details")))).all()
+    assert len(rows) == 8 and all(r.entity_type is None and r.entity_id is None for r in rows)
+    model_market.reset_cache()
+
+
 # ───────────── execution modes ─────────────
 
 def test_backend_mode_still_tailors_and_reviews_with_the_model(monkeypatch):
