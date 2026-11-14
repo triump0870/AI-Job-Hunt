@@ -56,6 +56,23 @@ function jdValue(value) {
 function jdRequirementRow(item) {
   return `<div class="jd-req" data-jd-req="${attr(item.id)}"><div class="row gap8 top-align">${jdPill(item.level)}<span class="grow small">${esc(item.value)}</span><span class="xs faint mono">${Math.round((item.confidence || 0) * 100)}%</span></div>${item.source_text ? `<details class="jd-source"><summary class="xs">Why?</summary><blockquote class="xs">${esc(item.source_text)}${item.source_section ? ` <span class="faint">— ${esc(item.source_section)}</span>` : ''}</blockquote></details>` : ''}</div>`;
 }
+// Requirements the posting offers as alternatives ("one of Python, Java or Go") share an alternative_group: they are
+// shown as one requirement that any one of them meets, in the place of the first.
+function jdRequirementGroups(requirements) {
+  const out = [], groups = {};
+  for (const item of requirements) {
+    const key = item.alternative_group;
+    if (!key) { out.push(item); continue; }
+    if (!groups[key]) { groups[key] = { ...item, id: key, alternatives: [] }; out.push(groups[key]); }
+    groups[key].alternatives.push(item.value);
+    groups[key].confidence = Math.min(groups[key].confidence ?? 1, item.confidence ?? 1);
+  }
+  return out.map(item => item.alternatives && item.alternatives.length < 2 ? { ...item, alternatives: undefined, value: item.alternatives[0] } : item);
+}
+function jdRequirementItem(item) {
+  if (!item.alternatives) return jdRequirementRow(item);
+  return `<div class="jd-req" data-jd-group="${attr(item.id)}"><div class="row gap8 top-align">${jdPill(item.level)}<span class="grow small"><span class="muted">Any one of:</span> ${item.alternatives.map(v => esc(v)).join(' · ')}</span><span class="xs faint mono">${Math.round((item.confidence || 0) * 100)}%</span></div>${item.source_text ? `<details class="jd-source"><summary class="xs">Why?</summary><blockquote class="xs">${esc(item.source_text)}${item.source_section ? ` <span class="faint">— ${esc(item.source_section)}</span>` : ''}</blockquote></details>` : ''}</div>`;
+}
 function jdField(path, label, kind, value) {
   const id = `jd-${path.replace(/\./g, '-')}`;
   if (kind === 'tri') {
@@ -132,7 +149,7 @@ function renderJobStructured(job) {
   const stale = data.stale ? `<div class="box warn small" data-jd-stale>The posting changed after it was parsed. Ranking and tailoring use the posting as written until it is parsed again.</div>` : '';
   return `<div style="padding:20px 22px" class="col gap14">${head}${error}${unmatched}${stale}${jdComparison(data)}${jdSummary(data)}
     <div><div class="caps mb8">REQUIREMENTS · IN THE EMPLOYER'S WORDS</div>${requirements.length
-      ? `<div class="col gap6">${requirements.map(jdRequirementRow).join('')}</div>`
+      ? `<div class="col gap6">${jdRequirementGroups(requirements).map(jdRequirementItem).join('')}</div>`
       : '<div class="small muted">No requirements were extracted from this posting.</div>'}</div>
     <div><div class="caps mb8">LIKELY PREPARATION TOPICS</div>${jdDerived(data)}</div></div>`;
 }

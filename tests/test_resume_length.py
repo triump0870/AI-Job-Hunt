@@ -89,7 +89,7 @@ def test_the_context_offers_candidates_per_budget_and_heading_only_roles(user):
     prompt = build_tailoring_prompt(candidate_profile=None, job=None, context=context)
     assert "LENGTH PLAN" in prompt.user and '"max_bullets_by_role_index"' in prompt.user
     assert "not a checklist" in prompt.system and "Update at most 3 roles" not in prompt.system
-    assert prompt.version == "v10"
+    assert prompt.version == "v11"
 
 
 # ───────────── enforcement and rendering ─────────────

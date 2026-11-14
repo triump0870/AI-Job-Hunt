@@ -22,7 +22,8 @@ from app.prompts.common import (
 )
 from app.prompts.contracts import JobDescriptionParserOutput
 
-JOB_DESCRIPTION_PARSER_PROMPT_VERSION = "v2"
+# v3: alternative_group marks requirements the posting offers as alternatives ("one of Python, Java or Go").
+JOB_DESCRIPTION_PARSER_PROMPT_VERSION = "v3"
 JOB_DESCRIPTION_PARSER_MARKER = "PARSE_JOB_DESCRIPTION"
 REQUIREMENT_LEVELS = ("REQUIRED", "PREFERRED", "INFORMATIONAL", "UNKNOWN")
 REQUIREMENT_TYPES = ("SKILL", "EXPERIENCE", "RESPONSIBILITY", "LEADERSHIP", "EDUCATION", "LOCATION",
@@ -55,7 +56,7 @@ STRUCTURED_JOB_TEMPLATE: dict[str, Any] = {
 REQUIREMENT_TEMPLATE: dict[str, Any] = {
     "id": "req_001", "type": "SKILL", "normalized_value": "Python", "requirement_level": "REQUIRED",
     "source_text": "Strong experience with Python is required.", "source_section": "Requirements",
-    "confidence": 0.98, "is_explicit": True, "is_derived": False,
+    "confidence": 0.98, "is_explicit": True, "is_derived": False, "alternative_group": None,
 }
 
 JOB_DESCRIPTION_PARSER_SYSTEM = instructions(
@@ -85,7 +86,11 @@ Return exactly one JSON object and nothing else:
   heading it sat under when the posting has headings ("Requirements", "About us", ...), otherwise null.
   confidence (0-1) is how clearly the posting states it, not how important you think it is.
   is_explicit is true when the posting says it. is_derived is true only for entries you inferred; an entry is
-  never both. Marketing and company-description sentences are INFORMATIONAL, not requirements.""",
+  never both. Marketing and company-description sentences are INFORMATIONAL, not requirements.
+  alternative_group: when the posting offers a choice ("one of", "any of", "at least one of", "either ... or",
+  "Python, Java or Go"), list each option as its own requirement with the same level and give them all the same
+  group id ("grp_001", "grp_002", ...): a candidate with any one of them meets it. Items joined by "and", or listed
+  as separate asks, are not alternatives: alternative_group is null for them and for every standalone requirement.""",
     """DERIVED SIGNALS
 derived_signals hold what a candidate might prepare for, inferred from the responsibilities and domains: likely
 interview domains, system-design topics, leadership topics and business topics. They are suggestions, never

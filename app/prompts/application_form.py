@@ -35,7 +35,8 @@ from app.prompts.contracts import PERSONAL_FORM_CATEGORIES, ApplicationFormPrepR
 #     retrieved for each pasted question.
 # v3: a question no fact answers exactly is drafted from the closest verified experience (form_basis CLOSEST) instead
 #     of being left to the candidate.
-APPLICATION_FORM_PROMPT_VERSION = "v3"
+# requirements with "alternatives" (one of Python, Java or Go): any one of them meets it.
+APPLICATION_FORM_PROMPT_VERSION = "v4"
 APPLICATION_FORM_MARKER = "PREPARE_APPLICATION_FORM"
 MAX_POSTING_CHARS = 12000
 MAX_PREDICTED = 8

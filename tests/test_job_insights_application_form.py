@@ -183,7 +183,7 @@ def test_predicted_questions_follow_the_rules_whatever_the_model_says(owner, mon
         assert "Tell us about your Kafka work." not in got, "an item citing an unknown id is dropped alone"
         uncited = got["What is your greatest strength?"]
         assert uncited["status"] == "NEEDS_INPUT", "a factual draft needs evidence"
-        assert insight_of(job_id).prompt_versions["application_form"] == "v3"
+        assert insight_of(job_id).prompt_versions["application_form"] == "v4"
     finally:
         _unseed()
 

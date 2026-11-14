@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import desc, event, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -205,6 +205,7 @@ class RequirementIn(_In):
     confidence: float = Field(default=0.5, ge=0, le=1)
     is_explicit: bool = True
     is_derived: bool = False
+    alternative_group: str | None = Field(default=None, max_length=60)
 
     @field_validator("type", mode="before")
     @classmethod
@@ -222,6 +223,22 @@ class RequirementIn(_In):
 class ParsedJobDescription(_In):
     structured_description: StructuredJobDescriptionIn = Field(default_factory=StructuredJobDescriptionIn)
     requirements: list[RequirementIn] = Field(default_factory=list, max_length=200)
+
+    @model_validator(mode="after")
+    def _real_groups(self) -> ParsedJobDescription:
+        """A group of alternatives needs two or more members at one level. Anything else is not a choice the posting
+        offers: the group is dropped and every member stays a requirement of its own (the stricter reading)."""
+        members: dict[str, list[RequirementIn]] = {}
+        for item in self.requirements:
+            group = (item.alternative_group or "").strip()
+            item.alternative_group = group or None
+            if group:
+                members.setdefault(group, []).append(item)
+        for items in members.values():
+            if len(items) < 2 or len({item.requirement_level for item in items}) > 1:
+                for item in items:
+                    item.alternative_group = None
+        return self
 
 
 # ───────────── deterministic extraction ─────────────
@@ -420,7 +437,8 @@ def store_requirements(db: Session, job: Job, requirements: list[RequirementIn])
             normalized_value=item.normalized_value[:300], requirement_level=item.requirement_level,
             source_text=item.source_text or "", source_section=item.source_section,
             confidence=float(item.confidence), is_explicit=bool(item.is_explicit) and not item.is_derived,
-            is_derived=bool(item.is_derived), origin="PARSER", created_at=utcnow(), updated_at=utcnow())
+            is_derived=bool(item.is_derived), alternative_group=item.alternative_group, origin="PARSER",
+            created_at=utcnow(), updated_at=utcnow())
         db.add(row)
         stored.append(row)
     return stored

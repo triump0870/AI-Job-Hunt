@@ -111,6 +111,61 @@ def requirement_dict(row: JobRequirementEvidence, *, with_source: bool = False) 
     return out
 
 
+# A sentence that explicitly offers a choice. Only these group rows parsed before the parser marked alternatives
+# itself: a bare "or" is too loose to merge requirements on.
+CHOICE_CUE = re.compile(r"\b(?:one of|any of|either\b.+\bor)\b", re.IGNORECASE)
+
+
+def alternative_groups(rows: list[JobRequirementEvidence]) -> dict[int, str]:
+    """Which rows are alternatives of one requirement, as {row id: group id}.
+
+    The parser's alternative_group decides. Rows parsed before it existed are grouped only when two or more of the
+    same type and level quote the same sentence and that sentence says "one of" / "any of" / "either ... or"."""
+    groups: dict[int, str] = {}
+    by_sentence: dict[tuple[str, str, str], list[JobRequirementEvidence]] = {}
+    marked: dict[tuple[str, str], list[JobRequirementEvidence]] = {}
+    for row in rows:
+        if row.alternative_group:
+            marked.setdefault((row.alternative_group, row.requirement_level), []).append(row)
+        elif row.source_text and CHOICE_CUE.search(row.source_text):
+            key = (row.source_text.strip(), row.requirement_type, row.requirement_level)
+            by_sentence.setdefault(key, []).append(row)
+    for (group, _level), members in marked.items():
+        if len(members) > 1:
+            groups |= {row.id: group for row in members}
+    for members in by_sentence.values():
+        if len(members) > 1:
+            groups |= {row.id: f"alt_{members[0].item_id}" for row in members}
+    return groups
+
+
+def grouped_requirements(rows: list[JobRequirementEvidence], level: str, *,
+                         with_source: bool = False) -> list[dict[str, Any]]:
+    """The requirements at one level as a task should weigh them: alternatives the posting offers ("one of Python,
+    Java or Go") become one requirement met by any of them, in the position of its first member."""
+    groups = alternative_groups(rows)
+    out: list[dict[str, Any]] = []
+    collected: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if row.requirement_level != level:
+            continue
+        group = groups.get(row.id)
+        if group is None:
+            out.append(requirement_dict(row, with_source=with_source))
+            continue
+        if group not in collected:
+            entry = requirement_dict(row, with_source=with_source) | {"id": group, "alternatives": [], "member_ids": []}
+            collected[group] = entry
+            out.append(entry)
+        entry = collected[group]
+        entry["alternatives"].append(row.normalized_value)
+        entry["member_ids"].append(row.item_id)
+        entry["confidence"] = min(entry["confidence"], round(row.confidence, 2))
+    for entry in collected.values():
+        entry["value"] = "Any one of: " + ", ".join(entry["alternatives"])
+    return out
+
+
 def _structured(job: Job) -> dict[str, Any]:
     """The structured description, only when it was parsed from the description the job has now.
 
@@ -154,12 +209,18 @@ def candidate_match(requirements: list[dict[str, Any]], candidate: Any) -> tuple
         pool = str(candidate or "")
     words = _tokens(pool)
     matches, gaps = [], []
-    for item in requirements:
-        needed = _distinctive(item["value"])
+    def coverage(value: str) -> tuple[bool, set[str]]:
+        needed = _distinctive(value)
         overlap = needed & words
-        entry = {**item, "matched_terms": sorted(overlap)[:6]}
         # Half of what the requirement actually names has to appear in the candidate's verified facts.
-        covered = bool(overlap) and len(overlap) >= max(1, round(0.5 * len(needed)))
+        return bool(overlap) and len(overlap) >= max(1, round(0.5 * len(needed))), overlap
+
+    for item in requirements:
+        # Alternatives ("one of Python, Java or Go") are met by any one of them.
+        options = [coverage(value) for value in item.get("alternatives") or [item["value"]]]
+        covered, overlap = next(((True, terms) for hit, terms in options if hit),
+                                (False, set().union(*(terms for _hit, terms in options))))
+        entry = {**item, "matched_terms": sorted(overlap)[:6]}
         (matches if covered else gaps).append(entry)
     return matches, gaps
 
@@ -229,8 +290,8 @@ def build_ranking_job_context(db: Session, job: Job, candidate: Any = None) -> J
         return context
     rows = requirements_of(db, job)
     terms = _tokens(f"{job.title or ''} {job.description or ''}")
-    context.required = [requirement_dict(r) for r in rows if r.requirement_level == REQUIRED][:RANKING_REQUIREMENTS]
-    context.preferred = [requirement_dict(r) for r in rows if r.requirement_level == PREFERRED][:RANKING_REQUIREMENTS]
+    context.required = grouped_requirements(rows, REQUIRED)[:RANKING_REQUIREMENTS]
+    context.preferred = grouped_requirements(rows, PREFERRED)[:RANKING_REQUIREMENTS]
     context.responsibilities = _relevant(data.get("responsibilities") or [], terms, RANKING_RESPONSIBILITIES)
     context.leadership_expectations = data.get("leadership_expectations") or []
     context.education_requirements = data.get("education_requirements") or []
@@ -254,8 +315,8 @@ def build_tailoring_job_context(db: Session, job: Job, candidate: Any = None) ->
         _stats(job, context)
         return context
     rows = requirements_of(db, job)
-    context.required = [requirement_dict(r) for r in rows if r.requirement_level == REQUIRED][:TAILOR_REQUIREMENTS]
-    context.preferred = [requirement_dict(r) for r in rows if r.requirement_level == PREFERRED][:TAILOR_REQUIREMENTS]
+    context.required = grouped_requirements(rows, REQUIRED)[:TAILOR_REQUIREMENTS]
+    context.preferred = grouped_requirements(rows, PREFERRED)[:TAILOR_REQUIREMENTS]
     context.responsibilities = (data.get("responsibilities") or [])[:TAILOR_RESPONSIBILITIES]
     context.leadership_expectations = data.get("leadership_expectations") or []
     if candidate is not None:
@@ -274,8 +335,8 @@ def build_review_job_context(db: Session, job: Job) -> JobContext:
         _stats(job, context)
         return context
     rows = requirements_of(db, job)
-    context.required = [requirement_dict(r) for r in rows if r.requirement_level == REQUIRED]
-    context.preferred = [requirement_dict(r) for r in rows if r.requirement_level == PREFERRED]
+    context.required = grouped_requirements(rows, REQUIRED)
+    context.preferred = grouped_requirements(rows, PREFERRED)
     context.responsibilities = data.get("responsibilities") or []
     context.leadership_expectations = data.get("leadership_expectations") or []
     context.source_evidence = [requirement_dict(r, with_source=True) for r in rows
@@ -293,8 +354,8 @@ def build_interview_insights_job_context(db: Session, job: Job) -> JobContext:
         _stats(job, context)
         return context
     rows = requirements_of(db, job)
-    context.required = [requirement_dict(r) for r in rows if r.requirement_level == REQUIRED]
-    context.preferred = [requirement_dict(r) for r in rows if r.requirement_level == PREFERRED]
+    context.required = grouped_requirements(rows, REQUIRED)
+    context.preferred = grouped_requirements(rows, PREFERRED)
     context.responsibilities = data.get("responsibilities") or []
     context.leadership_expectations = data.get("leadership_expectations") or []
     context.derived_signals = {"label": DERIVED_LABEL, **(data.get("derived_signals") or {}),
@@ -313,6 +374,7 @@ def _hash_of(document: dict[str, Any] | None) -> str:
 def summary(db: Session, job: Job) -> dict[str, Any]:
     """The structured description as the API and the UI show it, with its requirement evidence."""
     rows = requirements_of(db, job, derived=None)
+    groups = alternative_groups(rows)
     data = job.structured_description or {}
     stale = bool(data) and not _structured(job)
     return {
@@ -326,8 +388,11 @@ def summary(db: Session, job: Job) -> dict[str, Any]:
         "structured_hash": _hash_of(job.structured_description),
         "has_candidate": bool(job.structured_description_candidate),
         "candidate": job.structured_description_candidate,
-        "requirements": [requirement_dict(r, with_source=True) for r in rows],
-        "counts": {level: sum(1 for r in rows if r.requirement_level == level)
+        # Each row as the employer wrote it; alternative_group ties the options of one "any one of" requirement.
+        "requirements": [requirement_dict(r, with_source=True) | {"alternative_group": groups.get(r.id)}
+                         for r in rows],
+        # A group of alternatives counts once: it is one requirement.
+        "counts": {level: len({groups.get(r.id, r.id) for r in rows if r.requirement_level == level})
                    for level in (REQUIRED, PREFERRED, INFORMATIONAL, UNKNOWN)},
         "derived_label": DERIVED_LABEL,
     }

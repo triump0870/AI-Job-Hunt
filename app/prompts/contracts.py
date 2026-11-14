@@ -552,6 +552,9 @@ class ParsedRequirement(Contract):
     confidence: Confidence = 0.5
     is_explicit: bool = True
     is_derived: bool = False
+    alternative_group: str | None = Field(
+        default=None, max_length=60,
+        description="shared by requirements the posting offers as alternatives (any one meets it); null otherwise")
 
 
 class JobDescriptionParserOutput(Contract):
