@@ -156,7 +156,8 @@ function highlight(text, good, gaps) {
   const safe = esc(text);
   if (!terms.length) return safe;
   const cls = {}; terms.forEach(([t, c]) => { cls[esc(t).toLowerCase()] = cls[esc(t).toLowerCase()] || c; });
-  const re = new RegExp('(' + terms.map(([t]) => esc(t).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).sort((a, b) => b.length - a.length).join('|') + ')', 'gi');
+  // Whole words only, as the backend's grounding does: "Rust" must not light up inside "Trust" (C++, C#, .NET kept).
+  const re = new RegExp('(?<![\\w+#])(' + terms.map(([t]) => esc(t).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).sort((a, b) => b.length - a.length).join('|') + ')(?![\\w+#])', 'gi');
   return safe.replace(re, m => `<mark class="${cls[m.toLowerCase()] || 'm-good'}">${m}</mark>`);
 }
 // Scraped postings often arrive as escaped markdown (\\-, **bold**, * bullets); show them as plain text.

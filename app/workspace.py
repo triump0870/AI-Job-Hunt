@@ -142,6 +142,10 @@ router = APIRouter()
 TRIAGE_ACTIONS = {"shortlist": "shortlisted", "maybe": "maybe", "skip": "dismissed", "dismiss": "dismissed",
                   "archive": "archived", "restore": "discovered"}
 QUEUE_STATUSES = ("discovered", "shortlisted", "archived")
+# Words too common in gap names to tie a gap to a claim ("Security engineering" is not partly met by any
+# "...engineering..." claim).
+GENERIC_GAP_WORDS = frozenset({"engineering", "engineer", "software", "experience", "systems", "system", "development",
+                               "strong", "deep", "knowledge", "skills", "proficiency", "and", "the", "with"})
 AGENCY_HINTS = ("staffing", "recruit", "consultan", "talent", "placement", "manpower", "hr services", "headhunt")
 BOARDS = ["linkedin", "indeed", "glassdoor", "naukri", "bayt", "zip_recruiter"]
 DEFAULT_PREFS = {"weekly_target": 10, "followup_days": None, "email_run_sheet": False, "warn_closing": True,
@@ -1159,8 +1163,13 @@ def job_detail(job_id: int, db: Session = Depends(get_user_db)):
     evidence = db.scalars(select(Evidence).where(Evidence.verified.is_(True))).all()
     gap_notes = []
     analysis = job.fit_analysis or {}
-    for gap in [*ranked_list(analysis, "must_have_missing"), *ranked_list(analysis, "gaps")][:4]:
-        words = {w for w in re.findall(r"[a-z0-9]{3,}", str(gap).lower())}
+    # Fatal gaps are usually also listed as missing requirements: show each gap once.
+    gaps: dict[str, str] = {}
+    for g in [*ranked_list(analysis, "must_have_missing"), *ranked_list(analysis, "gaps")]:
+        if (text := str(g).strip()):
+            gaps.setdefault(text.lower(), text)
+    for gap in list(gaps.values())[:4]:
+        words = {w for w in re.findall(r"[a-z0-9]{3,}", gap.lower())} - GENERIC_GAP_WORDS
         partial = next((e for e in evidence if words & set(re.findall(r"[a-z0-9]{3,}", f"{e.claim} {' '.join(e.skills or [])}".lower()))), None)
         gap_notes.append({"gap": str(gap), "partial": f"{partial.company or 'Evidence'}: {partial.claim}" if partial else ""})
     from app.services import job_description  # local import, as app.services.sources does
