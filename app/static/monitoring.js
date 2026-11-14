@@ -592,6 +592,70 @@ function renderMonLogs() {
 }
 
 const PRIORITY_TONE = { HIGH: 'bad', MEDIUM: 'warn', LOW: 'muted' };
+const MON_CONFIDENCE_TONE = { HIGH: 'good', MEDIUM: 'warn', LOW: 'bad' };
+const monRecField = (name, value) => value ? `<div><div class="caps-sm">${name}</div><div class="small ink2" style="line-height:1.5">${esc(value)}</div></div>` : '';
+const monShare = v => v == null ? '—' : `${(v * 100).toFixed(1)}%`;
+// One change's before → after rows, as the AI configuration preview and the staged decision both describe them.
+function monChangeRows(changes) {
+  if (!changes?.length) return '';
+  const show = v => v == null || v === '' ? 'none' : Array.isArray(v) ? (v.join(', ') || 'none') : typeof v === 'object' ? (v.model || v.tier || 'on') : String(v);
+  return `<table class="mon-table mon-diff"><thead><tr><th>Setting</th><th>Now</th><th>After</th></tr></thead><tbody>${changes.map(c =>
+    `<tr><td>${esc(c.label)}</td><td>${esc(show(c.before))}</td><td class="b">${esc(show(c.after))}</td></tr>`).join('')}</tbody></table>`;
+}
+// The models a change touches, with their numbers on that worker straight from the request log.
+function monModelRows(models) {
+  if (!models?.length) return '';
+  return `<div class="mon-table-wrap"><table class="mon-table"><thead><tr><th>Model</th><th>Role now</th><th>After</th><th>Requests</th><th>Failed</th><th>Rate limited</th></tr></thead><tbody>${models.map(m =>
+    `<tr><td>${esc(m.model)}</td><td>${esc(m.role_before)}</td><td class="${m.role_before !== m.role_after ? 'b' : ''}">${esc(m.role_after)}</td><td>${(m.requests || 0).toLocaleString()}</td><td>${monShare(m.failure_rate)}</td><td>${(m.rate_limited || 0).toLocaleString()}</td></tr>`).join('')}</tbody></table></div>`;
+}
+function monConfidence(c) {
+  return c ? `<span class="row gap6">${pill(`${c.level.toLowerCase()} confidence`, MON_CONFIDENCE_TONE[c.level])}<span class="xs muted">${esc(c.text)}</span></span>` : '';
+}
+function monActionCard(a, blocked) {
+  const stagingAny = isBusy('monStage');
+  return `<div class="mon-action"><div class="row between wrap gap8"><div class="b small">${esc(a.title)}</div>${monConfidence(a.confidence)}</div>
+    <div class="small ink2" style="line-height:1.5">${esc(a.why)}</div>
+    ${monChangeRows(a.changes)}${monModelRows(a.models)}
+    <div class="mon-action-grid">${monRecField('Upside', a.upside)}${monRecField('Risk', a.risk)}${monRecField('How to check it worked', a.verify)}</div>
+    <div class="row gap8 wrap">${btn(label('monStage', 'Review &amp; apply…', 'Staging…'), 'mon-act-stage', { id: a.id }, 'primary sm', !!blocked || stagingAny)}
+      ${blocked ? `<span class="xs muted">${esc(blocked)}</span>` : '<span class="xs muted">Shows the exact diff and validates it first. Nothing is live until you apply.</span>'}</div></div>`;
+}
+function monRecDecisions(item) {
+  return (item.applied || []).map(d => `<div class="row gap8 wrap xs">${pill(d.status === 'APPLIED' ? `applied · v${d.config_version}` : `undone · v${d.undo_version}`, d.status === 'APPLIED' ? 'good' : 'muted')}<span class="muted">${esc(d.title)}</span>
+    ${d.status === 'APPLIED' ? btn(label(`monUndo${d.id}`, 'Undo', 'Undoing…'), 'mon-act-undo', { id: d.id, version: d.base_version }, 'ghost sm', isBusy(`monUndo${d.id}`)) : ''}</div>`).join('');
+}
+function monRecBody(x, item, blocked) {
+  const b = item?.brief;
+  const groups = {};
+  (item?.actions || []).forEach(a => { (groups[a.group || a.id] ||= []).push(a); });
+  const actions = Object.values(groups).map(list => list.length > 1
+    ? `<div class="caps-sm">Pick one of ${list.length} alternatives</div>${list.map(a => monActionCard(a, blocked)).join('')}`
+    : monActionCard(list[0], blocked)).join('');
+  const prompt = item?.coding_prompt ? `<div class="mon-action"><div class="row between wrap gap8"><div class="b small">Code change: prompt for your coding assistant</div>
+      <div class="row gap8">${btn('Copy prompt', 'mon-copy-prompt', { idx: item.index }, 'primary sm')}${btn('Download .md', 'mon-dl-prompt', { idx: item.index }, 'ghost sm')}</div></div>
+      <div class="xs muted">Paste it into Claude Code (or another coding assistant) in this repository. It carries the finding, the files to look at and the rules the change must keep; no resume text or secrets.</div>
+      <details class="mon-prompt"><summary class="xs">Show prompt</summary><pre>${esc(item.coding_prompt)}</pre></details></div>` : '';
+  const brief = b ? `<div class="box soft mon-brief"><div class="row between wrap gap8"><div class="caps-sm">Decision brief</div>${monConfidence(b.confidence)}</div>
+      <div class="small" style="line-height:1.5">${esc(b.doing)}</div>
+      <div class="mon-action-grid">${monRecField('Upside', b.upside)}${monRecField('Risk', b.risk)}${monRecField('How to check it worked', b.verify)}${monRecField('How to undo', b.undo)}</div>
+      ${(b.notes || []).map(n => `<div class="xs muted">${esc(n)}</div>`).join('')}</div>` : '';
+  return `<div class="mon-rec-body">${monRecField('Finding', x.finding)}${monRecField('Evidence', x.evidence)}${monRecField('Recommended change', x.recommended_change)}
+    ${brief}${monRecDecisions(item || {})}${actions}${prompt}
+    <div class="row between wrap gap8"><span class="xs faint">Nothing changes on its own: every change above needs your click.</span>
+      ${item ? btn(label(`monDismiss${item.key}`, 'Dismiss for 30 days', 'Dismissing…'), 'mon-act-dismiss', { key: item.key }, 'ghost sm', isBusy(`monDismiss${item.key}`)) : ''}</div></div>`;
+}
+// The change waiting in the AI configuration draft: its validated diff, then Apply or Cancel.
+function monStagedPanel(A) {
+  const staged = A?.staged; if (!staged) return '';
+  const preview = D.monStage?.decision?.id === staged.id ? D.monStage.preview : null;
+  const changes = preview ? preview.changes : staged.detail?.changes;
+  const errors = preview?.validation?.errors || [], warnings = preview?.validation?.warnings || [];
+  return `<div class="banner stack mb12 mon-staged"><div class="row between wrap gap8"><div><div class="b">Ready to apply: ${esc(staged.title)}</div>
+      <div class="xs muted">Staged in the AI configuration draft and validated against your models. Applying creates configuration v${(staged.base_version || 0) + 1}; you can undo it.</div></div>
+      <div class="row gap8">${btn(label('monApply', 'Apply change', 'Applying…'), 'mon-act-apply', { id: staged.id }, 'primary', isBusy('monApply') || errors.length > 0)}${btn(label('monCancel', 'Cancel', 'Cancelling…'), 'mon-act-cancel', { id: staged.id }, 'ghost', isBusy('monCancel'))}</div></div>
+    ${monChangeRows(changes)}
+    ${errors.map(e => `<div class="small" style="color:var(--bad)">${esc(e.message || e)}</div>`).join('')}${warnings.map(w => `<div class="xs muted">⚠ ${esc(w.message || w)}</div>`).join('')}</div>`;
+}
 function renderAdvisor() {
   const rec = D.monRec; if (!rec) return '';
   const r = rec.report, active = rec.tasks.find(t => ['PENDING', 'PROCESSING'].includes(t.status));
@@ -601,18 +665,27 @@ function renderAdvisor() {
     <div class="row gap10 wrap">${schedule}${btn(active ? (active.status === 'PENDING' ? 'Analysis queued…' : 'Analyzing…') : label('monAnalyze', 'Analyze AI usage', 'Queueing…'), 'mon-analyze', {}, 'primary', !!active || isBusy('monAnalyze'))}</div></div>`;
   const status = lastFailed ? `<div class="banner warn mb12"><span class="grow">The last analysis failed: ${esc(lastFailed.error || 'unknown error')}</span></div>` : '';
   if (!r) return `<section class="card">${head}${status}${empty('No recommendations yet', `Analyze the ${MON_RANGES.find(([id]) => id === monState().range)?.[1].toLowerCase()} of usage to get cost, latency, context and reliability recommendations.`)}</section>`;
-  const recs = r.recommendations || [];
-  const groups = ['HIGH', 'MEDIUM', 'LOW'].map(p => [p, recs.filter(x => x.priority === p)]).filter(([, items]) => items.length);
-  const field = (name, value) => value ? `<div><div class="caps-sm">${name}</div><div class="small ink2" style="line-height:1.5">${esc(value)}</div></div>` : '';
+  const A = rec.actions || { items: [] };
+  const byIndex = Object.fromEntries((A.items || []).map(i => [i.index, i]));
+  const blocked = A.staged ? 'Apply or cancel the staged change first.' : A.blocked;
+  const recs = (r.recommendations || []).map((x, i) => ({ x, item: byIndex[i] }));
+  const shown = recs.filter(({ item }) => !item?.dismissed), hidden = recs.filter(({ item }) => item?.dismissed);
+  const groups = ['HIGH', 'MEDIUM', 'LOW'].map(p => [p, shown.filter(({ x }) => x.priority === p)]).filter(([, items]) => items.length);
+  const tags = item => [item?.actions?.length ? pill(`${item.actions.length} one-click change${item.actions.length === 1 ? '' : 's'}`, 'brand') : '', item?.coding_prompt ? pill('code prompt', 'muted') : ''].join('');
   const body = groups.map(([p, items]) => `<div class="mt12"><div class="row gap8 mb8">${pill(p, PRIORITY_TONE[p])}<span class="xs muted">${items.length} recommendation${items.length === 1 ? '' : 's'}</span></div>
-    ${items.map(x => `<details class="mon-rec"><summary><span class="b small">${esc(x.title)}</span><span class="xs muted">${esc(x.category.toLowerCase())} · ${esc(monStage(x.affected_stage) === 'ALL' ? 'all stages' : monStage(x.affected_stage))}${x.estimated_cost_saving && x.estimated_cost_saving !== 'unknown' ? ` · saving ${esc(x.estimated_cost_saving)}` : ''}</span></summary>
-      <div class="mon-rec-body">${field('Finding', x.finding)}${field('Evidence', x.evidence)}${field('Recommended change', x.recommended_change)}${field('Expected benefit', x.expected_benefit)}${field('Estimated cost saving', x.estimated_cost_saving)}${field('Risk', x.risk)}
-        <div class="xs faint">Recommendation only — nothing has been changed. Apply it yourself if you agree.</div></div></details>`).join('')}</div>`).join('');
+    ${items.map(({ x, item }) => `<details class="mon-rec"><summary><span class="row between wrap gap8"><span class="b small">${esc(x.title)}</span><span class="row gap6">${tags(item)}</span></span><span class="xs muted">${esc(x.category.toLowerCase())} · ${esc(monStage(x.affected_stage) === 'ALL' ? 'all stages' : monStage(x.affected_stage))}${x.estimated_cost_saving && x.estimated_cost_saving !== 'unknown' ? ` · saving ${esc(x.estimated_cost_saving)}` : ''}</span></summary>
+      ${monRecBody(x, item, blocked)}</details>`).join('')}</div>`).join('');
+  const dismissed = hidden.length ? `<details class="mt12"><summary class="xs muted">${hidden.length} dismissed recommendation${hidden.length === 1 ? '' : 's'}</summary>${hidden.map(({ x, item }) =>
+    `<div class="row between gap8 mt6 xs"><span>${esc(x.title)}</span>${btn('Show again', 'mon-act-restore', { id: item.dismissed.id }, 'ghost sm')}</div>`).join('')}</details>` : '';
+  const blockedBanner = !A.staged && A.blocked ? `<div class="banner warn mb12"><span class="grow">${esc(A.blocked)}</span></div>` : '';
   const source = r.generated_by === 'llm' ? `AI write-up by ${esc(r.model_name || r.model_provider || 'model')} · prompt ${esc(r.prompt_version || '')}` : 'Rule-based findings';
-  return `<section class="card">${head}${status}
+  return `<section class="card">${head}${status}${monStagedPanel(A)}${blockedBanner}
     <div class="box soft"><div class="small" style="line-height:1.55">${esc(r.summary)}</div>
       <div class="xs muted mt6">${source} · ${esc(fmtDay(r.time_range_start))} – ${esc(fmtDay(r.time_range_end))} · created ${esc(fmtDateTime(r.created_at))}${r.estimated_savings && r.estimated_savings !== 'unknown' ? ` · estimated savings ${esc(r.estimated_savings)}` : ''}</div></div>
-    ${body || '<div class="small muted mt12">No recommendations: nothing in this period needs attention.</div>'}</section>`;
+    ${body || '<div class="small muted mt12">No recommendations: nothing in this period needs attention.</div>'}${dismissed}</section>`;
+}
+function monPromptFor(idx) {
+  return (D.monRec?.actions?.items || []).find(i => String(i.index) === String(idx))?.coding_prompt || '';
 }
 
 // Full prompt and response capture: off unless the account (or LLM_PROMPT_DEBUG on the server) turns it on.
@@ -826,6 +899,48 @@ const MONITORING_ACTIONS = {
     await api('/api/monitoring/analyze', { method: 'POST', body: { range: monState().range === 'today' ? 'today' : monState().range } });
     await loadMonitoring();
   }, 'Analysis queued. Recommendations appear here when it finishes.'),
+  'mon-act-stage': el => busy('monStage', async () => {
+    const out = await api(`/api/monitoring/recommendations/${D.monRec.report.id}/actions/${encodeURIComponent(el.dataset.id)}/stage`, { method: 'POST' });
+    D.monStage = out;
+    await loadMonitoring();
+    return out;
+  }, out => out?.decision ? 'Change staged: review the diff at the top, then apply' : 'That change did not pass validation, so nothing was changed'),
+  'mon-act-apply': el => busy('monApply', async () => {
+    const out = await api(`/api/monitoring/recommendations/decisions/${el.dataset.id}/apply`, { method: 'POST' });
+    D.monStage = null;
+    await loadMonitoring();
+    return out;
+  }, out => out?.decision?.status === 'APPLIED' ? `Applied as configuration v${out.decision.config_version}` : 'Nothing to apply: the configuration already matched'),
+  'mon-act-cancel': el => busy('monCancel', async () => {
+    await api(`/api/monitoring/recommendations/decisions/${el.dataset.id}/cancel`, { method: 'POST' });
+    D.monStage = null;
+    await loadMonitoring();
+  }, 'Change cancelled: the configuration is as it was'),
+  'mon-act-undo': el => {
+    if (!confirm(`Undo this change? Configuration v${el.dataset.version} is restored as a new version.`)) return;
+    return busy(`monUndo${el.dataset.id}`, async () => {
+      const out = await api(`/api/monitoring/recommendations/decisions/${el.dataset.id}/undo`, { method: 'POST' });
+      await loadMonitoring();
+      return out;
+    }, out => `Undone: configuration v${out?.decision?.undo_version} is active`);
+  },
+  'mon-act-dismiss': el => busy(`monDismiss${el.dataset.key}`, async () => {
+    await api(`/api/monitoring/recommendations/${D.monRec.report.id}/dismiss`, { method: 'POST', body: { key: el.dataset.key } });
+    await loadMonitoring();
+  }, 'Dismissed for 30 days'),
+  'mon-act-restore': el => busy('monRestore', async () => {
+    await api(`/api/monitoring/recommendations/decisions/${el.dataset.id}/restore`, { method: 'POST' });
+    await loadMonitoring();
+  }),
+  'mon-copy-prompt': el => copyText(monPromptFor(el.dataset.idx)),
+  'mon-dl-prompt': el => {
+    const text = monPromptFor(el.dataset.idx);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([text], { type: 'text/markdown' }));
+    a.download = `ai-optimization-task-${el.dataset.idx}.md`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  },
   'mon-schedule': el => busy('monSchedule', async () => {
     await api('/api/monitoring/schedule', { method: 'PUT', body: { schedule: el.value } });
     D.monRec = { ...D.monRec, schedule: el.value };

@@ -612,6 +612,12 @@ p.settings-help{margin:10px 0}
 .mon-rec summary::-webkit-details-marker{display:none}
 .mon-rec[open]{border-color:var(--brand-line)}
 .mon-rec-body{display:grid;gap:10px;margin-top:10px;padding-top:10px;border-top:1px solid var(--line2)}
+.mon-action{display:grid;gap:8px;border:1px solid var(--line2);border-radius:8px;padding:10px 12px;background:#fafbfe}
+.mon-action-grid{display:grid;gap:8px;grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}
+.mon-brief{display:grid;gap:8px}
+.mon-diff td{white-space:normal}
+.mon-prompt pre{white-space:pre-wrap;font-size:11.5px;max-height:320px;overflow:auto;margin:6px 0 0}
+.mon-staged{border-color:var(--brand-line)}
 .mon-kv-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:8px 18px}
 .mon-kv{display:flex;justify-content:space-between;gap:12px;font-size:12.5px;padding:5px 0;border-bottom:1px solid var(--line3)}
 .mon-kv span:last-child{text-align:right;min-width:0;word-break:break-word}

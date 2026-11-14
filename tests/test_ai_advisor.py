@@ -139,7 +139,7 @@ def test_analyze_queues_one_asynchronous_task_and_the_scheduler_writes_a_report(
     assert task.status == "COMPLETED" and task.report_id is not None and task.attempt_count == 1
     out = client.get("/api/monitoring/recommendations").json()
     report = out["report"]
-    assert out["active"] is False and "Nothing is changed automatically" in out["notice"]
+    assert out["active"] is False and "Nothing changes on its own" in out["notice"]
     assert report["generated_by"] == "llm" and report["prompt_version"] == AI_OPTIMIZATION_PROMPT_VERSION
     assert (report["model_provider"], report["model_name"]) == ("openrouter", "vendor/advisor-model")
     rec, = report["recommendations"]
