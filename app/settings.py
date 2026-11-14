@@ -7,6 +7,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     app_name: str = "Job Hunt OS"
     database_url: str = "sqlite:///./jobhunt.db"
+    # Connection pool (app.db; server databases only, SQLite keeps its own). A worker holds one connection while its
+    # model call runs and takes a second to record the answer, so size + overflow must exceed the workers running at
+    # once (the *_CONCURRENCY settings, about 30 by default) with room for web requests — and stay under the database's
+    # max_connections across every process. Too small and every thread waits DB_POOL_TIMEOUT_SECONDS for a connection.
+    db_pool_size: int = 20
+    db_pool_max_overflow: int = 20
+    db_pool_timeout_seconds: int = 30
     app_base_url: str = "http://localhost:8000"
     cron_secret: str = "change-me"
 
@@ -105,6 +112,11 @@ class Settings(BaseSettings):
     # for suggestions only, cached in-process. Off: only your gateway, your local Ollama and your own telemetry.
     model_market_enabled: bool = True
     model_market_cache_hours: float = 6
+    # Worker model suggestions (AI Orchestration → Workers) may also use how a model did across every account on this
+    # server: rates only, per underlying model, and only once enough distinct accounts have used it, so no single
+    # account's usage can be read from it. Off: suggestions come from the account's own requests and the catalogs.
+    platform_model_stats_enabled: bool = True
+    platform_model_stats_min_accounts: int = 3
     # Optional catalog keys, used only to list models (never to call one). Without a key that source is "not
     # configured" (Groq, Artificial Analysis) or tried without one (Ollama Cloud); nothing is guessed in its place.
     artificial_analysis_api_key: str | None = None
@@ -408,6 +420,9 @@ class Settings(BaseSettings):
     agent_langsmith_endpoint: str = "https://api.smith.langchain.com"
     agent_langsmith_project: str = "job-hunt-os"
     agent_langsmith_timeout_ms: int = 3000
+    # After LangSmith answers 429 because the plan's trace quota is spent, export stops for this long and then tries
+    # once more (a longer Retry-After wins). Graph runs continue untraced meanwhile.
+    agent_langsmith_quota_pause_minutes: int = 60
     # The qualification graph (app.agents.qualification, Phase 3). QUALIFICATION_GRAPH_MODE: off (default; jobs are
     # qualified by the services exactly as before), shadow (they still are, and a bounded number of decided jobs per
     # account a day are re-run through the graph read-only and compared — no paid call unless the paid budget below

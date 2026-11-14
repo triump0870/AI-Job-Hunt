@@ -22,9 +22,17 @@ class AppSession(Session):
         return obj
 
 
+def engine_options(settings) -> dict:
+    """How the engine is made. A server database gets a pool sized by DB_POOL_*; SQLite keeps SQLAlchemy's own."""
+    if settings.database_url.startswith("sqlite"):
+        return {"pool_pre_ping": True, "connect_args": {"check_same_thread": False}}
+    return {"pool_pre_ping": True, "connect_args": {},
+            "pool_size": max(1, settings.db_pool_size), "max_overflow": max(0, settings.db_pool_max_overflow),
+            "pool_timeout": max(1, settings.db_pool_timeout_seconds)}
+
+
 settings = get_settings()
-connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
-engine = create_engine(settings.database_url, pool_pre_ping=True, connect_args=connect_args)
+engine = create_engine(settings.database_url, **engine_options(settings))
 SessionLocal = sessionmaker(bind=engine, class_=AppSession, autoflush=False, autocommit=False)
 
 

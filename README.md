@@ -176,7 +176,7 @@ With a local Postgres (for example `brew install postgresql@16 && brew services 
 scripts/setup_local_postgres.sh          # creates jobhunt and jobhunt_test for $USER
 ```
 
-Then set `DATABASE_URL=postgresql+psycopg://<your-user>@localhost:5432/jobhunt` in `.env` and start the app; tables are created and migrated on startup. To run the tests on Postgres instead of throwaway SQLite files:
+Then set `DATABASE_URL=postgresql+psycopg://<your-user>@localhost:5432/jobhunt` in `.env` and start the app; tables are created and migrated on startup. The connection pool is `DB_POOL_SIZE` + `DB_POOL_MAX_OVERFLOW` (20 + 20 by default, waiting up to `DB_POOL_TIMEOUT_SECONDS`, 30). A worker holds one connection while its model call runs and takes a second to record the answer, so the total must exceed the workers running at once (the `*_CONCURRENCY` settings) and stay under PostgreSQL's `max_connections`; if you raise worker concurrency, raise the pool with it. A pool that is too small shows up as the whole server pausing with `QueuePool limit ... reached`. To run the tests on Postgres instead of throwaway SQLite files:
 
 ```bash
 TEST_DATABASE_URL=postgresql+psycopg://<your-user>@localhost:5432/jobhunt_test pytest
@@ -1946,7 +1946,11 @@ Monitoring rows are exactly the same as for any other call.
 Thread ids become keyed pseudonyms. Inputs, prompts, responses and error messages are left out; an error is reduced
 to its class name. Every request body is checked before it is sent, and one that looks like it holds a credential is
 not sent at all. No debug or capture setting changes this. A LangSmith outage is a failed row in Monitoring →
-External APIs (provider `LANGSMITH`) and changes nothing else. These are our own setting names: the SDK's
+External APIs (provider `LANGSMITH`) and changes nothing else. A 429 pauses export in that process: five minutes for
+an ordinary rate limit, `AGENT_LANGSMITH_QUOTA_PAUSE_MINUTES` (60) when the plan's trace quota is spent, or the
+provider's `Retry-After` when that is longer. During a pause graph runs continue untraced and nothing is sent or
+recorded; the pause and its end are in the server log, and the 429 that started it is the one row in Monitoring.
+Restart the server to end a pause early (after upgrading the plan, say). These are our own setting names: the SDK's
 `LANGSMITH_TRACING` / `LANGCHAIN_TRACING_V2` variables have no effect on graph runs.
 
 **Rollback.** Set `AGENT_GRAPHS_ENABLED=false` (and `AGENT_LANGSMITH_EXPORT_ENABLED=false`). Migration 0044 is
@@ -2686,6 +2690,41 @@ account. Rows from different sources are joined only on exact ids, and each row 
 
 The tools never change a worker's model: apply a suggestion in AI Orchestration → Models (draft → preview → apply).
 `MODEL_MARKET_ENABLED=false` stops the web fetches; your gateway, local Ollama and telemetry still answer.
+
+**Worker insights** (AI Orchestration → Models & routing → Workers, `app/services/worker_insights.py`,
+`GET /api/settings/ai/insights`). Each worker's row shows the average prompt its requests sent against its model's
+context window, and opens to:
+
+- **Best so far**: up to three models with at least 20 of that worker's own requests in the last 30 days, ordered by
+  the score Reliability uses (failures first, then schema failures and speed). A LiteLLM fallback's answer counts
+  against the model that was asked.
+- **Worth trying**: models the worker has not tried enough to rank. Evidence, strongest first: how the model did in
+  the account's other workers; how it did across every account on this server; the model market's catalog ranking,
+  read from its cache only so the tab never waits on the web. A model is suggested only when every gate holds, and
+  "unknown" never passes one on its own:
+  1. *Capacity*: the worker's typical request (p90 prompt + p90 answer, never under its registry minimum) fits a
+     known context window, or the model has already answered a request that large for this account. A model that
+     refused a request of that size as too large for its per-minute limit is out.
+  2. *Structured output*, where the worker parses JSON: known to be supported, or 20 of the model's own answers
+     were judged and at least 90% were valid.
+  3. *Quality floor*: at least 90% of the requests behind the evidence succeeded, whatever the model in use does.
+  4. *Comparable evidence*: another worker's requests count only when they were at least half the size of this
+     worker's average prompt.
+  5. *Better than the model in use*, by a margin on the same score. With too few requests here, the model in use is
+     judged on all its requests.
+
+  The panel says how many models fell at which gate, so an empty list explains itself.
+- **Switch**: one tap sends the model and its backups in one change. The model it used becomes the first backup, the
+  other backups keep their order, and nothing appears twice. It goes through the normal validate → apply path, so
+  it is one version you can roll back in Settings → History, and an invalid switch is refused like any other save.
+
+No model is asked anything: the ranking is deterministic, and a suggestion never applies itself.
+
+The across-accounts figures are the one read that crosses accounts, and are kept narrow: keyed by the provider's own
+model (never an account's gateway name), rates only (success, schema validity, average latency), and shown only once
+at least `PLATFORM_MODEL_STATS_MIN_ACCOUNTS` (default 3) distinct accounts and 50 requests stand behind a model, so
+no single account's usage can be read from them. `PLATFORM_MODEL_STATS_ENABLED=false` turns them off; on a
+single-account server they are simply empty.
 
 ### 10a. Pre-submit claims and the application worker (Phase 5)
 

@@ -38,8 +38,10 @@ class Wire:
         if self.mode == "timeout":
             raise requests.Timeout("read timed out")
         response = requests.Response()
-        response.status_code = 503 if self.mode == "503" else 200
+        response.status_code = {"503": 503, "quota": 429, "429": 429}.get(self.mode, 200)
         response._content, response.request, response.url = b"{}", request, request.url
+        if self.mode == "quota":
+            response._content = b'{"error":"Monthly unique traces usage limit exceeded"}'
         return response
 
     def text(self) -> str:
@@ -243,6 +245,74 @@ def test_a_langsmith_outage_changes_nothing(wire, export_on, mode):
     rows = export_rows(before)
     assert rows and all(r.status == "FAILED" for r in rows)
     assert {r.error_type for r in rows} <= {"CONNECTION", "TIMEOUT", "SERVER_ERROR", "OTHER", "SDK_ERROR"}
+
+
+# ───────────── rate limited: one 429, then a pause ─────────────
+
+def test_a_spent_quota_pauses_export_instead_of_failing_on_every_run(wire, export_on, monkeypatch):
+    wire.mode = "quota"
+    before = last_log_id()
+    user = make_user(SessionLocal)
+    pk = run_pilot(user)
+    tracing_boundary.flush()
+    assert support.thread(SessionLocal, pk).status == "COMPLETED"  # the run itself is untouched
+    assert tracing_boundary.paused() and "usage limit" in tracing_boundary.paused()
+    sent, rows = len(wire.bodies), export_rows(before)
+    assert sent == 1 and [r.error_type for r in rows] == ["RATE_LIMIT"]  # the SDK's retries were not sent
+
+    made = []
+    monkeypatch.setattr(tracing_boundary, "client", lambda fields: made.append(fields))
+    assert support.thread(SessionLocal, run_pilot(user)).status == "COMPLETED"
+    tracing_boundary.flush()
+    assert not made and len(wire.bodies) == sent and len(export_rows(before)) == 1  # no call, no new row
+
+
+def test_a_pause_ends_and_export_starts_again(wire, export_on, monkeypatch):
+    tracing_boundary.pause(120, "rate limited")
+    user = make_user(SessionLocal)
+    run_pilot(user)
+    tracing_boundary.flush()
+    assert not wire.bodies
+    clock = tracing_boundary.time.monotonic()
+    monkeypatch.setattr(tracing_boundary.time, "monotonic", lambda: clock + 121)
+    assert tracing_boundary.paused() is None
+    run_pilot(user)
+    tracing_boundary.flush()
+    assert wire.bodies
+
+
+@pytest.mark.parametrize("mode, retry_after, seconds", [
+    ("429", None, tracing_boundary.RATE_LIMIT_PAUSE_SECONDS),  # an ordinary rate limit: a short pause
+    ("429", "900", 900),                                        # the provider's own figure wins when longer
+    ("quota", None, 3600), ("quota", "30", 3600),               # a spent plan does not come back in 30 seconds
+    ("quota", "999999", tracing_boundary.MAX_PAUSE_SECONDS),    # and nothing pauses export for ever
+])
+def test_how_long_a_429_pauses_export(wire, monkeypatch, mode, retry_after, seconds):
+    from app.services.external_api import requests_session
+
+    paused_for = []
+    monkeypatch.setattr(tracing_boundary, "pause", lambda secs, reason: paused_for.append(secs))
+    wire.mode = mode
+    if retry_after:
+        original = wire.send
+
+        def send(session, request, **kw):
+            response = original(session, request, **kw)
+            response.headers["Retry-After"] = retry_after
+            return response
+        wire.send = send
+    session = requests_session("LANGSMITH", operation="trace_export", on_response=tracing_boundary._on_response)
+    assert session.post("https://api.smith.langchain.com/runs/batch", data=b"{}").status_code == 429
+    assert [min(s, tracing_boundary.MAX_PAUSE_SECONDS) for s in paused_for] == [seconds]
+
+
+def test_a_paused_session_sends_and_stores_nothing(wire):
+    from app.services.external_api import requests_session
+
+    before = last_log_id()
+    session = requests_session("LANGSMITH", operation="trace_export", paused=lambda: "paused for a test")
+    assert session.post("https://api.smith.langchain.com/runs/batch", data=b"{}").status_code == 400
+    assert not wire.bodies and not export_rows(before)
 
 
 # ───────────── Phase 7: shapes a projection alone used to let through ─────────────

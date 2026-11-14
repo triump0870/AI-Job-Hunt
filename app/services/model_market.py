@@ -497,8 +497,10 @@ def _describe(name: str, exc: BaseException) -> str:
     return (str(exc) or type(exc).__name__)[:200]
 
 
-def load(user_id: int | None, names: Iterable[str] | None = None, *, refresh: bool = False) -> dict[str, SourceState]:
-    """Every source's state, fetching the ones whose cache expired. A failure keeps the last good data (stale)."""
+def load(user_id: int | None, names: Iterable[str] | None = None, *, refresh: bool = False,
+         cached_only: bool = False) -> dict[str, SourceState]:
+    """Every source's state, fetching the ones whose cache expired. A failure keeps the last good data (stale).
+    `cached_only` never fetches: a source nobody has loaded yet simply has no data (a screen must not wait on it)."""
     settings = get_settings()
     ttl = max(0.0, float(settings.model_market_cache_hours)) * 3600
     fetchers = _fetchers(user_id)
@@ -514,6 +516,9 @@ def load(user_id: int | None, names: Iterable[str] | None = None, *, refresh: bo
             out[name] = state
             continue
         now = time.monotonic()
+        if cached_only:
+            out[name] = state
+            continue
         if refresh or state.data is None or state.expires <= now:
             try:
                 data = fetch()
@@ -740,8 +745,8 @@ class Catalog:
     benchmarks: bool
 
 
-def catalog(db: Session, user_id: int, *, refresh: bool = False) -> Catalog:
-    states = load(user_id, refresh=refresh)
+def catalog(db: Session, user_id: int, *, refresh: bool = False, cached_only: bool = False) -> Catalog:
+    states = load(user_id, refresh=refresh, cached_only=cached_only)
 
     def data(name: str) -> Any:
         state = states.get(name)
