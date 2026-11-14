@@ -6,8 +6,8 @@ draft → preview → apply flow and its versions; this table links a version ba
 
 Additive: a new owned table. Downgrade drops it.
 
-Revision ID: 0069
-Revises: 0068
+Revision ID: 0070
+Revises: 0069
 Create Date: 2026-11-14 12:00:00
 """
 from collections.abc import Sequence
@@ -15,8 +15,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = '0069'
-down_revision: str | None = '0068'
+revision: str = '0070'
+down_revision: str | None = '0069'
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
