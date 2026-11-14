@@ -114,13 +114,41 @@ def requirement_dict(row: JobRequirementEvidence, *, with_source: bool = False) 
 # A sentence that explicitly offers a choice. Only these group rows parsed before the parser marked alternatives
 # itself: a bare "or" is too loose to merge requirements on.
 CHOICE_CUE = re.compile(r"\b(?:one of|any of|either\b.+\bor)\b", re.IGNORECASE)
+CHOICE_START = re.compile(r"\b(?:one of|any of|either)\b", re.IGNORECASE)
+OR_WORD = re.compile(r"\bor\b", re.IGNORECASE)
+
+
+def _named_at(sentence: str, value: str) -> int | None:
+    """Where `value` is named in `sentence` as a whole word (C#, C++ and .NET included), or None."""
+    found = re.search(rf"(?<![\w#+.]){re.escape(value.strip())}(?![\w#+])", sentence, re.IGNORECASE)
+    return found.start() if found and value.strip() else None
+
+
+def _choice_members(sentence: str, rows: list[JobRequirementEvidence]) -> list[JobRequirementEvidence]:
+    """The rows a "one of" sentence offers as the choice, never the rest of the sentence.
+
+    In "Python and one of Kafka or Spark" only Kafka and Spark are alternatives: the list starts at the cue and ends
+    with the option after its "or" (or runs to the end when it has none). A sentence where any row's value cannot
+    be located is ambiguous and nothing in it is grouped."""
+    start = CHOICE_START.search(sentence)
+    places = {row.id: _named_at(sentence, row.normalized_value) for row in rows}
+    if start is None or any(place is None for place in places.values()):
+        return []
+    after = sorted((place, row) for row in rows if (place := places[row.id]) >= start.end())
+    closing = OR_WORD.search(sentence, start.end())
+    if closing is not None:
+        past = [place for place, _row in after if place > closing.start()]
+        if past:
+            after = [(place, row) for place, row in after if place <= past[0]]
+    return [row for _place, row in after]
 
 
 def alternative_groups(rows: list[JobRequirementEvidence]) -> dict[int, str]:
     """Which rows are alternatives of one requirement, as {row id: group id}.
 
     The parser's alternative_group decides. Rows parsed before it existed are grouped only when two or more of the
-    same type and level quote the same sentence and that sentence says "one of" / "any of" / "either ... or"."""
+    same type and level quote the same sentence, that sentence says "one of" / "any of" / "either ... or", and the
+    rows are the options it lists (_choice_members)."""
     groups: dict[int, str] = {}
     by_sentence: dict[tuple[str, str, str], list[JobRequirementEvidence]] = {}
     marked: dict[tuple[str, str], list[JobRequirementEvidence]] = {}
@@ -133,7 +161,8 @@ def alternative_groups(rows: list[JobRequirementEvidence]) -> dict[int, str]:
     for (group, _level), members in marked.items():
         if len(members) > 1:
             groups |= {row.id: group for row in members}
-    for members in by_sentence.values():
+    for (sentence, _type, _level), candidates in by_sentence.items():
+        members = _choice_members(sentence, candidates)
         if len(members) > 1:
             groups |= {row.id: f"alt_{members[0].item_id}" for row in members}
     return groups

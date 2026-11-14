@@ -8,7 +8,8 @@ Before parser v3 / ranking v7 each alternative was its own REQUIRED requirement,
 Java, Kotlin and Scala as gaps. The requirement rows are not rewritten: job_context.alternative_groups groups them
 when they read (from the parser's alternative_group, or for older rows from a shared "one of" / "any of" sentence).
 Only the jobs where it finds a group, and that already have a ranking, are queued, through ranker.queue_job with the
-normal (non-forced) cadence, so a large account re-ranks gradually. A job's current fit analysis stays until its new
+normal (non-forced) cadence, so a large account re-ranks gradually. A job already ranked with the current prompt, or
+already waiting for the ranker, is passed over, so repeated --limit runs move on through the backlog. A job's current fit analysis stays until its new
 ranking lands. Uses DATABASE_URL; run the dry run first.
 """
 from __future__ import annotations
@@ -33,7 +34,8 @@ def main() -> int:
     from sqlalchemy import select
 
     from app.db import SessionLocal
-    from app.models import Job
+    from app.models import ACTIVE_RANKING_TASK_STATUSES, Job, JobRankingTask
+    from app.prompts.ranking import RANKING_PROMPT_VERSION
     from app.services import job_context, ranker
     from app.services.job_description import is_current
 
@@ -43,8 +45,13 @@ def main() -> int:
                               .order_by(Job.id)).all():
             if len(rows) >= args.limit:
                 break
-            if not is_current(job):
-                continue
+            if not is_current(job) or (job.fit_analysis or {}).get("prompt_version") == RANKING_PROMPT_VERSION:
+                continue  # parsed from older wording, or already ranked with alternatives in mind
+            # Every read below is scoped to this job's account (app.tenancy filters by db.info["user_id"]).
+            db.info["user_id"] = job.user_id
+            if db.scalar(select(JobRankingTask.id).where(JobRankingTask.job_id == job.id,
+                                                         JobRankingTask.status.in_(ACTIVE_RANKING_TASK_STATUSES))):
+                continue  # already waiting for the ranker
             requirements = [r for r in job_context.requirements_of(db, job)
                             if r.requirement_level in (job_context.REQUIRED, job_context.PREFERRED)]
             groups = job_context.alternative_groups(requirements)
@@ -52,7 +59,6 @@ def main() -> int:
                 continue
             row = {"job_id": job.id, "user_id": job.user_id, "title": job.title, "groups": len(set(groups.values()))}
             if args.apply:
-                db.info["user_id"] = job.user_id
                 locked = db.scalars(select(Job).where(Job.id == job.id).with_for_update()
                                     .execution_options(populate_existing=True)).one()
                 why = ranker.queue_job(db, locked, policy=ranker.policy_for(db, job.user_id), actor=ACTOR,

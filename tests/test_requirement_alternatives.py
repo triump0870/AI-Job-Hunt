@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from app.models import Job, JobRequirementEvidence
+from app.models import Job, JobRankingTask, JobRequirementEvidence
 from app.prompts.common import job_sections
 from app.prompts.contracts import RankingResult
 from app.services import job_context as jc
@@ -118,3 +118,65 @@ def test_the_requirements_panel_counts_and_ties_the_alternatives(user, parsed_jo
     assert data["counts"]["REQUIRED"] == 3, "the seven languages are one requirement, beside Kafka and Spark"
     tied = [item["value"] for item in data["requirements"] if item.get("alternative_group")]
     assert tied == LANGUAGES
+
+
+def _rows(sentence, values, level="REQUIRED"):
+    return [JobRequirementEvidence(id=i, item_id=f"req_{i:03d}", requirement_type="SKILL", normalized_value=value,
+                                   requirement_level=level, source_text=sentence, confidence=0.9)
+            for i, value in enumerate(values, start=1)]
+
+
+@pytest.mark.parametrize(("sentence", "values", "grouped"), [
+    ("Experience with Python and one of Kafka or Spark is required.", ["Python", "Kafka", "Spark"], {"Kafka", "Spark"}),
+    ("One of Kafka or Spark, and Python, are required.", ["Kafka", "Spark", "Python"], {"Kafka", "Spark"}),
+    ("Either Go or Rust is required.", ["Go", "Rust"], {"Go", "Rust"}),
+    (ONE_OF, LANGUAGES, set(LANGUAGES)),
+    # A value the sentence does not name cannot be placed: nothing in it is grouped.
+    ("Experience in one of Kafka or Spark is required.", ["Kafka", "Stream processing"], set()),
+])
+def test_older_rows_group_only_the_options_the_choice_lists(sentence, values, grouped):
+    rows = _rows(sentence, values)
+    groups = jc.alternative_groups(rows)
+    assert {row.normalized_value for row in rows if row.id in groups} == grouped
+
+
+def test_the_backfill_reads_each_job_under_its_own_account(parsed_job, monkeypatch, capsys):
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    from app.db import SessionLocal
+    from tests.conftest import make_user
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "rerank_alternative_requirements.py"
+    spec = importlib.util.spec_from_file_location("rerank_alternative_requirements", path)
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+
+    job_ids = []
+    for _account in range(2):
+        owner = make_user(SessionLocal)
+        from app.services.llm import LLMClient
+        monkeypatch.setattr(LLMClient, "generate_prompt_json", lambda self, prompt, call=None: _parser_answer())
+        job_id = add_job(owner, description=POSTING)
+        with session(owner) as db:
+            job = db.get(Job, job_id)
+            jd.parse_now(db, job)
+            job.fit_score, job.fit_analysis = 70.0, {"prompt_version": "v6"}
+            db.commit()
+        job_ids.append(job_id)
+    # --apply sets an account's scope to queue its job: the next account's job must still be read under its own.
+    monkeypatch.setattr(sys, "argv", ["rerank", "--json", "--apply", "--limit", "100000"])
+    script.main()
+    found = {row["job_id"]: row for row in json.loads(capsys.readouterr().out)}
+    assert set(job_ids) <= set(found), "the second account's job is not hidden by the first account's scope"
+    with SessionLocal() as db:  # queued jobs are waiting for the ranker now: a later run passes them over
+        db.execute(JobRankingTask.__table__.delete().where(JobRankingTask.job_id.in_(job_ids)))
+        db.commit()
+    monkeypatch.setattr(sys, "argv", ["rerank", "--json", "--limit", "100000"])
+    with SessionLocal() as db:
+        db.get(Job, job_ids[0]).fit_analysis = {"prompt_version": "v7"}
+        db.commit()
+    script.main()
+    found = {row["job_id"] for row in json.loads(capsys.readouterr().out)}
+    assert job_ids[0] not in found and job_ids[1] in found, "a job ranked with the current prompt is passed over"

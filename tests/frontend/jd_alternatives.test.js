@@ -26,3 +26,12 @@ describe('JD requirements · alternatives', () => {
     expect(item.value).toBe('Python');
   });
 });
+
+describe('JD requirements · alternatives split by a correction', () => {
+  it('keeps options moved to another level apart from the ones left behind', () => {
+    const items = jdRequirementGroups([row('r1', 'Python', 'grp_001'), row('r2', 'Java', 'grp_001'),
+      { ...row('r3', 'Kotlin', 'grp_001'), level: 'PREFERRED' }, { ...row('r4', 'Scala', 'grp_001'), level: 'PREFERRED' }]);
+    expect(items.map(item => [item.level, item.alternatives])).toEqual([
+      ['REQUIRED', ['Python', 'Java']], ['PREFERRED', ['Kotlin', 'Scala']]]);
+  });
+});

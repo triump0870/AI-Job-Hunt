@@ -61,9 +61,10 @@ function jdRequirementRow(item) {
 function jdRequirementGroups(requirements) {
   const out = [], groups = {};
   for (const item of requirements) {
-    const key = item.alternative_group;
+    // A correction can move some options to another level: only options at the same level are one requirement.
+    const key = item.alternative_group && `${item.alternative_group}|${item.level}`;
     if (!key) { out.push(item); continue; }
-    if (!groups[key]) { groups[key] = { ...item, id: key, alternatives: [] }; out.push(groups[key]); }
+    if (!groups[key]) { groups[key] = { ...item, id: item.alternative_group, alternatives: [] }; out.push(groups[key]); }
     groups[key].alternatives.push(item.value);
     groups[key].confidence = Math.min(groups[key].confidence ?? 1, item.confidence ?? 1);
   }
