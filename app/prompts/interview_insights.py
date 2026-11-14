@@ -31,7 +31,8 @@ from app.prompts.common import (
 from app.prompts.contracts import InterviewPrepResult, describe_fields
 
 # v1: role-derived and candidate-specific preparation with requirement and evidence ids.
-INTERVIEW_INSIGHTS_PROMPT_VERSION = "v1"
+# requirements with "alternatives" (one of Python, Java or Go): any one of them meets it.
+INTERVIEW_INSIGHTS_PROMPT_VERSION = "v2"
 INTERVIEW_INSIGHTS_MARKER = "PREPARE_INTERVIEW_INSIGHTS"
 MAX_POSTING_CHARS = 16000
 

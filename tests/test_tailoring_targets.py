@@ -79,7 +79,7 @@ def test_the_tailoring_context_and_prompt_carry_the_map_and_targets(user):
     assert {"Kafka", "Python", "Kubernetes"} <= set(use)
     assert {"PHP", "Terraform"} <= set(context.keyword_targets["do_not_use"])
     prompt = build_tailoring_prompt(candidate_profile=None, job=None, context=context)
-    assert prompt.version == "v10" and "REQUIREMENT MAP" in prompt.user and "KEYWORD TARGETS" in prompt.user
+    assert prompt.version == "v11" and "REQUIREMENT MAP" in prompt.user and "KEYWORD TARGETS" in prompt.user
     assert "do_not_use" in prompt.system and "WRITE FOR THIS POSTING" in prompt.system
     assert prompt.user.index("REQUIREMENT MAP") < prompt.user.index("LENGTH PLAN")
 
@@ -108,7 +108,7 @@ def test_the_cover_letter_reads_the_parsed_posting_and_the_tailored_resume():
                "keyword_targets": {"use": [{"keyword": "Kafka", "level": "REQUIRED"}], "do_not_use": ["PHP"]},
                "tailored": {"summary": "Data platform lead", "top_bullets": ["Cut incidents by 45%"]}}
     prompt = build_cover_letter_prompt(context)
-    assert prompt.version == "v6"
+    assert prompt.version == "v7"
     for label in ("TAILORED RESUME", "JOB REQUIREMENTS", "REQUIREMENT MAP", "KEYWORD TARGETS", "Own Kafka pipelines"):
         assert label in prompt.user, label
     assert "do_not_use" in prompt.system

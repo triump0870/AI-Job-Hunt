@@ -36,7 +36,8 @@ from app.prompts.contracts import CoverLetterResult, describe_fields
 # v3: about a third shorter (one shape paragraph, one avoid list), no personal name in the instructions.
 # v2: typed output contract; gaps stay gaps; only the candidate fields a letter uses; the FitAnalysis only when the
 # Ranker completed one; the candidate policy applied before the prompt instead of sent for the model to reason about.
-COVER_LETTER_PROMPT_VERSION = "v6"
+# requirements with "alternatives" (one of Python, Java or Go): any one of them meets it.
+COVER_LETTER_PROMPT_VERSION = "v7"
 COVER_LETTER_MARKER = "COVER_LETTER"
 CANDIDATE_FIELDS = ("name", "headline", "location", "work_authorization")
 JOB_FIELDS = ("identity", "role_summary", "responsibilities", "required", "preferred", "technical_domains")

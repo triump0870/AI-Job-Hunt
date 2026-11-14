@@ -48,7 +48,8 @@ from app.prompts.contracts import TailoringResult, describe_fields
 # without duplicate paragraphs or legal boilerplate.
 # v5: patch output with evidence ids per claim; completed FitAnalysis as read-only input (no score, no empty fields);
 # one canonical source resume instead of roles + resume text + policy; candidate context is name and headline only.
-TAILOR_PROMPT_VERSION = "v10"
+# requirements with "alternatives" (one of Python, Java or Go): any one of them meets it.
+TAILOR_PROMPT_VERSION = "v11"
 TAILOR_MARKER = "TAILOR_RESUME"
 # The FitAnalysis fields the Tailor reads. Scores are deliberately absent: the Tailor does not work with them.
 FIT_ANALYSIS_FIELDS = ("strong_matches", "partial_matches", "resume_gaps", "recommended_resume_focus")

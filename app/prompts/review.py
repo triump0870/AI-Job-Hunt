@@ -32,7 +32,8 @@ from app.prompts.contracts import REVIEW_RECOMMENDATIONS, ReviewResult, describe
 # v5: verified resume facts are application data, not untrusted text; each fact is sent once (bullets carry their
 # evidence ids); the posting arrives without duplicate paragraphs or legal boilerplate.
 # v4: the shared ReviewResult contract (PASS / RETAILOR / SKIP), per-claim evidence checks, no search configuration.
-REVIEW_PROMPT_VERSION = "v5"
+# requirements with "alternatives" (one of Python, Java or Go): any one of them meets it.
+REVIEW_PROMPT_VERSION = "v6"
 REVIEW_MARKER = "REVIEW_RESUME"
 __all__ = ["REVIEW_PROMPT_VERSION", "REVIEW_RECOMMENDATIONS", "build_review_prompt"]
 # The candidate policy flags a reviewer checks claims against.

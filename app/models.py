@@ -745,6 +745,8 @@ class JobRequirementEvidence(Base):
     confidence: Mapped[float] = mapped_column(Float, default=0.0)
     is_explicit: Mapped[bool] = mapped_column(Boolean, default=True)
     is_derived: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Rows sharing a group id are alternatives the posting offers ("one of Python, Java or Go"): any one meets it.
+    alternative_group: Mapped[str | None] = mapped_column(String(60), nullable=True)
     # Who settled this row's level: the parser, or the user (a correction or a re-parse decision). A parser never
     # replaces a USER row.
     origin: Mapped[str] = mapped_column(String(10), default="PARSER", server_default="PARSER")
