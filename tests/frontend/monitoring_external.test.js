@@ -81,9 +81,9 @@ const show = tab => { ui.monState().tab = tab; ui.render(); return document.getE
 describe('Monitoring · external APIs', () => {
   it('offers every section', () => {
     show('external');
-    expect(ui.MON_TABS.map(([id]) => id)).toEqual(['overview', 'llm', 'models', 'external', 'apify', 'inbox', 'logs', 'advisor']);
+    expect(ui.MON_TABS.map(([id]) => id)).toEqual(['overview', 'llm', 'models', 'external', 'limits', 'apify', 'inbox', 'logs', 'advisor']);
     expect([...document.querySelectorAll('[data-act="mon-tab"]')].map(b => b.textContent.trim()))
-      .toEqual(['Overview', 'LLM usage', 'Model performance', 'External APIs', 'Apify', 'Application inbox', 'Logs', 'AI optimization']);
+      .toEqual(['Overview', 'LLM usage', 'Model performance', 'External APIs', 'Rate limits', 'Apify', 'Application inbox', 'Logs', 'AI optimization']);
   });
 
   it('shows the headline numbers the dashboard is for', () => {
@@ -96,6 +96,31 @@ describe('Monitoring · external APIs', () => {
     expect(text).toContain('$0.42');            // estimated cost
     expect(text).toContain('APIFY');
     expect(text).toContain('OPENROUTER');
+  });
+
+  it('shows rolling provider usage and dated quota readings with distinct request and token windows', () => {
+    ui.D.monLimits = { as_of: '2026-11-15T03:00:00', providers: [{ provider: 'GROQ', calls_minute: 2,
+      calls_day: 150, http_429_day: 1, models: [{ model: 'alias', calls_minute: 2, calls_day: 150 }] }],
+      snapshots: [{ provider: 'GROQ', model: 'alias', requests_window: 'day', requests_limit: 1000,
+        requests_remaining: 0, tokens_per_minute_limit: 8000, tokens_per_minute_remaining: 420,
+        tokens_reset_seconds: 7.66, retry_after_seconds: 2, observed_at: '2026-11-15T03:00:00' }] };
+    const view = show('limits');
+    expect(view.querySelector('[data-act="mon-range"]')).toBeNull();
+    const rows = [...view.querySelectorAll('tbody tr')].map(tr => [...tr.cells].map(td => td.textContent));
+    expect(rows).toContainEqual(['GROQ', '2', '150', '1']);
+    expect(rows).toContainEqual(['GROQ', 'alias', 'Requests / day', '1,000', '0', '—', expect.any(String)]);
+    expect(rows).toContainEqual(['GROQ', 'alias', 'Tokens / minute', '8,000', '420', '7.66 s', expect.any(String)]);
+    expect(view.textContent).toContain('Retry after');
+    expect(view.textContent).toContain('whisper-large-v3');
+    expect(view.querySelector('[data-act="mon-openrouter-quota"]')).toBeTruthy();
+  });
+
+  it('keeps plan references available when nothing has been recorded', () => {
+    ui.D.monLimits = { as_of: '2026-11-15T03:00:00', providers: [], snapshots: [] };
+    const view = show('limits');
+    expect(view.textContent).toContain('No provider calls recorded');
+    expect(view.textContent).toContain('No quota headers recorded');
+    expect(view.textContent).toContain('OpenRouter free models');
   });
 
   it('lists calls with provider, operation, workflow, status, latency, retries and cost', () => {

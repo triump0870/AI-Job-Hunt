@@ -23,7 +23,7 @@ The dashboard is a single-page workspace served from `app/static/app.js`; every 
 | Apply kit | Files to upload, answers to paste, link to the posting, confirm "mark applied" | `GET /api/jobs/{id}/apply-kit` |
 | Tracker | Kanban by post-submission stage (drag or "move to"), optional extra stages, timeline, recruiter, interview scheduling, AI follow-up draft | `GET /api/tracker`, `POST /api/applications/{id}/stage`, `POST /api/applications/{id}/events` |
 | AI Orchestration | The pipeline as an interactive graph: every stage, what kind of work it is (AI, deterministic, external, human gate, browser, async), the model each AI worker is assigned and the one that actually answered, live packets, one job's path and trace, model history per worker. The graph is observational; its **Models & routing** workspace is where models are managed (moved from Settings): the route (LiteLLM or direct), each worker's model, the model catalog, tiers and the auto router, the LiteLLM connection and version history, all through draft → preview → apply → version | `GET /api/orchestration/graph`, `GET /api/orchestration/live`, `GET /api/orchestration/jobs/{id}`, `GET /api/orchestration/jobs/{id}/trace`, `GET /api/orchestration/nodes/{id}`, `GET /api/orchestration/nodes/{id}/history`, `GET /api/orchestration/edges/{from}/{to}` |
-| Monitoring | Seven sections — Overview, LLM usage, External APIs, Apify, Application inbox, Logs and AI optimization (JD parsing and JD recovery metrics are in Running workers). Every LLM request and every third-party call: volume, success rate, latency (avg/p50/p95/p99), failures by type, retries, rate limits, tokens, context utilisation and cost, with filters, detail views, trace lookup and the AI Optimization Advisor | `GET /api/monitoring/dashboard`, `GET /api/monitoring/external/dashboard`, `GET /api/monitoring/apify/summary`, `GET /api/monitoring/logs`, `POST /api/monitoring/analyze` |
+| Monitoring | Nine sections — Overview, LLM usage, Model performance, External APIs, Rate limits, Apify, Application inbox, Logs and AI optimization (JD parsing and JD recovery metrics are in Running workers). Every LLM request and every third-party call: volume, success rate, latency (avg/p50/p95/p99), failures by type, retries, rate limits, tokens, context utilisation and cost, with filters, detail views, trace lookup and the AI Optimization Advisor | `GET /api/monitoring/dashboard`, `GET /api/monitoring/external/dashboard`, `GET /api/monitoring/apify/summary`, `GET /api/monitoring/logs`, `POST /api/monitoring/analyze` |
 | Knowledge bank | Searchable Answer library and Evidence bank, focused editors, verification filters, copy and removal | `/api/knowledge`, `/api/evidence` |
 | Settings & profile | Candidate details and chip fields, resume variants, re-parse resume into (unverified) evidence, provider/model, your own API keys (stored encrypted), approval mode, cadence | `/api/profile`, `/api/settings`, `PUT /api/settings/keys`, `/api/preferences` |
 | Setup quest | Interactive, gamified setup guide: a welcome screen for new accounts, then a quest map of ten setup tasks (profile, preferences, resume, verified facts, AI model, Apify, search setup, first run, first triage, answer bank) plus an optional Gmail bonus. The AI quest recommends Ollama Cloud's `nemotron-3-nano:30b-cloud` behind a local LiteLLM proxy, with commands to copy. Each quest links to where the work is done; quests tick off by themselves from the account's real data, earn XP and levels (Rookie → Offer Magnet) and are celebrated once. A floating tracker shows the next quest; open the guide from the sidebar or with `?` | `GET /api/setup/guide`, `PUT /api/setup/guide` |
@@ -1543,7 +1543,7 @@ Prices and context windows live in one file, `app/model_catalog.json` (override 
 
 ### Monitoring tab and API
 
-Monitoring has seven sections, each loading only what it shows:
+Monitoring has nine sections, each loading only what it shows:
 
 - **Overview** — external call volume, success rate and latency next to LLM spend and Apify discovery.
 - **LLM usage** — metric tiles (requests, tokens, estimated cost, average and P95 latency, failures, retry
@@ -1557,6 +1557,12 @@ Monitoring has seven sections, each loading only what it shows:
   estimated cost; breakdowns by service, operation and workflow; failures by type; calls over time; and a
   filterable, paginated table of individual calls (time, provider, operation, workflow, status, latency,
   retries, cost) with a safe detail view.
+- **Rate limits** shows your account's outbound calls per provider and model over the last 60 seconds and 24 hours,
+  plus HTTP 429s and the latest timestamped quota readings. Counts exclude local holds, pre-send refusals and mock
+  calls. Each SDK or gateway operation counts once, including when it retries internally. LiteLLM calls without
+  recorded upstream attribution appear under LITELLM. Groq's published model limits and OpenRouter's free-model tiers
+  are reference figures. **Check key allowance** reads the UTC-day counter for your saved OpenRouter key on demand.
+- **Application inbox** shows Gmail and application email processing activity.
 - **Apify** — runs today and this month, successful and failed runs, compute units, dataset items, jobs found
   and jobs after deduplication, reported cost, and breakdowns by actor, saved search, location, board and day,
   with a recent-runs table.
@@ -1644,6 +1650,8 @@ GET  /api/monitoring/summary | stages | models | costs | latency | context | err
 GET  /api/monitoring/requests               paginated LLM request list
 GET  /api/monitoring/requests/{id}          one LLM request (no prompt text unless debugging stored it)
 
+GET  /api/monitoring/rate-limits            signed-in account’s rolling counts and latest observed quotas
+GET  /api/monitoring/rate-limits/openrouter  free-model daily allowance for the account’s saved key
 GET  /api/monitoring/external/dashboard     everything the External APIs section shows
 GET  /api/monitoring/external/summary       calls, success rate, latency percentiles, retries, cost
 GET  /api/monitoring/external/providers     per-provider health, and the same per operation

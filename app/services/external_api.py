@@ -32,6 +32,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from functools import wraps
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -207,11 +208,16 @@ def _count(headers: Any, name: str) -> int | None:
         return None
 
 
+def _groq_headers(headers: Any) -> bool:
+    return headers is not None and any(str(key).lower().removeprefix(FORWARDED).startswith("x-groq-")
+                                       for key in headers)
+
+
 def is_groq(headers: Any, metadata: dict[str, Any] | None = None) -> bool:
     """Whether the answer came from Groq: its own `x-groq-*` headers (forwarded or not), the deployment LiteLLM
     reports, or a `groq/` model name. Only then is the request counter known to be per day."""
     try:
-        if headers is not None and any("x-groq-" in str(name).lower() for name in headers):
+        if _groq_headers(headers):
             return True
         base = str(headers.get("x-litellm-model-api-base") or "") if headers is not None else ""
         names = [headers.get("x-litellm-model-name") if headers is not None else None, (metadata or {}).get("model")]
@@ -242,6 +248,62 @@ def _window_note(window: token_pacing.Window) -> dict[str, Any] | None:
             "requests_window": window.requests_window}
     note = {k: v for k, v in note.items() if v is not None}
     return note or None
+
+
+def _gateway_provider(headers: Any, deployment: str) -> str | None:
+    """Attribute a LiteLLM response from its upstream host, provider headers or deployment prefix."""
+    from app.services.model_market import ollama_platform, split_platform
+
+    try:
+        host = urlsplit(headers.get("x-litellm-model-api-base") or "").hostname
+    except ValueError:
+        host = None
+    hosts = {"api.groq.com": "GROQ", "openrouter.ai": "OPENROUTER", "api.openai.com": "OPENAI",
+             "api.anthropic.com": "ANTHROPIC", "generativelanguage.googleapis.com": "GEMINI",
+             "ollama.com": "OLLAMA_CLOUD"}
+    if host in hosts:
+        return hosts[host]
+    if _groq_headers(headers):
+        return "GROQ"
+    platform, model = split_platform(deployment)
+    if platform in ("ollama", "ollama_chat"):
+        return ollama_platform(model).upper()
+    # The OpenAI adapter can serve arbitrary compatible hosts.
+    return platform.upper() if platform and not (host and platform == "openai") else None
+
+
+def _response_metadata(call: ExternalCall, headers: Any, window: token_pacing.Window,
+                       status: int | None) -> dict[str, Any]:
+    """Keep numeric quota facts and the gateway route that answered, without retaining headers or URLs."""
+    metadata = dict(call.metadata)
+    limits = _window_note(window) or {}
+    retry = duration_seconds(_header(headers, "retry-after")) if status == 429 else None
+    if retry is not None and 0 <= retry <= 2**53:
+        limits["retry_after_seconds"] = retry
+    provider = call.provider.upper()
+    if provider == "LITELLM" and headers:
+        model = headers.get("x-litellm-model-name")
+        if model == "None":
+            model = None
+        if model:
+            metadata["answered_model"] = model[:300]
+        group = headers.get("x-litellm-model-group")
+        if group and group != "None":
+            metadata["model_group"] = group[:300]
+        provider = _gateway_provider(headers, model or "")
+        if provider:
+            metadata["upstream_provider"] = provider
+    if window.requests_limit is not None or window.requests_remaining is not None:
+        if provider in ("OPENAI", "GROQ"):
+            limits["requests_window"] = "day" if provider == "GROQ" else "minute"
+    elif window.tokens_limit is None and window.tokens_remaining is None:
+        for name in ("x-ratelimit-limit", "ratelimit-limit", "x-rate-limit-limit"):
+            if (limit := _count(headers, name)) is not None:
+                limits["limit"] = limit
+                break
+    if limits:
+        metadata["rate_limits"] = limits
+    return metadata
 
 
 def _duration_reset(headers: Any, status: int | None) -> float | None:
@@ -307,11 +369,13 @@ def build_entry(call: ExternalCall, *, started_at: datetime, completed_at: datet
     failure = error_type or (_classify_exception(error) if error is not None else _classify_status(code))
     parsed = httpx.URL(url) if url else None
     window = rate_window(headers, call.metadata) if headers is not None else token_pacing.Window()
-    noted = {**call.metadata, "rate_limits": _window_note(window)} if _window_note(window) else call.metadata
+    noted = _response_metadata(call, headers, window, code)
     metadata = redact_value(dict(list(noted.items())[:MAX_METADATA_KEYS])) if noted else None
     # Groq's request counter is per day: its row shows the per-minute tokens left, the limit that runs out first.
     remaining = (window.tokens_remaining if window.requests_window == "day" and window.tokens_remaining is not None
                  else _header_int(headers, REMAINING_HEADERS))
+    if remaining is None:
+        remaining = _header_int(headers, (FORWARDED + name for name in REMAINING_HEADERS))
     return {
         "request_id": call.request_id,
         "trace_id": (call.metadata.get("trace_id") if isinstance(call.metadata.get("trace_id"), str) else None)
@@ -727,8 +791,13 @@ def external_operation(provider: str, *, service: str = "", operation: str = "",
     try:
         yield call
     except Exception as exc:
+        # Direct LLM adapters wrap SDK errors. Keep the actual HTTP response's quota facts.
+        response = getattr(exc, "response", None)
+        if response is None:
+            response = getattr(exc.__cause__, "response", None)
         record(call, started_at=started, completed_at=_finished(started, clock),
-               status_code=_status_of(exc) or call.http_status_code, error=exc)
+               status_code=_status_of(exc) or getattr(response, "status_code", None) or call.http_status_code,
+               headers=getattr(response, "headers", None), error=exc)
         raise
     record(call, started_at=started, completed_at=_finished(started, clock))
 

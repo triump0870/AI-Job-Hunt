@@ -430,3 +430,129 @@ def test_an_llm_call_is_one_provider_call_with_two_views(owner, monkeypatch):
     detail = client.get(f"/api/monitoring/external/requests/{external.id}").json()
     assert detail["llm"]["stage"] == "OTHER" or detail["llm"]["stage"]
     assert detail["llm"]["model"] == "mock"
+
+
+def test_rate_limits_count_only_outbound_calls_and_keep_last_reported_windows(owner, monkeypatch):
+    from app.services import provider_usage
+
+    now = utcnow()
+    monkeypatch.setattr(provider_usage, "utcnow", lambda: now)
+    other = make_user(SessionLocal)
+
+    def record(seconds, provider="LITELLM", metadata=None, status=200, headers=None, user_id=owner):
+        at = now - timedelta(seconds=seconds)
+        call = external_api.ExternalCall(provider=provider, user_id=user_id, metadata=metadata or {})
+        external_api.persist(external_api.build_entry(call, started_at=at, completed_at=at, status_code=status,
+                                                       headers=httpx.Headers(headers or {})))
+
+    groq = {"x-litellm-model-api-base": "https://api.groq.com/openai/v1",
+            "x-litellm-model-name": "groq/openai/gpt-oss-20b"}
+    quota = {"x-ratelimit-limit-requests": "1000", "x-ratelimit-remaining-requests": "0",
+             "x-ratelimit-reset-requests": "2m59.56s", "llm_provider-retry-after": "2",
+             "x-ratelimit-limit-tokens": "8000", "x-ratelimit-remaining-tokens": "20",
+             "x-ratelimit-reset-tokens": "7.66s"}
+    record(70, headers={**groq, **quota, "x-ratelimit-remaining-requests": "1"})
+    record(59, headers={**groq, **quota}, status=429, metadata={"model": "router", "payload": "private text"})
+    record(1, headers=groq, metadata={"model": "router"})
+    record(60, metadata={"model": "old-gateway-route", "rate_limits": {"requests_window": "day"}})
+    record(60, provider="APIFY", status=500)
+    record(86399, provider="OPENROUTER")
+    record(86400, provider="TOO_OLD")
+    record(-1, provider="FUTURE")
+    record(0, provider="MOCK")
+    record(1, provider="OTHER_ACCOUNT", user_id=other, headers=quota)
+    for flags in ({"skipped_by": "cooldown"}, {"skipped_by": "token_pacing"}, {"blocked_by": "pre_send_policy"},
+                  {"not_sent": True}):
+        record(1, provider="HELD", metadata=flags, status=None)
+    record(1, metadata={"model": "legacy-alias"})
+
+    result = client.get("/api/monitoring/rate-limits?all_accounts=true")
+    assert result.status_code == 200, result.text
+    body = result.json()
+    providers = {p["provider"]: p for p in body["providers"]}
+    assert set(providers) == {"APIFY", "GROQ", "LITELLM", "OPENROUTER"}
+    assert providers["GROQ"] == {"provider": "GROQ", "calls_minute": 2, "calls_day": 4, "http_429_day": 1,
+                                 "models": [{"model": "groq/openai/gpt-oss-20b", "calls_minute": 2, "calls_day": 3},
+                                            {"model": "old-gateway-route", "calls_minute": 0, "calls_day": 1}]}
+    assert providers["APIFY"]["calls_day"] == 1 and providers["APIFY"]["calls_minute"] == 0
+    assert providers["OPENROUTER"]["calls_day"] == 1 and providers["OPENROUTER"]["calls_minute"] == 0
+    snapshot, = body["snapshots"]
+    assert snapshot["provider"] == "GROQ" and snapshot["requests_window"] == "day"
+    assert snapshot["requests_limit"] == 1000 and snapshot["requests_remaining"] == 0
+    assert snapshot["tokens_per_minute_limit"] == 8000 and snapshot["tokens_per_minute_remaining"] == 20
+    assert snapshot["retry_after_seconds"] == 2 and snapshot["tokens_reset_seconds"] == 7.66
+    assert snapshot["requests_reset_seconds"] == 179.56 and "private text" not in result.text
+
+
+def test_openrouter_key_quota_only_returns_reported_counters(owner, monkeypatch):
+    from app.services import provider_usage
+
+    key = "a-private-test-key"
+    monkeypatch.setattr(provider_usage, "user_keys", lambda db, user_id: {"openrouter": key if user_id == owner else None})
+    client_factory = external_api.external_client
+
+    def handle(request):
+        assert str(request.url) == "https://openrouter.ai/api/v1/key"
+        assert request.headers["Authorization"] == f"Bearer {key}" and request.extensions[external_api.NO_CAPTURE]
+        return httpx.Response(200, json={"data": {"label": "private account", "usage": 1234, "is_free_tier": False,
+                                                 "free_model_daily_requests": {"limit": 50, "used": 50, "remaining": 0}}})
+    monkeypatch.setattr(external_api, "external_client", lambda *args, **kwargs: client_factory(
+        *args, **kwargs, transport=httpx.MockTransport(handle)))
+    monkeypatch.setattr(get_settings(), "external_api_debug_payloads", True)
+    response = client.get("/api/monitoring/rate-limits/openrouter")
+    assert response.status_code == 200
+    body = response.json()
+    assert body.pop("observed_at") and body == {"status": "reported", "used": 50, "limit": 50, "remaining": 0}
+    with SessionLocal() as db:
+        call = db.scalar(select(ExternalAPIRequestLog).where(ExternalAPIRequestLog.provider == "OPENROUTER_ACCOUNT"))
+        assert call.user_id == owner and call.payload is None
+        assert key not in str(call.request_metadata) and "private account" not in str(call.request_metadata)
+
+
+@pytest.mark.parametrize("code, body, status", [
+    (200, {"data": {"usage_daily": 10, "is_free_tier": True}}, "unreported"),
+    (200, {"data": {"free_model_daily_requests": {"used": False, "remaining": -1}}}, "unreported"),
+    (429, {}, "unavailable"),
+])
+def test_openrouter_quota_unknown_and_unavailable(owner, monkeypatch, code, body, status):
+    from app.services import provider_usage
+
+    factory = external_api.external_client
+    monkeypatch.setattr(provider_usage, "user_keys", lambda *_: {"openrouter": "test"})
+    monkeypatch.setattr(external_api, "external_client", lambda *args, **kwargs: factory(
+        *args, **kwargs, transport=httpx.MockTransport(lambda _: httpx.Response(code, json=body))))
+    assert client.get("/api/monitoring/rate-limits/openrouter").json() == {"status": status}
+
+
+def test_openrouter_quota_without_account_key_or_with_custom_endpoint_stays_local(owner, monkeypatch):
+    from app.services import provider_usage
+
+    monkeypatch.setattr(provider_usage, "user_keys", lambda *_: {})
+    assert client.get("/api/monitoring/rate-limits/openrouter").json() == {"status": "no_key"}
+    monkeypatch.setattr(get_settings(), "openrouter_base_url", "https://private.example/v1")
+    assert client.get("/api/monitoring/rate-limits/openrouter").json() == {"status": "custom_endpoint"}
+
+
+def test_wrapped_sdk_429_counts_once_and_preserves_the_provider_wait(owner):
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    response = httpx.Response(429, request=request, headers={"retry-after": "3"})
+    with pytest.raises(RuntimeError), external_api.external_operation("OPENROUTER", user_id=owner,
+                                                                      metadata={"model": "example:free"}):
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError("typed adapter error") from exc
+    data = client.get("/api/monitoring/rate-limits").json()
+    assert data["providers"][0]["http_429_day"] == data["providers"][0]["calls_day"] == 1
+    assert data["snapshots"][0]["retry_after_seconds"] == 3
+
+
+def test_unspecified_quota_keeps_the_reported_limit_and_zero_remaining(owner):
+    with external_api.external_client("EXAMPLE", user_id=owner, transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, headers={"llm_provider-x-ratelimit-limit": "40",
+                                                   "llm_provider-x-ratelimit-remaining": "0",
+                                                   "x-ratelimit-reset": "90"}))) as http:
+        http.get("https://example.test/")
+    snapshot, = client.get("/api/monitoring/rate-limits").json()["snapshots"]
+    assert snapshot["limit"] == 40 and snapshot["remaining"] == 0 and snapshot["reset_at"]
+    assert snapshot["requests_window"] is None and snapshot["tokens_per_minute_limit"] is None

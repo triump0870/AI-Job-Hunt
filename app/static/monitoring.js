@@ -12,8 +12,8 @@ const MON_FILTER_KEYS = ['provider', 'model', 'stage', 'prompt_version', 'status
 const monWorker = w => w ? w.replace(/_/g, ' ').toLowerCase().replace(/^./, c => c.toUpperCase()) : '—';
 let monTimer = null;
 
-// Monitoring is one screen with seven sections; each loads only what it shows (loadMonitoring).
-const MON_TABS = [['overview', 'Overview'], ['llm', 'LLM usage'], ['models', 'Model performance'], ['external', 'External APIs'],
+// Monitoring is one screen with independently loaded sections; each loads only what it shows (loadMonitoring).
+const MON_TABS = [['overview', 'Overview'], ['llm', 'LLM usage'], ['models', 'Model performance'], ['external', 'External APIs'], ['limits', 'Rate limits'],
                   ['apify', 'Apify'], ['inbox', 'Application inbox'], ['logs', 'Logs'], ['advisor', 'AI optimization']];
 const MON_CATEGORY_TONE = { EXTERNAL_API: 'brand', APIFY: 'brand', LLM: 'muted', SCHEDULER: 'muted',
                             WORKFLOW: 'muted', APPLICATION: 'muted', EMAIL: 'muted', SYSTEM: 'muted' };
@@ -62,7 +62,7 @@ async function loadMonitoring() {
   // Each section asks only for what it draws, so opening Logs does not aggregate every LLM request.
   const wantsLlm = ['overview', 'llm', 'advisor'].includes(m.tab);
   const wantsExternal = ['overview', 'external', 'apify'].includes(m.tab);
-  const [dash, reqs, capture, rec, ext, extReqs, logs, inbox] = await Promise.all([
+  const [dash, reqs, capture, rec, ext, extReqs, logs, inbox, limits] = await Promise.all([
     wantsLlm ? api('/api/monitoring/dashboard?' + monQuery()) : Promise.resolve(D.mon),
     m.tab === 'llm' ? api('/api/monitoring/requests?' + monQuery({ page: m.page, per_page: 20 })) : Promise.resolve(D.monRequests),
     ['llm', 'logs'].includes(m.tab) ? api('/api/monitoring/capture').catch(() => D.monCapture) : Promise.resolve(D.monCapture),
@@ -71,8 +71,10 @@ async function loadMonitoring() {
     m.tab === 'external' ? api('/api/monitoring/external/requests?' + monExtQuery({ page: m.ext.page, per_page: 25 })) : Promise.resolve(D.monExtRequests),
     m.tab === 'logs' ? api('/api/monitoring/logs?' + monLogQuery({ page: m.logs.page, per_page: 50 })) : Promise.resolve(D.monLogs),
     m.tab === 'inbox' ? api('/api/monitoring/application-inbox?' + monQuery()) : Promise.resolve(D.monInbox),
+    m.tab === 'limits' ? api('/api/monitoring/rate-limits') : null,
   ]);
   if (m.tab === 'models') D.monPerf = await api('/api/monitoring/performance?' + monQuery({ group_by: m.perfBy }));
+  if (limits) D.monLimits = limits;
   const wasActive = D.monRec?.active;
   Object.assign(D, { mon: dash, monRequests: reqs, monCapture: capture, monRec: rec, monExt: ext, monExtRequests: extReqs, monLogs: logs, monInbox: inbox });
   if (wasActive && !rec.active) {
@@ -222,12 +224,89 @@ function monTile(label, value, sub = '', tone = '') {
 function renderMonitoring() {
   const m = monState();
   const tabs = `<section class="card pad12"><div class="row between wrap gap10" style="align-items:center">
-    <div class="seg">${MON_TABS.map(([id, t]) => `<button class="${m.tab === id ? 'on' : ''}" data-act="mon-tab" data-id="${id}">${t}</button>`).join('')}</div>
-    <div class="seg">${MON_RANGES.map(([id, t]) => `<button class="${m.range === id ? 'on' : ''}" data-act="mon-range" data-id="${id}">${t}</button>`).join('')}</div></div></section>`;
-  const body = m.tab === 'llm' ? renderMonLlm() : m.tab === 'models' ? renderMonPerformance() : m.tab === 'external' ? renderMonExternal()
+    <div class="seg wrap">${MON_TABS.map(([id, t]) => `<button class="${m.tab === id ? 'on' : ''}" data-act="mon-tab" data-id="${id}">${t}</button>`).join('')}</div>
+    ${m.tab === 'limits' ? '' : `<div class="seg">${MON_RANGES.map(([id, t]) => `<button class="${m.range === id ? 'on' : ''}" data-act="mon-range" data-id="${id}">${t}</button>`).join('')}</div>`}</div></section>`;
+  const body = m.tab === 'limits' ? renderMonLimits() : m.tab === 'llm' ? renderMonLlm() : m.tab === 'models' ? renderMonPerformance() : m.tab === 'external' ? renderMonExternal()
     : m.tab === 'apify' ? renderMonApify() : m.tab === 'inbox' ? renderMonInbox() : m.tab === 'logs' ? renderMonLogs()
     : m.tab === 'advisor' ? renderAdvisor() : renderMonOverview();
   return `<div class="stack">${tabs}${body}</div>`;
+}
+
+// Published free-plan examples supplied on 15 Nov 2026. These are reference data only.
+const GROQ_FREE_LIMITS = [
+  ['canopylabs/orpheus-arabic-saudi', 10, 100, 1200, 3600],
+  ['canopylabs/orpheus-v1-english', 10, 100, 1200, 3600],
+  ['meta-llama/llama-prompt-guard-2-22m', 30, 14400, 15000, 500000],
+  ['meta-llama/llama-prompt-guard-2-86m', 30, 14400, 15000, 500000],
+  ['openai/gpt-oss-120b', 30, 1000, 8000, 200000],
+  ['openai/gpt-oss-20b', 30, 1000, 8000, 200000],
+  ['openai/gpt-oss-safeguard-20b', 3, 1000, 2000, 200000],
+  ['qwen/qwen3.8-27b', 30, 1000, 8000, 200000],
+  ['whisper-large-v3', 20, 2000, null, null, 7200, 28800],
+  ['whisper-large-v3-turbo', 20, 2000, null, null, 7200, 28800],
+];
+const monCount = value => value == null ? '—' : value.toLocaleString();
+
+function monLimitReadings(snapshots) {
+  const rows = [];
+  for (const s of snapshots) {
+    const add = (window, limit, left, reset) => rows.push([s.provider, s.model || '—', window,
+      monCount(limit), monCount(left), reset || '—', fmtDateTime(s.observed_at)]);
+    const seconds = value => value == null ? null : `${monCount(value)} s`;
+    if ([s.requests_limit, s.requests_remaining, s.requests_reset_seconds].some(v => v != null)) {
+      add(s.requests_window ? `Requests / ${s.requests_window}` : 'Requests (window unknown)',
+        s.requests_limit, s.requests_remaining, seconds(s.requests_reset_seconds));
+    }
+    if ([s.tokens_per_minute_limit, s.tokens_per_minute_remaining, s.tokens_reset_seconds].some(v => v != null)) {
+      add('Tokens / minute', s.tokens_per_minute_limit, s.tokens_per_minute_remaining, seconds(s.tokens_reset_seconds));
+    }
+    if (s.retry_after_seconds != null) add('Retry after', null, null, seconds(s.retry_after_seconds));
+    if (s.requests_remaining == null && s.tokens_per_minute_remaining == null && (s.limit != null || s.remaining != null || s.reset_at)) {
+      add('Unspecified quota', s.limit, s.remaining, fmtDateTime(s.reset_at));
+    }
+  }
+  return rows.length ? monTable(['Provider', 'Model or route', 'Window', 'Limit', 'Remaining', 'Reset / wait at observation', 'Observed'], rows)
+    : '<p class="small muted">No quota headers recorded in the last 24 hours.</p>';
+}
+
+function monOpenRouterQuota() {
+  const q = D.monOpenRouterQuota;
+  const messages = { no_key: 'Add your OpenRouter API key in Settings to check its daily allowance.',
+    custom_endpoint: 'The configured endpoint is custom. Check the allowance with its operator.',
+    unavailable: 'OpenRouter could not be reached or declined the quota check.',
+    unreported: 'OpenRouter did not report a daily request allowance for this key.' };
+  const reading = q?.status === 'reported' ? `<p class="small"><b>${monCount(q.used)} used · ${monCount(q.remaining)} remaining</b>
+    of ${monCount(q.limit)} requests for the UTC day · checked ${esc(fmtDateTime(q.observed_at))}</p>` : '';
+  return `<section class="card pad16"><div class="row between wrap gap8"><div class="card-title">OpenRouter free models</div>
+    ${btn(label('monQuota', 'Check key allowance', 'Checking…'), 'mon-openrouter-quota', {}, 'sm', isBusy('monQuota'))}</div>
+    ${reading}${D.monQuotaStatus ? `<p class="small muted" role="status">${esc(messages[D.monQuotaStatus])}</p>` : ''}
+    <div class="card-sub mt6">Published limits for :free models are 20 requests per minute and 50 or 1,000 per UTC day, depending on lifetime credits purchased.
+    OpenRouter lists 10 credits for the higher tier and allows a one-credit rounding margin. BYOK and exempt requests have separate rules.
+    <a href="https://openrouter.ai/docs/api/reference/limits" target="_blank" rel="noopener">OpenRouter limits</a></div></section>`;
+}
+
+function renderMonLimits() {
+  const data = D.monLimits;
+  if (!data) return loading();
+  const models = data.providers.flatMap(p => p.models.map(m => [p.provider, m.model, monCount(m.calls_minute), monCount(m.calls_day)]));
+  return `<section class="card pad16"><div class="row between wrap gap8"><div class="card-title">Provider calls</div>
+    ${btn(label('monRefresh', 'Refresh', 'Refreshing…'), 'mon-refresh', {}, 'sm', isBusy('monRefresh'))}</div>
+    <p class="card-sub mb12">Calls recorded for your account in rolling windows ending ${esc(fmtDateTime(data.as_of))}.
+    SDK and gateway retries inside a single recorded call count once. LiteLLM includes calls with an unidentified upstream provider.</p>
+    ${data.recording_enabled === false ? '<p class="small">External API recording is currently off.</p>' : ''}
+    ${data.providers.length ? monTable(['Provider', 'Last 60 seconds', 'Last 24 hours', 'HTTP 429s · 24 hours'],
+      data.providers.map(p => [p.provider, monCount(p.calls_minute), monCount(p.calls_day), monCount(p.http_429_day)]))
+      : '<p class="small muted">No provider calls recorded in the last 24 hours.</p>'}
+    ${models.length ? `<details class="mt12"><summary>Calls by model or route</summary>${monTable(['Provider', 'Model or route', 'Last 60 seconds', 'Last 24 hours'], models)}</details>` : ''}</section>
+    <section class="card pad16"><div class="card-title">Last reported quotas</div>
+    <p class="card-sub mb12">Latest response with quota details for each model or route in the last 24 hours. Remaining amounts and reset intervals are readings at the time shown.</p>
+    ${monLimitReadings(data.snapshots)}</section>
+    ${monOpenRouterQuota()}
+    <details class="card pad16"><summary class="card-title">Groq free-plan limits by model</summary>
+    <p class="card-sub mb12">Published free-plan figures from 15 Nov 2026. Your organization may have different limits.
+    <a href="https://console.groq.com/docs/rate-limits" target="_blank" rel="noopener">Groq limits</a></p>
+    ${monTable(['Model', 'Requests / min', 'Requests / day', 'Tokens / min', 'Tokens / day', 'Audio sec / hour', 'Audio sec / day'],
+      GROQ_FREE_LIMITS.map(([name, rpm, rpd, tpm, tpd, ash, asd]) => [name, ...[rpm, rpd, tpm, tpd, ash, asd].map(monCount)]))}</details>`;
 }
 
 /* Overview: the few numbers that say whether the whole system is healthy, from both telemetry tables. */
@@ -830,6 +909,11 @@ function renderMonLogModal() {
 }
 
 const MONITORING_ACTIONS = {
+  'mon-openrouter-quota': () => busy('monQuota', async () => {
+    const result = await api('/api/monitoring/rate-limits/openrouter');
+    D.monQuotaStatus = result.status === 'reported' ? null : result.status;
+    if (result.status === 'reported' || result.status === 'no_key' || result.status === 'custom_endpoint') D.monOpenRouterQuota = result;
+  }),
   'mon-range': el => { Object.assign(monState(), { range: el.dataset.id, page: 1 }); load(); },
   'mon-filter': el => { monState()[el.dataset.key] = el.dataset.key === 'job_id' ? el.value.replace(/\D/g, '') : el.value; monState().page = 1; load(); },
   'mon-perf-by': el => { monState().perfBy = el.dataset.id; load(); },

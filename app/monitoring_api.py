@@ -34,6 +34,7 @@ from app.services import (
     ai_model_config,
     external_monitoring,
     model_performance,
+    provider_usage,
     monitoring,
 )
 from app.services.user_settings import lock_settings_row, settings_for
@@ -202,6 +203,16 @@ def external_filter(
 
 
 ExtFilter = Depends(external_filter)
+
+
+@router.get("/rate-limits")
+def provider_rate_limits(user: CurrentUser = Depends(current_user), db: Session = Depends(get_user_db)):
+    return provider_usage.usage(db, user.id)
+
+
+@router.get("/rate-limits/openrouter")
+def openrouter_rate_limit(user: CurrentUser = Depends(current_user), db: Session = Depends(get_user_db)):
+    return provider_usage.openrouter_quota(db, user.id)
 
 
 @router.get("/external/dashboard")
