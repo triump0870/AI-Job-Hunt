@@ -7,7 +7,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const appSource = readFileSync('app/static/app.js', 'utf8').split('/* ───────────── boot ───────────── */')[0];
 let ui;
 const facets = (extra = {}) => ({ items: [], total: 12, total_all: 12, boards: ['Naukri', 'LinkedIn'], locations: [],
-  easy_apply: 3, status_counts: { all: 12, starred: 1, waiting: 7, sent_back: 2, approved: 2 }, ...extra });
+  easy_apply: 3, status_counts: { all: 12, starred: 1, waiting: 7, sent_back: 2, approved: 2, rejected: 3 }, ...extra });
 const view = (f = facets()) => { document.getElementById('view').innerHTML = ui.renderPacketFilters('approvals', f); return document.getElementById('view'); };
 
 beforeEach(() => {
@@ -30,7 +30,7 @@ describe('Packet filter bar', () => {
   it('shows each status as a tab with its count, the current one selected', () => {
     ui.S.pf.approvals.status = 'waiting';
     const tabs = [...view().querySelectorAll('.pf-tab')];
-    expect(tabs.map(t => t.textContent)).toEqual(['All12', 'Starred1', 'Waiting7', 'Sent back2', 'Approved2']);
+    expect(tabs.map(t => t.textContent)).toEqual(['All12', 'Starred1', 'New7', 'Sent back2', 'Approved2', 'Rejected3']);
     expect(tabs.find(t => t.classList.contains('on')).dataset.status).toBe('waiting');
     ui.A['pf-status'](tabs[4]);
     expect(ui.S.pf.approvals.status).toBe('approved');

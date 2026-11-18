@@ -44,6 +44,14 @@ def test_compound_names_are_supported_by_their_parts():
     assert not _term_supported("terraform", vocabulary) and not _term_supported("ci/terraform", vocabulary)
 
 
+def test_a_generic_modifier_rests_on_the_name_it_modifies():
+    vocabulary = _with_parts(_words("Built reporting on Spark, S3 and Redis."))
+    assert _term_supported("s3-backed", vocabulary) and _term_supported("redis-driven", vocabulary)
+    assert not _term_supported("dynamodb-backed", vocabulary), "the name itself still needs support"
+    assert not _term_supported("backed", vocabulary) and not _term_supported("cloud-native", vocabulary)
+    assert not _term_supported("first-backed", vocabulary), "modifiers alone are not a supported name"
+
+
 def test_supported_keyword_coverage_names_what_the_resume_leaves_out():
     targets = {"use": [{"keyword": "Kafka", "level": "REQUIRED"}, {"keyword": "CI/CD", "level": "KEYWORD"}]}
     out = supported_keyword_coverage(targets, "## Experience\n- Ran Kafka pipelines\n## Source Resume\nCI/CD")

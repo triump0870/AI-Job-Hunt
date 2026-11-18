@@ -148,10 +148,21 @@ def _with_parts(words: set[str]) -> set[str]:
     return words | {part for word in words for part in NAME_PARTS_RE.split(word) if part}
 
 
+# Generic words a hyphenated compound may end in ("S3-backed", "Kafka-driven"). They name no technology, employer or
+# skill, so they need no support of their own; the name they modify still does.
+COMPOUND_MODIFIERS = frozenset({"backed", "based", "driven", "powered", "enabled", "native", "first", "ready",
+                                "aware", "friendly", "oriented", "centric", "focused", "heavy", "facing", "agnostic"})
+
+
 def _term_supported(term: str, supported: set[str]) -> bool:
     """A named term is supported when the corpus has it, or has every part of it: the resume's "CI/CD" is read as
-    "ci" and "cd", and "Python-based" rests on "python" and "based"."""
-    return term in supported or all(part in supported for part in NAME_PARTS_RE.split(term) if part)
+    "ci" and "cd", and "Python-based" rests on "python" and "based". A trailing generic modifier ("S3-backed")
+    needs no support, but the name before it always does: "backed" alone never passes."""
+    if term in supported:
+        return True
+    parts = [part for part in NAME_PARTS_RE.split(term) if part]
+    names = [part for part in parts if part not in COMPOUND_MODIFIERS] if len(parts) > 1 else parts
+    return bool(names) and all(part in supported for part in names)
 
 
 def verified_evidence(db: Session, job: Job) -> dict[int, Evidence]:

@@ -86,6 +86,18 @@ def test_the_document_shows_corrections_and_leaves_out_what_was_rejected():
     assert parsed.roles[0].bullets == ["Reduced incidents by 45% across Kafka pipelines"]
 
 
+def test_a_project_achievement_the_description_already_says_is_not_repeated():
+    project = {"name": "Knowledge Assistant", "verification": {"status": "VERIFIED"},
+               "description": "Designed RAG pipelines, resulting in 30% faster document retrieval for internal teams.",
+               "achievements": [{"text": "resulting in 30% faster document retrieval for internal teams.",
+                                 "verification": {"status": "VERIFIED"}},
+                                {"text": "Cut hosting cost by 20%", "verification": {"status": "VERIFIED"}}]}
+    document = sr.render_document({"projects": [project]})
+    assert "- resulting in 30%" not in document, "the fragment is already in the description line"
+    assert "- Cut hosting cost by 20%" in document, "a new achievement is still listed"
+    assert document.count("30% faster document retrieval") == 1
+
+
 def test_a_role_without_dates_keeps_its_location():
     data = sr.materialize(sr.parse_deterministic(STRUCTURED))
     lead = data["experience"][0]

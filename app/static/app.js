@@ -1181,7 +1181,7 @@ function renderManualAdd() {
 /* ───────────── packet filters (Tailor, Approvals) ───────────── */
 const PF_STATUS = {
   tailor: [['all', 'All packets'], ['not_tailored', 'Not tailored'], ['has_packet', 'Has packet'], ['needs_retailor', 'Needs re-tailoring'], ['sent_back', 'Sent back'], ['untailored', 'Master resume only']],
-  approvals: [['all', 'All statuses'], ['starred', 'Starred'], ['waiting', 'Waiting'], ['sent_back', 'Sent back'], ['approved', 'Approved']],
+  approvals: [['all', 'All statuses'], ['starred', 'Starred'], ['waiting', 'New'], ['sent_back', 'Sent back'], ['approved', 'Approved'], ['rejected', 'Rejected']],
 };
 const PF_SORT = {
   tailor: [['fit', 'Sort: best fit'], ['reviewer', 'Sort: reviewer score'], ['new', 'Sort: newest'], ['company', 'Sort: company']],
@@ -1474,17 +1474,37 @@ const reviewNoteRow = n => `<div class="row top-align gap10"><span class="note-d
 function renderApprovalReview(job, r, minScore) {
   const unreviewed = r.reviewer_score == null;
   const notes = r.review || [];
-  const concerns = [...notes.filter(n => n.tone === 'bad'), ...notes.filter(n => n.tone === 'warn')];
+  // Each disputed claim is its own row (app.services.approval_review.review_notes): what to fix in the packet, then
+  // the job's requirements the resume doesn't show, then what holds up.
+  const packetIssues = notes.filter(n => n.tone === 'bad');
+  const gaps = notes.filter(n => n.tone === 'warn');
   const strengths = notes.filter(n => n.tone === 'good');
   const group = (title, items) => items.length ? `<div><div class="caps-sm mb8">${title} · ${items.length}</div><div class="col gap10">${items.map(reviewNoteRow).join('')}</div></div>` : '';
   const body = unreviewed
     ? `<div class="small muted">This packet has not been reviewed, so there are no notes yet. <a href="#" data-act="go" data-screen="tailor" data-job="${job.id}">Send it to review in Tailor</a>.</div>`
     : notes.length
-      ? `<div class="grid-auto" style="grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:18px">${group('TO WEIGH BEFORE APPROVING', concerns)}${group('WHAT HOLDS UP', strengths)}</div>`
+      ? `<div class="col gap16">${group('FIX BEFORE SENDING', packetIssues)}${group('JOB REQUIREMENTS THE RESUME DOESN\'T SHOW', gaps)}${group('WHAT HOLDS UP', strengths)}</div>`
       : '<div class="small muted">The reviewer left no notes.</div>';
   return `<div id="approval-review" style="padding:18px 22px;border-bottom:1px solid var(--line2)">
     <div class="row gap8 mb12">${pill('AI', 'brand')}<span class="base b">Reviewer notes</span>${unreviewed ? '' : `<span class="mono bb base" style="margin-left:auto;color:${r.reviewer_score >= minScore ? 'var(--good)' : 'var(--bad)'}">${fitTxt(r.reviewer_score)} / 100</span>`}</div>
     ${body}</div>`;
+}
+// A queue row's two scores, labelled: the reviewer's score of the packet (coloured against your minimum) and the
+// job's fit. They are different numbers and read as one if either is unlabelled.
+function approvalRowScores(q, minScore) {
+  const rev = q.reviewer_score;
+  const color = q.status === 'approved' || q.status === 'rejected' || rev == null ? 'var(--faint)'
+    : rev >= minScore ? 'var(--good)' : rev >= minScore - 10 ? 'var(--warn)' : 'var(--bad)';
+  return `<span class="col none" style="align-items:flex-end;line-height:1.2"><span class="mono bb base" style="color:${color}" title="Reviewer score: how well this packet holds up (your minimum is ${minScore})"><span class="xs faint" style="font-weight:500">rev </span>${fitTxt(rev)}</span><span class="xs muted mono" title="Fit: how well the job matches you">fit ${fitTxt(q.fit)}</span></span>`;
+}
+const ANSWER_TONE = { verified: 'good', draft: 'warn', other_job: 'warn', confirm: 'warn', unverified: 'warn', needs_input: 'bad' };
+const ANSWER_PILL = { verified: 'verified', draft: 'draft', other_job: 'other job', confirm: 'confirm', unverified: 'unverified', needs_input: 'needs you' };
+// The questions this job's application is known to ask, and the answer each would get. Answers saved for other
+// jobs' questions are never listed here (app.services.approval_review.job_answers).
+function renderJobAnswers(answers) {
+  const items = Array.isArray(answers) ? [] : answers?.items || [];
+  if (!items.length) return `<div class="small muted">This job's application questions aren't known yet. They appear once you paste the form's questions in Job insights, or when an application run reads the form. Answers you saved for other jobs aren't shown here.</div>`;
+  return `<div class="col gap9">${items.map(x => `<div class="box"><div class="small muted">${esc(x.question)}${x.origin === 'predicted' ? ' <span class="xs faint">· likely asked</span>' : ''}</div><div class="row gap8 mt4 top-align"><span class="small ${x.answer ? 'b' : 'muted'} grow clamp3" title="${attr(x.answer || '')}">${esc(x.answer || (x.state === 'confirm' ? 'Saved — you confirm it on the form' : 'No answer yet'))}</span><span title="${attr(x.label)}">${pill(ANSWER_PILL[x.state] || x.state, ANSWER_TONE[x.state] || 'muted')}</span></div>${x.state === 'other_job' || x.state === 'needs_input' ? `<div class="xs mt4" style="color:var(--warn-deep)">${esc(x.label)}</div>` : ''}</div>`).join('')}</div>`;
 }
 function renderApprovals() {
   const list = D.approvals; if (!list) return loading();
@@ -1494,11 +1514,14 @@ function renderApprovals() {
 function renderApprovalsBody(list) {
   if (!list.length) return `<section class="card">${empty('The queue is clear', 'Tailored packets land here for your sign-off.', btn('Go to Tailor', 'go', { screen: 'tailor' }, 'primary'))}</section>`;
   const a = D.approval;
-  const waiting = list.filter(x => x.waiting).length;
+  // One number everywhere: what still needs a decision, new or sent back (the sidebar badge counts the same).
+  const fresh = list.filter(x => x.waiting).length;
+  const toDecide = list.filter(x => x.to_decide).length;
+  const minScore = D.approvalFacets?.min_review_score ?? D.approval?.min_review_score ?? 70;
   const allOn = list.every(q => S.approvalPicked.has(q.id));
-  const queue = `<section class="card flush c-narrow"><div class="card-head row gap10"><input type="checkbox" data-act="approval-check-all" ${allOn ? 'checked' : ''} aria-label="Select every job in the queue"><span class="card-title sm grow">Queue · ${waiting} waiting</span></div>
+  const queue = `<section class="card flush c-narrow"><div class="card-head row gap10"><input type="checkbox" data-act="approval-check-all" ${allOn ? 'checked' : ''} aria-label="Select every job in the queue"><span class="card-title sm grow">Queue · ${toDecide} to decide</span>${toDecide ? `<span class="xs muted none">${fresh} new · ${toDecide - fresh} sent back</span>` : ''}</div>
     ${renderApprovalBulkBar(list)}
-    ${list.map(q => `<div class="lrow click ${q.id === S.approvalJob ? 'sel' : ''}" data-act="select-approval" data-id="${q.id}"><input type="checkbox" data-act="approval-check" data-id="${q.id}" ${S.approvalPicked.has(q.id) ? 'checked' : ''} aria-label="Select ${attr(q.title)}">${starButton(q)}<div class="grow"><div class="base b ellipsis">${esc(q.title)}</div><div class="xs muted">${esc(q.company)} · ${esc(q.age)}</div></div>${q.easy_apply ? pill('Easy Apply', 'brand') : ''}${q.approval_override ? pill('waived', 'warn') : ''}${approvalTaskPill(q)}${postingClosedPill(q)}<span class="mono bb base" style="color:${q.status === 'approved' ? 'var(--faint)' : (q.reviewer_score || 0) >= 75 ? 'var(--good)' : (q.reviewer_score || 0) >= 65 ? 'var(--warn)' : 'var(--bad)'}">${fitTxt(q.reviewer_score)}</span></div>`).join('')}</section>`;
+    ${list.map(q => `<div class="lrow click ${q.id === S.approvalJob ? 'sel' : ''}" data-act="select-approval" data-id="${q.id}"><input type="checkbox" data-act="approval-check" data-id="${q.id}" ${S.approvalPicked.has(q.id) ? 'checked' : ''} aria-label="Select ${attr(q.title)}">${starButton(q)}<div class="grow"><div class="base b ellipsis">${esc(q.title)}</div><div class="xs muted">${esc(q.company)} · ${esc(q.age)}</div></div>${q.easy_apply ? pill('Easy Apply', 'brand') : ''}${q.approval_override ? pill('waived', 'warn') : ''}${approvalTaskPill(q)}${postingClosedPill(q)}${approvalRowScores(q, minScore)}</div>`).join('')}</section>`;
   if (!a) return `<div class="split">${queue}<section class="card c-main">${loading()}</section></div>`;
   const r = a.resume, job = a.job;
   const approved = job.status === 'approved';
@@ -1519,8 +1542,8 @@ function renderApprovalsBody(list) {
     ${renderApprovalReview(job, r, a.min_review_score)}
     <div class="grid-auto" style="grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:0">
       <div style="padding:18px 22px;border-right:1px solid var(--line2)"><div class="row between mb10"><div class="base b">Tailored resume</div><a class="small" href="#" data-act="go" data-screen="tailor" data-job="${job.id}">Edit in Tailor</a></div><div class="doc clip">${miniMarkdown(r.markdown)}</div></div>
-      <div style="padding:18px 22px"><div class="base b mb10">ATS answers to reuse</div>
-        <div class="col gap9">${a.answers.length ? a.answers.map(x => `<div class="box"><div class="small muted">${esc(x.question)}</div><div class="row gap8 mt4"><span class="small b grow">${esc(x.answer || 'Awaiting answer')}</span>${pill(x.sensitive ? 'confirm' : x.verified ? 'verified' : 'unverified', x.sensitive || !x.verified ? 'warn' : 'good')}</div></div>`).join('') : '<div class="small muted">No saved answers. Add them in the Knowledge bank.</div>'}</div>
+      <div style="padding:18px 22px"><div class="base b mb10">This job's application questions</div>
+        ${renderJobAnswers(a.answers)}
         <textarea class="textarea mt12" id="approval-notes" data-act-blur="save-notes" data-id="${job.id}" placeholder="Notes for yourself — saved when you click away">${esc(fv('approvalNotes', job.id, a.notes))}</textarea></div></div>` : empty('No packet', 'This job has no tailored resume.')}
   </section></div>`;
 }
@@ -2233,7 +2256,7 @@ function renderPalette() {
     <div style="padding:10px 0 12px;max-height:55vh;overflow:auto">
       ${q ? `<div class="row between" style="padding:8px 18px"><span class="caps-sm faint">JOBS</span><span class="tiny faint">${S.paletteTotal ?? 0} match</span></div>${S.paletteJobs.map(j => item('↳', `${j.company} — ${j.title}`, `fit ${fitTxt(j.fit)} · ${j.location || j.board}`, 'palette-job', { id: j.id })).join('') || '<div class="small muted" style="padding:6px 18px">No jobs match.</div>'}` : ''}
       <div class="caps-sm faint" style="padding:8px 18px">JUMP TO</div>
-      ${item('O', 'Overview', 'pipeline health', 'palette-go', { screen: 'overview' })}${item('T', 'Today · run sheet', `${c.today ?? 0} actions`, 'palette-go', { screen: 'today', variant: 'run' })}${item('D', 'Discovery · triage queue', `${c.discovery ?? 0} new`, 'palette-go', { screen: 'discovery', mode: 'triage' })}${item('A', 'Approvals', `${c.approvals ?? 0} waiting`, 'palette-go', { screen: 'approvals' })}${item('R', 'Tracker', `${c.tracker ?? 0} live`, 'palette-go', { screen: 'tracker' })}
+      ${item('O', 'Overview', 'pipeline health', 'palette-go', { screen: 'overview' })}${item('T', 'Today · run sheet', `${c.today ?? 0} actions`, 'palette-go', { screen: 'today', variant: 'run' })}${item('D', 'Discovery · triage queue', `${c.discovery ?? 0} new`, 'palette-go', { screen: 'discovery', mode: 'triage' })}${item('A', 'Approvals', `${c.approvals ?? 0} to decide`, 'palette-go', { screen: 'approvals' })}${item('R', 'Tracker', `${c.tracker ?? 0} live`, 'palette-go', { screen: 'tracker' })}
       <div class="caps-sm faint" style="padding:14px 18px 8px;border-top:1px solid var(--line3);margin-top:6px">ACTIONS</div>
       ${item('N', 'Run the saved search now', 'the setup you last opened', 'palette-run')}${item('K', 'Open the apply kit for the latest approved packet', '', 'palette-kit')}${item('F', 'Work the follow-ups that are due', `${D.today?.followups?.length ?? ''}`, 'palette-go', { screen: 'today' })}${item('+', 'Add a job from a URL', 'manual', 'palette-go', { screen: 'discovery', mode: 'setup' })}
     </div><div class="xs muted" style="padding:10px 18px;border-top:1px solid var(--line2);background:#fbfbfe">Search every job in the pipeline, jump between screens, or fire an action without leaving the keyboard.</div></div></div>`;

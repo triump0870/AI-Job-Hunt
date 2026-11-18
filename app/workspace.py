@@ -53,6 +53,7 @@ from app.prompts import build_evidence_extraction_prompt
 from app.scheduler_hooks import run_soon
 from app.services import (
     approval,
+    approval_review,
     ats_keywords,
     domain_match,
     evidence_tags,
@@ -2018,10 +2019,14 @@ TAILOR_STATUS_FILTERS = {
 }
 APPROVAL_STATUS_FILTERS = {
     "waiting": lambda r: r["status"] == "tailored",
-    "sent_back": lambda r: r["status"] in ("pending_approval", "rejected"),
+    "sent_back": lambda r: r["status"] == "pending_approval",
     "approved": lambda r: r["status"] == "approved",
+    "rejected": lambda r: r["status"] == "rejected",
     "starred": lambda r: r["starred"],
 }
+# What still needs the person's decision: the same statuses the sidebar badge counts (approval_jobs). A sent-back
+# packet stays here — it can be approved as it is at any time.
+TO_DECIDE_STATUSES = ("tailored", "pending_approval")
 PACKET_SORTS = {
     "fit": lambda r: (r["fit"] is None, -(r["fit"] or 0), -r["id"]),
     "reviewer": lambda r: (r["reviewer_score"] is None, -(r["reviewer_score"] or 0), -r["id"]),
@@ -2106,10 +2111,7 @@ def packet(db: Session, job: Job) -> dict:
         return base
     edits = resume_edits(db, resume)
     coverage = keyword_coverage(job, resume)
-    notes = resume.reviewer_notes or {}
-    review = ([{"tone": "good", "text": s} for s in notes.get("strengths") or []]
-              + [{"tone": "warn", "text": s} for s in notes.get("improvements") or []]
-              + [{"tone": "bad", "text": s} for s in notes.get("reject_reasons") or []])
+    review = approval_review.review_notes(resume.reviewer_notes or {})
     # A reviewer may cite "req_024" or "evidence IDs (127, 129)": show what they stand for.
     for item, text in zip(review, review_text.readable_lines(db, job, [r["text"] for r in review]), strict=True):
         item["text"] = text
@@ -2191,17 +2193,30 @@ def approvals(q: str = "", min_fit: int = 0, max_fit: int = 0, min_review: int =
         resume = latest_resume(db, job.id)
         app = job.application
         age = (f"approved {day_label(app.approved_at)}" if job.status == "approved" and app and app.approved_at
-               else "sent back" if job.status in ("pending_approval", "rejected") else f"tailored {ago(resume.created_at) if resume else ''}")
+               else "sent back" if job.status == "pending_approval" else "rejected" if job.status == "rejected"
+               else f"tailored {ago(resume.created_at) if resume else ''}")
         rows.append({**job_card(job), "reviewer_score": resume.reviewer_score if resume else None, "age": age,
-                     "waiting": job.status == "tailored",
+                     "waiting": job.status == "tailored", "to_decide": job.status in TO_DECIDE_STATUSES,
                      "easy_apply": easy_apply(job, inputs.get(job.search_run_id)),
                      "approval_override": bool(app.approval_override) if app else False})
-    # Starred jobs lead the queue, then the ones waiting for a decision.
-    rows.sort(key=lambda r: (not r["starred"], not r["waiting"], r["status"] == "approved"))
-    return filter_packet_rows(rows, q=q, min_fit=min_fit, min_review=min_review, board=board, status=status, sort=sort,
-                              status_filters=APPROVAL_STATUS_FILTERS, with_facets=with_facets,
-                              location=location, easy_apply_only=easy_apply_filter == "only", max_fit=max_fit,
-                              max_review=max_review)
+    # Starred jobs lead the queue, then new packets, then sent-back ones; decided jobs last.
+    rows.sort(key=lambda r: (not r["starred"], not r["waiting"], not r["to_decide"], r["status"] == "rejected"))
+    # A rejected job is out of the queue: only the Rejected filter brings it back.
+    rejected = [r for r in rows if r["status"] == "rejected"]
+    if status != "rejected":
+        rows = [r for r in rows if r["status"] != "rejected"]
+    out = filter_packet_rows(rows, q=q, min_fit=min_fit, min_review=min_review, board=board, status=status, sort=sort,
+                             status_filters=APPROVAL_STATUS_FILTERS, with_facets=with_facets,
+                             location=location, easy_apply_only=easy_apply_filter == "only",
+                             max_fit=max_fit, max_review=max_review)
+    if with_facets:
+        out["min_review_score"] = settings_for(db).min_review_score
+        # The Rejected tab counts what the other filters would show, though rejected rows are out of "All".
+        out["status_counts"]["rejected"] = len(filter_packet_rows(
+            rejected, q=q, min_fit=min_fit, min_review=min_review, board=board, status="all", sort="",
+            status_filters=APPROVAL_STATUS_FILTERS, with_facets=False, location=location,
+            easy_apply_only=easy_apply_filter == "only", max_fit=max_fit, max_review=max_review))
+    return out
 
 
 @router.get("/api/approvals/{job_id}")
@@ -2211,30 +2226,14 @@ def approval_detail(job_id: int, db: Session = Depends(get_user_db)):
     resume = data["resume"]
     profile = get_profile(db)
     answers = answers_for(db)
-    checklist = []
-    if resume:
-        edits = [e for e in resume["edits"] if e["status"] != "reverted"]
-        cited = sum(1 for e in edits if e["evidence"])
-        rejects = (latest_resume(db, job.id).reviewer_notes or {}).get("reject_reasons") or []
-        body = resume["markdown"].split("## Source Resume")[0]
-        comp = [a for a in answers if a.category == "compensation"]
-        score = resume["reviewer_score"] or 0
-        checklist = [
-            {"label": "Every claim cites evidence", "detail": f"{cited} of {len(edits)} edits traced", "state": "ok" if cited == len(edits) else "warn"},
-            {"label": "No invented experience", "detail": rejects[0] if rejects else "Reviewer raised no unsupported claims", "state": "warn" if rejects else "ok"},
-            {"label": "Contact details present", "detail": "Email and phone on profile" if profile.email and profile.phone else "Add email and phone in Settings", "state": "ok" if profile.email and profile.phone else "warn"},
-            {"label": "One page, ATS-safe", "detail": f"{len(body.split())} words · plain text sections", "state": "ok" if len(body.split()) <= 650 else "warn"},
-            {"label": "Compensation answer", "detail": "Verified answer on file" if any(a.verified for a in comp) else "No verified compensation answer yet", "state": "ok" if any(a.verified for a in comp) else "warn"},
-            {"label": "Reviewer threshold", "detail": f"{score:.0f} vs minimum {data['min_review_score']}", "state": "ok" if score >= data["min_review_score"] else "warn"},
-        ]
+    checklist = approval_review.checklist(job, data, latest_resume(db, job.id), profile, answers) if resume else []
     app = job.application
     return {**data, "checklist": checklist, "pipeline": ranker.pipeline_status(db, job),
             "notes": app.notes if app else "", "application_id": app.id if app else None,
             "approval": {"override": bool(app.approval_override), "note": app.approval_note or ""} if app else None,
             "rejection_reasons": [{"id": key, "label": label} for key, label in REJECTION_REASONS.items()],
             "profile": {"name": profile.name, "headline": profile.headline, "location": profile.location},
-            "answers": [{"id": a.id, "question": a.question, "answer": a.answer, "verified": a.verified,
-                         "sensitive": a.sensitive, "category": a.category} for a in answers[:6]]}
+            "answers": approval_review.job_answers(db, job)}
 
 
 class NotesIn(BaseModel):

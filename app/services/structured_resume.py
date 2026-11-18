@@ -782,6 +782,11 @@ def _ordered_bullets(role: dict[str, Any], keep) -> list[str]:
     return [b["text"].strip() for b in sorted(bullets, key=lambda b: written.get(b["text"], len(written)))]
 
 
+def _comparable(text: str) -> str:
+    """Lower-cased words only, so "…for internal teams." and "for internal teams" compare equal."""
+    return " ".join(re.findall(r"[a-z0-9%]+", (text or "").lower()))
+
+
 def render_document(data: dict[str, Any] | None) -> str:
     """The structured data as a resume document in the dialect resume_format.parse_resume reads.
 
@@ -841,8 +846,12 @@ def render_document(data: dict[str, Any] | None) -> str:
             head = ": ".join(part for part in ((project.get("name") or "").strip(),
                                                 (project.get("description") or "").strip()) if part)
             out.append(head)
+            # An achievement the description already says (a parser often splits one sentence into both) is not
+            # printed again: the resume would repeat itself.
+            said = _comparable(project.get("description") or "")
             out += [f"- {b['text'].strip()}" for b in project.get("achievements") or []
-                    if isinstance(b, dict) and (b.get("text") or "").strip() and keep(b)]
+                    if isinstance(b, dict) and (b.get("text") or "").strip() and keep(b)
+                    and not (said and _comparable(b["text"]) in said)]
     education = [e for e in data.get("education") or [] if keep(e)]
     if education:
         out += ["", "## Education"]

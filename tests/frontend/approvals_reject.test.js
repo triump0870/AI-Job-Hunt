@@ -66,13 +66,14 @@ describe('reviewer notes on Approvals', () => {
     return view().querySelector('#approval-review');
   };
 
-  it('shows the score and puts concerns ahead of strengths, blockers first', () => {
+  it('shows the score and separates packet issues, job gaps and strengths, issues first', () => {
     const section = show({ reviewer_score: 45, review: [
       { tone: 'good', text: 'Strong Python backend' },
       { tone: 'warn', text: 'No Salesforce experience' },
       { tone: 'bad', text: 'Cites evidence that does not exist' }] });
     expect(section.textContent).toContain('45 / 100');
-    expect(section.textContent).toContain('TO WEIGH BEFORE APPROVING · 2');
+    expect(section.textContent).toContain('FIX BEFORE SENDING · 1');
+    expect(section.textContent).toContain("JOB REQUIREMENTS THE RESUME DOESN'T SHOW · 1");
     expect(section.textContent).toContain('WHAT HOLDS UP · 1');
     expect([...section.querySelectorAll('.pretty')].map(n => n.textContent)).toEqual(
       ['Cites evidence that does not exist', 'No Salesforce experience', 'Strong Python backend']);
@@ -93,6 +94,39 @@ describe('reviewer notes on Approvals', () => {
     expect(section.textContent).toContain('has not been reviewed');
     expect(section.textContent).not.toContain('/ 100');
     expect(section.querySelector('[data-act="go"]').dataset.screen).toBe('tailor');
+  });
+});
+
+describe("this job's application questions on Approvals", () => {
+  const show = answers => { ui.D.approval = approval({ answers }); ui.render(); return view().textContent; };
+
+  it('says the questions are not known yet instead of listing other jobs\' answers', () => {
+    expect(show({ items: [], known: false })).toContain("This job's application questions aren't known yet");
+    expect(show([])).toContain("This job's application questions aren't known yet");
+  });
+
+  it('flags an answer written for another job and one that needs the person', () => {
+    const text = show({ known: true, items: [
+      { question: 'Why do you want to work here?', answer: 'I like it', state: 'other_job', origin: 'form',
+        label: 'Written for another job — check it fits' },
+      { question: 'Notice period?', answer: null, state: 'needs_input', origin: 'predicted', label: 'Needs your answer' }] });
+    expect(text).toContain('other job');
+    expect(text).toContain('Written for another job — check it fits');
+    expect(text).toContain('needs you');
+    expect(text).toContain('likely asked');
+  });
+});
+
+describe('the Approvals queue header and rows', () => {
+  it('counts what is left to decide and labels both scores', () => {
+    ui.D.approvals = [{ ...job(), reviewer_score: 45, age: 'tailored 3d ago', waiting: true, to_decide: true },
+                      { ...job({ id: 8, fit: 70 }), reviewer_score: 80, age: 'sent back', waiting: false, to_decide: true }];
+    ui.render();
+    const text = view().textContent;
+    expect(text).toContain('Queue · 2 to decide');
+    expect(text).toContain('1 new · 1 sent back');
+    expect(text).toContain('rev 45');
+    expect(text).toContain('fit 92');
   });
 });
 
