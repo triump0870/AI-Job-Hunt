@@ -100,8 +100,42 @@ def _plural(n: int, word: str) -> str:
     return f"{n} {word}{'' if n == 1 else 's'}"
 
 
+def _pay_check(answers: list[KnowledgeAnswer], questions: dict[str, Any] | None,
+               pay: dict[str, Any] | None) -> tuple[str, str]:
+    """Compensation, for this job: whether its form asks about pay and what answer it would get, next to the range
+    the posting states. A form that never asks needs no answer."""
+    posted = f" · posted {pay['text']}" if pay else ""
+    asked = [q for q in (questions or {}).get("items") or [] if PAY_QUESTION_RE.search(q.get("question") or "")]
+    if asked:
+        ready = [q for q in asked if q.get("state") in ("verified", "confirm")]
+        return ((f"The form asks about pay; your answer is on file{posted}", "ok") if len(ready) == len(asked)
+                else (f"The form asks “{asked[0]['question'][:60]}” and there is no verified answer{posted}", "warn"))
+    # Only the form's own questions (pasted, or read by an application run) can say it never asks; predicted ones
+    # cannot.
+    if any(q.get("origin") == "form" for q in (questions or {}).get("items") or []):
+        return f"This form doesn't ask about pay{posted}", "ok"
+    verified = any(a.verified for a in answers if a.category == "compensation")
+    return ((f"Verified answer on file, if the form asks{posted}", "ok") if verified
+            else (f"No verified pay answer yet; needed only if the form asks{posted}", "warn"))
+
+
+# Which checks must be fixed before the packet goes out (blocker) and which are worth a look (nudge). Neither gates
+# Approve: the person may approve whatever the checks say.
+BLOCKERS = {"Claims backed by evidence", "No invented experience", "Resume reads cleanly", "Contact details present",
+            "Reviewer threshold"}
+FIXES = {
+    "Claims backed by evidence": {"label": "Fix in Tailor", "screen": "tailor"},
+    "No invented experience": {"label": "Fix in Tailor", "screen": "tailor"},
+    "Resume reads cleanly": {"label": "Fix in Tailor", "screen": "tailor"},
+    "Length": {"label": "Shorten in Tailor", "screen": "tailor"},
+    "Contact details present": {"label": "Add in Settings", "href": "#settings"},
+    "Compensation answer": {"label": "Add to Knowledge bank", "screen": "knowledge"},
+    "Reviewer threshold": {"label": "Send back for revision", "act": "revise-open"},
+}
+
+
 def checklist(job: Job, data: dict[str, Any], variant: Any, profile: Any,
-              answers: list[KnowledgeAnswer]) -> list[dict[str, str]]:
+              answers: list[KnowledgeAnswer], questions: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     resume = data["resume"]
     notes = (variant.reviewer_notes or {}) if variant is not None else {}
     content = (variant.content or {}) if variant is not None else {}
@@ -134,21 +168,25 @@ def checklist(job: Job, data: dict[str, Any], variant: Any, profile: Any,
               + (f" (+{len(lint) - 1} more)" if len(lint) > 1 else ""), "warn") if lint
              else ("No repeated lines, stray dashes or spacing slips", "ok"))
 
-    comp = [a for a in answers if a.category == "compensation"]
+    pay = _pay_check(answers, questions, salary(job))
     score = resume["reviewer_score"] or 0
     contact = bool(profile.email and profile.phone)
-    return [
+    items = [
         {"label": "Claims backed by evidence", "detail": evidence[0], "state": evidence[1]},
         {"label": "No invented experience", "detail": invented[0], "state": invented[1]},
         {"label": "Resume reads cleanly", "detail": clean[0], "state": clean[1], "issues": lint[:10]},
         {"label": "Contact details present", "detail": "Email and phone on profile" if contact
          else "Add email and phone in Settings", "state": "ok" if contact else "warn"},
         {"label": "Length", "detail": length[0], "state": length[1]},
-        {"label": "Compensation answer", "detail": "Verified answer on file" if any(a.verified for a in comp)
-         else "No verified compensation answer yet", "state": "ok" if any(a.verified for a in comp) else "warn"},
+        {"label": "Compensation answer", "detail": pay[0], "state": pay[1]},
         {"label": "Reviewer threshold", "detail": f"{score:.0f} vs minimum {data['min_review_score']}",
          "state": "ok" if score >= data["min_review_score"] else "warn"},
     ]
+    for item in items:
+        item["level"] = "blocker" if item["label"] in BLOCKERS else "nudge"
+        if item["state"] != "ok":
+            item["fix"] = FIXES.get(item["label"])
+    return items
 
 
 def clean_question(question: str) -> str:
@@ -218,3 +256,120 @@ def job_answers(db: Session, job: Job) -> dict[str, Any]:
             add(row.question, row.answer or None, state, label, "form")
     known = bool(out)
     return {"items": out[:MAX_ANSWERS], "known": known}
+
+
+# ───────────── the role's facts, and what approving does ─────────────
+
+WORK_MODE_LABELS = {"remote": "Remote", "hybrid": "Hybrid", "onsite": "On-site"}
+PERIOD_LABELS = {"year": "/yr", "yearly": "/yr", "annual": "/yr", "month": "/mo", "monthly": "/mo", "hour": "/hr",
+                 "hourly": "/hr", "week": "/wk", "day": "/day"}
+PAY_QUESTION_RE = re.compile(r"\b(salary|compensation|pay|ctc|remuneration|expected (?:base|package))\b",
+                             re.IGNORECASE)
+
+
+def work_mode(job: Job) -> str | None:
+    """remote, hybrid or onsite as the board stated it; None when it did not say."""
+    mode = (job.remote_type or "").strip().lower().replace("-", "").replace(" ", "")
+    if mode in ("remote", "hybrid"):
+        return mode
+    if mode in ("onsite", "inoffice", "office"):
+        return "onsite"
+    text = (job.location or "").lower()
+    return "remote" if "remote" in text else "hybrid" if "hybrid" in text else None
+
+
+def _money(value: float | None) -> str:
+    if value is None:
+        return ""
+    return f"{value / 1000:.0f}K" if value >= 10_000 else f"{value:,.0f}"
+
+
+def salary(job: Job) -> dict[str, Any] | None:
+    """The salary the posting states (never an estimate): {min, max, currency, period, text}. None when unstated."""
+    from app.services.compensation import extract_posting_salary
+
+    found: dict[str, Any] | None = None
+    if job.salary_min is not None or job.salary_max is not None:
+        found = {"min": job.salary_min, "max": job.salary_max, "currency": job.salary_currency,
+                 "period": job.salary_interval}
+    else:
+        stored = job.compensation if isinstance(job.compensation, dict) else {}
+        found = stored.get("posting") or extract_posting_salary(job.raw)
+    if not found or (found.get("min") is None and found.get("max") is None):
+        return None
+    low, high = found.get("min"), found.get("max")
+    amount = "–".join(_money(v) for v in (low, high) if v is not None) if low != high else _money(low)
+    currency = (found.get("currency") or "").upper()
+    period = PERIOD_LABELS.get(str(found.get("period") or "").lower(), "")
+    return {"min": low, "max": high, "currency": currency or None, "period": found.get("period"),
+            "text": f"{currency + ' ' if currency else ''}{amount}{period}"}
+
+
+def _location_wanted(job: Job, preferred: list[str], mode: str | None) -> bool | None:
+    """Whether the job's place is one of the person's preferred locations. None when no preference is set."""
+    wanted = [p.strip().lower() for p in preferred or [] if p and p.strip()]
+    if not wanted:
+        return None
+    place = (job.location or "").lower()
+    if mode == "remote" and any("remote" in w for w in wanted):
+        return True
+    return any(w.split(",")[0].strip() in place for w in wanted if w.split(",")[0].strip())
+
+
+def approve_effect(db: Session, job: Job) -> dict[str, str]:
+    """What approving this job will do: queue the guarded automatic submission (auto) or open the apply kit for the
+    person (kit). A prediction for the button's label only; application_execution.on_approved decides."""
+    from app.services import application_execution, ats_map
+
+    match = ats_map.for_job(job)
+    auto = (application_execution.mode() == "guarded_auto" and application_execution.routes(db)
+            and application_execution.default_mode(db, job.user_id) == "GUARDED_AUTO")
+    if auto and match is not None and match.auto_submit:
+        return {"kind": "auto", "label": "Approve & auto-apply",
+                "detail": f"Approving queues the guarded submission on {match.label}; it pauses for anything only "
+                          "you can answer."}
+    why = ("Auto submit is off for your account" if not auto
+           else "This job has no application web address" if match is None
+           else match.note or f"{match.label} applications are not automated")
+    return {"kind": "kit", "label": "Approve → apply kit",
+            "detail": f"{why}: approving opens the apply kit and you submit the form yourself."}
+
+
+def facts(db: Session, job: Job, profile: Any) -> dict[str, Any]:
+    """The role's facts the decision needs, from what the posting stated. Unknown stays None; a mismatch with the
+    person's preferences is flagged, never decided."""
+    from app.services import ats_map
+
+    mode = work_mode(job)
+    pay = salary(job)
+    match = ats_map.for_job(job)
+    wanted = _location_wanted(job, list(getattr(profile, "preferred_locations", None) or []), mode)
+    return {
+        "location": job.location or None, "work_mode": mode, "work_mode_label": WORK_MODE_LABELS.get(mode or ""),
+        "location_wanted": wanted, "salary": pay, "seniority": job.seniority or None,
+        "posted_at": job.posted_at.isoformat() if job.posted_at else None,
+        "route": {"ats": match.ats if match else None, "label": match.label if match else None,
+                  "auto_submit": bool(match and match.auto_submit)},
+    }
+
+
+def role_gaps(job: Job) -> list[dict[str, Any]]:
+    """The job's requirements against the candidate's evidence, as the Ranker assessed them: requirement → what is
+    shown → met / partial / missing / unknown. Required ones first; at most 15 (the Ranker's own limit)."""
+    status = {"MATCH": "met", "PARTIAL_MATCH": "partial", "MISSING": "missing", "UNKNOWN": "unknown"}
+    rows = [a for a in (job.fit_analysis or {}).get("requirement_assessments") or []
+            if isinstance(a, dict) and a.get("requirement")]
+    rows.sort(key=lambda a: (str(a.get("level") or "").upper() != "REQUIRED",
+                             ["MISSING", "PARTIAL_MATCH", "UNKNOWN", "MATCH"].index(a.get("status"))
+                             if a.get("status") in status else 4))
+    return [{"requirement": str(a["requirement"]), "level": str(a.get("level") or "UNKNOWN").lower(),
+             "status": status.get(str(a.get("status") or "").upper(), "unknown"),
+             "supported": a.get("supported") or "", "unsupported": a.get("unsupported") or "",
+             "fatal": bool(a.get("fatal"))} for a in rows[:15]]
+
+
+def duplicate_key(job: Job) -> str:
+    """Postings of one role: the same company and the same full title, case and punctuation aside. The title is kept
+    whole on purpose — "Engineer, Backend (Cards)" and "Engineer, Fullstack (Marketplace)" are different roles."""
+    words = lambda text: " ".join(re.findall(r"[a-z0-9+#]+", (text or "").lower()))
+    return f"{words(job.company)}|{words(job.title)}"

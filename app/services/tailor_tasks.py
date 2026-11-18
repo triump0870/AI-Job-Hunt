@@ -72,12 +72,28 @@ def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
 
 
-def _revision_feedback(db: Session, job: Job, variant_id: int | None) -> dict[str, Any] | None:
-    """The review a revision pass fixes: the named version of this job, else none."""
+# What the person asked a revision to change when they sent the packet back (Approvals): at most this many items.
+MAX_PERSON_REQUESTS = 12
+PERSON_REQUEST_CHARS = 400
+
+
+def person_requests(values: list[Any] | None) -> list[str]:
+    """The person's revision requests, trimmed and bounded. Their words, so still never a source of new facts."""
+    out = [" ".join(str(v).split())[:PERSON_REQUEST_CHARS] for v in values or [] if str(v or "").strip()]
+    return list(dict.fromkeys(out))[:MAX_PERSON_REQUESTS]
+
+
+def _revision_feedback(db: Session, job: Job, variant_id: int | None,
+                       requests: list[str] | None = None) -> dict[str, Any] | None:
+    """The review a revision pass fixes: the named version of this job, else none — plus what the person asked to
+    change when they sent it back."""
     from app.services.review_results import retailor_feedback
 
     variant = db.get(ResumeVariant, variant_id) if variant_id else None
-    return retailor_feedback(variant) or None if variant is not None and variant.job_id == job.id else None
+    feedback = retailor_feedback(variant) if variant is not None and variant.job_id == job.id else {}
+    if feedback and requests:
+        feedback["previous_review"]["person_requests"] = person_requests(requests)
+    return feedback or None
 
 
 def packet_outcome(db: Session, job: Job, resume: ResumeVariant, *, auto_approve: bool = True) -> dict[str, Any]:
@@ -318,6 +334,7 @@ def run_task(sessions: SessionFactory, task_id: int, worker_id: str, lease_secon
         user_id, job_id, mode = task.user_id, task.job_id, task.mode
         pages = (task.options or {}).get("pages")
         revise_from = (task.options or {}).get("revise_from")  # a revision pass: the version whose review to fix
+        requests = (task.options or {}).get("person_requests")  # what the person asked that pass to change
         conducted = bool((task.options or {}).get("conducted"))  # queued by the preparation graph
         holder, run_now = task.locked_by, task.run_now_at is not None
     worker_id = holder  # every write below is guarded by this claim's own name
@@ -363,7 +380,7 @@ def run_task(sessions: SessionFactory, task_id: int, worker_id: str, lease_secon
             if job.status not in SKIP_TAILORING_STATUSES:
                 raise ValueError(f"This job is {job.status.replace('_', ' ')} and can no longer be tailored")
             with backoff.bypass(run_now):
-                feedback = _revision_feedback(db, job, revise_from) if mode == "tailor" else None
+                feedback = _revision_feedback(db, job, revise_from, requests) if mode == "tailor" else None
                 made = skip_tailoring(db, job, progress=progress) if mode == "skip" \
                     else review_packet(db, job, progress=progress) if mode == "review" \
                     else tailor_job(db, job, progress=progress, pages=pages, **({"feedback": feedback} if feedback else {}))

@@ -87,7 +87,7 @@ def test_the_tailoring_context_and_prompt_carry_the_map_and_targets(user):
     assert {"Kafka", "Python", "Kubernetes"} <= set(use)
     assert {"PHP", "Terraform"} <= set(context.keyword_targets["do_not_use"])
     prompt = build_tailoring_prompt(candidate_profile=None, job=None, context=context)
-    assert prompt.version == "v11" and "REQUIREMENT MAP" in prompt.user and "KEYWORD TARGETS" in prompt.user
+    assert prompt.version == "v12" and "REQUIREMENT MAP" in prompt.user and "KEYWORD TARGETS" in prompt.user
     assert "do_not_use" in prompt.system and "WRITE FOR THIS POSTING" in prompt.system
     assert prompt.user.index("REQUIREMENT MAP") < prompt.user.index("LENGTH PLAN")
 

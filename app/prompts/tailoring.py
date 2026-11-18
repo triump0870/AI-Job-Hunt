@@ -49,7 +49,7 @@ from app.prompts.contracts import TailoringResult, describe_fields
 # v5: patch output with evidence ids per claim; completed FitAnalysis as read-only input (no score, no empty fields);
 # one canonical source resume instead of roles + resume text + policy; candidate context is name and headline only.
 # requirements with "alternatives" (one of Python, Java or Go): any one of them meets it.
-TAILOR_PROMPT_VERSION = "v11"
+TAILOR_PROMPT_VERSION = "v12"
 TAILOR_MARKER = "TAILOR_RESUME"
 # The FitAnalysis fields the Tailor reads. Scores are deliberately absent: the Tailor does not work with them.
 FIT_ANALYSIS_FIELDS = ("strong_matches", "partial_matches", "resume_gaps", "recommended_resume_focus")
@@ -60,7 +60,9 @@ SECTIONS = ("CANDIDATE", "SOURCE RESUME", "RELEVANT EVIDENCE", "JOB", "JOB REQUI
             "KEYWORD TARGETS", "LENGTH PLAN", "FIT ANALYSIS")
 # A revision pass only: the previous version's review. Its findings are corrections to make, never facts to add.
 REVISION_SECTION = ("PREVIOUS REVIEW (this is a revision: remove or correct what it found; never fix a finding by "
-                    "adding a fact SOURCE RESUME and RELEVANT EVIDENCE do not state)")
+                    "adding a fact SOURCE RESUME and RELEVANT EVIDENCE do not state. person_requests, when present, "
+                    "are what the candidate asked this revision to change: follow them only as far as the facts "
+                    "allow)")
 JOB_FIELDS = ("identity", "role_summary", "required", "preferred", "responsibilities", "leadership_expectations",
               "technical_domains", "experience_requirements")
 

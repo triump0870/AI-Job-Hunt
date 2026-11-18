@@ -26,8 +26,8 @@ NOTES = {
     "deterministic_issues": [{"code": "UNSUPPORTED_TERM", "location": "cover_letter",
                               "message": "['s3-backed'] appear nowhere in the master resume, your profile or verified "
                                          "evidence; cite them there first or leave them out"}],
-    "reject_reasons": ["UNSUPPORTED_TERM: ['s3-backed'] appear nowhere in the master resume, your profile or "
-                       "verified evidence; cite them there first or leave them out",
+    "reject_reasons": [("UNSUPPORTED_TERM: ['s3-backed'] appear nowhere in the master resume, your profile or "
+                        "verified evidence; cite them there first or leave them out"),
                        "1 unsupported claim(s) found by the reviewer", "1 overstated claim(s) found by the reviewer"],
     "improvements": ["Familiarity with OAuth."],
 }
@@ -111,8 +111,8 @@ def test_disputed_claims_are_listed_one_by_one_in_plain_words(owner):
     review = client.get(f"/api/approvals/{make_job(owner)}").json()["resume"]["review"]
     packet = [n["text"] for n in review if n["group"] == "packet"]
     assert packet == [
-        "Cover letter: “s3-backed” isn't in the master resume, your profile or verified evidence — add it there "
-        "first, or leave it out",
+        ("Cover letter: “s3-backed” isn't in the master resume, your profile or verified evidence — add it there "
+         "first, or leave it out"),
         "Unsupported: The AI Marketing Platform project is not in any verified fact.",
         "Overstated: 'Engineered a targeting system' overstates the verified project."]
     assert [n["text"] for n in review if n["group"] == "gap"] == ["Familiarity with OAuth."]
@@ -188,3 +188,94 @@ def test_a_motivation_answer_written_for_this_job_is_verified(owner):
 ])
 def test_job_specific_questions(question, specific):
     assert approval_review.job_specific(question) is specific
+
+
+def test_the_detail_states_the_roles_facts_and_what_approving_does(owner):
+    job_id = make_job(owner)
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        job.location, job.remote_type, job.seniority = "Dublin, Ireland", "hybrid", "Senior"
+        job.salary_min, job.salary_max, job.salary_currency, job.salary_interval = 110000, 135000, "eur", "year"
+        job.url = "https://boards.greenhouse.io/acme/jobs/123"
+        db.commit()
+    out = client.get(f"/api/approvals/{job_id}").json()
+    facts = out["facts"]
+    assert facts["work_mode"] == "hybrid" and facts["salary"]["text"] == "EUR 110K–135K/yr"
+    assert facts["seniority"] == "Senior" and facts["route"]["label"]
+    # Auto submit is off on this test server: approving opens the apply kit, and the label says so.
+    assert out["approve_effect"]["kind"] == "kit" and out["approve_effect"]["label"] == "Approve → apply kit"
+    row = next(r for r in rows() if r["id"] == job_id)
+    assert row["work_mode"] == "hybrid" and row["salary"] == "EUR 110K–135K/yr"
+
+
+def test_an_unstated_salary_stays_unknown(owner):
+    job_id = make_job(owner)
+    facts = client.get(f"/api/approvals/{job_id}").json()["facts"]
+    assert facts["salary"] is None and facts["work_mode"] is None
+
+
+def test_checks_say_which_must_be_fixed_and_how(owner):
+    checks = {c["label"]: c for c in client.get(f"/api/approvals/{make_job(owner)}").json()["checklist"]}
+    invented = checks["No invented experience"]
+    assert invented["level"] == "blocker" and invented["fix"] == {"label": "Fix in Tailor", "screen": "tailor"}
+    assert checks["Length"]["level"] == "nudge" and "fix" not in checks["Length"], "a passed check needs no fix"
+
+
+def test_the_pay_check_follows_this_jobs_form(owner):
+    job = make_job(owner)
+    pay = lambda: next(c for c in client.get(f"/api/approvals/{job}").json()["checklist"]
+                       if c["label"] == "Compensation answer")
+    assert pay()["detail"].startswith("No verified pay answer yet; needed only if the form asks")
+    with SessionLocal() as db:
+        db.add(JobInsight(user_id=owner, job_id=job, application_form_input=[{"id": "q1"}],
+                          application_questions=[{"id": "p1", "question": "Expected salary?", "origin": "PREDICTED",
+                                                  "status": "DRAFTED", "answer": "x"},
+                                                 {"id": "q1", "question": "Years of Python?", "origin": "FORM",
+                                                  "status": "DRAFTED", "answer": "11"}]))
+        db.commit()
+    assert pay()["state"] == "warn", "a predicted pay question counts as asked until the form says otherwise"
+    with SessionLocal() as db:
+        insight = db.scalar(select(JobInsight).where(JobInsight.job_id == job))
+        insight.application_questions = [q for q in insight.application_questions if q["origin"] == "FORM"]
+        db.commit()
+    assert pay() == {**pay(), "state": "ok", "detail": "This form doesn't ask about pay"}
+    answer(owner, "What is your expected salary?", "", verified=False, asked_by=[job], job_id=job)
+    assert pay()["state"] == "warn" and "asks “What is your expected salary?”" in pay()["detail"]
+
+
+def test_role_gaps_lead_with_required_requirements_that_are_not_met(owner):
+    job_id = make_job(owner)
+    with SessionLocal() as db:
+        db.get(Job, job_id).fit_analysis = {"requirement_assessments": [
+            {"requirement": "Kubernetes", "level": "PREFERRED", "status": "MISSING"},
+            {"requirement": "Python", "level": "REQUIRED", "status": "MATCH", "supported": "11 years"},
+            {"requirement": "OAuth", "level": "REQUIRED", "status": "PARTIAL_MATCH", "unsupported": "no OIDC"}]}
+        db.commit()
+    gaps = client.get(f"/api/approvals/{job_id}").json()["role_gaps"]
+    assert [(g["requirement"], g["status"]) for g in gaps] == [("OAuth", "partial"), ("Python", "met"),
+                                                               ("Kubernetes", "missing")]
+
+
+def test_postings_of_one_role_share_a_duplicate_key_and_other_roles_do_not(owner):
+    same = [make_job(owner, company="Affirm") for _ in range(2)]
+    with SessionLocal() as db:
+        for job_id, title in zip(same, ["Senior Staff SWE, Backend (Cards)", "senior staff swe — backend (cards)"],
+                                 strict=True):
+            db.get(Job, job_id).title = title
+        other = db.get(Job, make_job(owner, company="Affirm"))
+        other.title = "Senior Staff SWE, Fullstack (Marketplace)"
+        db.commit()
+        other_id = other.id
+    keys = {r["id"]: r["duplicate_key"] for r in rows(q="Affirm")}
+    assert keys[same[0]] == keys[same[1]] != keys[other_id]
+
+
+def test_the_queue_filters_by_work_mode(owner):
+    remote, office = make_job(owner), make_job(owner)
+    with SessionLocal() as db:
+        db.get(Job, remote).remote_type = "remote"
+        db.commit()
+    assert [r["id"] for r in rows(work_mode="remote")] == [remote]
+    assert office in [r["id"] for r in rows(work_mode="not_stated")]
+    assert rows(with_facets=True)["work_modes"]["remote"] == 1
+    assert client.get("/api/approvals", params={"work_mode": "moon"}).status_code == 422

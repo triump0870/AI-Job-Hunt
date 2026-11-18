@@ -66,7 +66,7 @@ describe('acting on several approvals at once', () => {
     ui.A['approval-check-all']();
     expect(view().textContent).toContain('3 selected');
     const [revise, approve] = button('bulk-approval');
-    expect(revise.textContent).toBe('Needs revision 2');  // job 3 is already sent back
+    expect(revise.textContent).toBe('Send back 2');  // job 3 is already sent back
     expect(approve.textContent).toBe('Approve 2');        // job 2 is below the minimum of 70
     ui.A['approval-check-all']();
     expect(ui.S.approvalPicked.size).toBe(0);
@@ -103,7 +103,7 @@ describe('acting on several approvals at once', () => {
     expect(button('bulk-open-postings')).toHaveLength(0);
     ui.A['approval-check-all']();
     const [open] = button('bulk-open-postings');
-    expect(open.textContent).toBe('Open postings 2 ↗');
+    expect(open.textContent).toBe('Open 2 postings ↗');
     const tabs = [];
     vi.stubGlobal('open', vi.fn(url => { const tab = { url, opener: window }; tabs.push(tab); return tab; }));
     ui.A['bulk-open-postings']();
@@ -149,7 +149,7 @@ describe('acting on several approvals at once', () => {
       row(4, { status: 'approved', waiting: false }), row(5)];
     ui.D.tasks = [{ id: 9, job_id: 5, mode: 'review', status: 'running' }];
     ui.A['approval-check-all']();
-    expect(button('bulk-retailor')[0].textContent).toBe('Retailor 2');   // 2 is not ranked, 4 is approved, 5 is busy
+    expect(button('bulk-retailor')[0].textContent).toBe('Re-tailor 2');   // 2 is not ranked, 4 is approved, 5 is busy
     expect(button('bulk-rereview')[0].textContent).toBe('Re-review 3');
     const rows = [...view().querySelectorAll('[data-act="select-approval"]')];
     expect(rows[4].textContent).toContain('re-reviewing');
@@ -163,7 +163,7 @@ describe('acting on several approvals at once', () => {
     const [, options] = fetchMock.mock.calls.find(([u, o]) => u.endsWith('/api/tailor-tasks') && o?.method === 'POST');
     expect(JSON.parse(options.body)).toEqual({ ids: [1, 3], mode: 'tailor', regenerate: true, revise: true });
     expect([...ui.S.approvalPicked]).toEqual([3]);
-    expect(document.getElementById('toast').textContent).toContain('Retailoring 1 job in the background · 1 skipped');
+    expect(document.getElementById('toast').textContent).toContain('Re-tailoring 1 job in the background · 1 skipped');
   });
 
   it('reviews the picked packets again without tailoring', async () => {

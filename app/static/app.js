@@ -8,7 +8,7 @@ const attr = esc;
 
 /* ───────────── state ───────────── */
 // Filters on the Tailor and Approvals screens, sent to /api/tailor/queue and /api/approvals.
-function pfDefaults(kind) { return { q: '', min_fit: 0, max_fit: 0, min_review: 0, max_review: 0, board: 'all', location: 'all', status: 'all', ...(kind === 'approvals' ? { easy_apply: 'all' } : {}), sort: kind === 'tailor' ? 'fit' : 'default' }; }
+function pfDefaults(kind) { return { q: '', min_fit: 0, max_fit: 0, min_review: 0, max_review: 0, board: 'all', location: 'all', status: 'all', ...(kind === 'approvals' ? { easy_apply: 'all', work_mode: 'all' } : {}), sort: kind === 'tailor' ? 'fit' : 'default' }; }
 // Discovery table filters, sent to /api/jobs/search. The date filter is one of: within (last N), older_than, a
 // date_from–date_to range, or posted_unknown (Posted only); date_field says which date they look at.
 const DEFAULT_FILTERS = { q: '', min_fit: 0, max_fit: 0, board: 'all', location: 'all', stage: 'all', description: 'all', domain: 'matching',
@@ -36,7 +36,7 @@ const S = {
   kitJob: null, tailorJob: null, tailorTab: 'diff', editing: null,
   tailorMode: 'single', tailorChecked: new Set(), tailorRegenerate: false, tailorPages: '',  // '' = the default length in Settings
   pf: { tailor: pfDefaults('tailor'), approvals: pfDefaults('approvals') },
-  approvalJob: null, approvalPicked: new Set(), bulkRejecting: false, rejecting: null, overriding: null, selApp: null, trackerView: 'board', trackerArchive: null, showArchived: false, addingStage: false, tf: { q: '', location: 'all', min_fit: 0 }, rf: { q: '', location: 'all' }, runSel: null, setupSel: null,
+  approvalJob: null, approvalPicked: new Set(), approvalLast: null, dupOpen: new Set(), revising: null, apprTab: 'resume', apprFull: false, apprKeys: false, roleGapsAll: false, bulkRejecting: false, rejecting: null, overriding: null, selApp: null, trackerView: 'board', trackerArchive: null, showArchived: false, addingStage: false, tf: { q: '', location: 'all', min_fit: 0 }, rf: { q: '', location: 'all' }, runSel: null, setupSel: null,
   scheduling: false, editingRecruiter: false, recruiterDraft: [], ivDraft: null, manualMissing: null,
   polling: null, busy: {}, forms: {}, apifyImport: false, importPick: new Set(), autoRefreshed: false,
 };
@@ -64,8 +64,15 @@ async function api(url, { method = 'GET', body, form } = {}) {
 }
 // Location filters group by city (the first part of "Bengaluru, Karnataka, India"), and anything remote as Remote.
 // The server does the same for Discovery, Tailor and Approvals (app.workspace.location_key); facets are [city, count].
-const locationOptions = facets => [['all', 'All locations'], ...(facets || []).map(([k, n]) => [k, `${k} (${n})`])];
-const locationKey = loc => { const l = (loc || '').trim(); return !l ? 'Not listed' : /remote/i.test(l) ? 'Remote' : l.split(',')[0].trim(); };
+// Your preferred locations lead the list (`preferred`, from Settings), then the rest by how many jobs each has.
+const locationOptions = (facets, preferred = []) => {
+  const wanted = preferred.map(p => locationKey(p).toLowerCase());
+  const rank = k => { const i = wanted.indexOf(k.toLowerCase()); return i < 0 ? wanted.length : i; };
+  const list = [...(facets || [])].map((f, i) => [f, i]).sort((a, b) => rank(a[0][0]) - rank(b[0][0]) || a[1] - b[1]).map(([f]) => f);
+  return [['all', 'All locations'], ...list.map(([k, n]) => [k, `${wanted.includes(k.toLowerCase()) ? '★ ' : ''}${k} (${n})`])];
+};
+// Mirrors app.services.locations.location_key: a work-mode prefix ("Hybrid - Bengaluru") is dropped.
+const locationKey = loc => { const l = (loc || '').trim().replace(/^(?:hybrid|on[- ]?site|in[- ]office|office)\s*[-–—:|]\s*/i, '').trim(); return !l ? 'Not listed' : /remote/i.test(l) ? 'Remote' : l.split(',')[0].trim() || 'Not listed'; };
 const qs = obj => new URLSearchParams(Object.entries(obj).filter(([, v]) => v !== '' && v !== null && v !== undefined)).toString();
 let toastTimer;
 // `opts.title` adds a bold first line; `opts.top` shows it at the top of the screen (click to dismiss); `opts.ms` how long.
@@ -423,6 +430,15 @@ function renderSideFoot() {
   return `<div class="side-card"><div class="side-card-title"><span class="dot" style="background:${on ? '#4ade80' : '#6a7388'}"></span>Auto-search ${on ? 'on' : 'off'}</div>
     <div class="side-card-body">${on ? `${a.setups} scheduled setup${a.setups === 1 ? '' : 's'} · ${a.roles} role${a.roles === 1 ? '' : 's'} × ${Math.max(1, a.locations)} location${a.locations === 1 ? '' : 's'}${a.next_run ? `, next ${fmtDay(a.next_run)}` : ''}.` : 'Searches run when you start them.'} ${esc(last)}</div></div>${account}`;
 }
+// What the queue holds, as things to do: packets to decide, revisions running, approved ones to apply to.
+function approvalsSummary() {
+  const c = D.approvalFacets?.status_counts;
+  if (!c) return 'Nothing leaves this queue without your sign-off';
+  const revising = (D.approvals || []).filter(q => activeTask(q.id)).length;
+  const decide = (c.waiting || 0) + (c.sent_back || 0);
+  return [`${decide} packet${decide === 1 ? ' needs' : 's need'} your decision`, revising && `${revising} being revised`,
+    c.approved && `${c.approved} approved, ready to apply`].filter(Boolean).join(' · ');
+}
 function screenMeta() {
   const s = D.summary, c = s?.counts || {};
   const now = new Date();
@@ -431,7 +447,7 @@ function screenMeta() {
     today: ['Today', `${now.toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long' })} · everything that needs you, in order`],
     discovery: ['Discovery', `${s?.total_jobs ?? 0} in pipeline · ${c.discovery ?? 0} waiting for triage`],
     tailor: ['Tailor & review', 'AI drafts, you approve every claim'],
-    approvals: ['Approvals', 'Nothing leaves this queue without your sign-off'],
+    approvals: ['Approvals', approvalsSummary()],
     tracker: ['Tracker', D.tracker ? `${D.tracker.stats.live} live applications · ${D.tracker.stats.due} follow-ups due` : 'Every submitted application'],
     workers: ['Running workers', 'Background work for your account: JD parsing, JD recovery, ranking and tailoring · kill a stuck task or run one now'],
     orchestration: ['AI Orchestration', 'Live system topology, models and packet execution · what is running, where each job is and which model handles it'],
@@ -1187,6 +1203,7 @@ const PF_SORT = {
   tailor: [['fit', 'Sort: best fit'], ['reviewer', 'Sort: reviewer score'], ['new', 'Sort: newest'], ['company', 'Sort: company']],
   approvals: [['default', 'Sort: waiting first'], ['reviewer', 'Sort: reviewer score'], ['fit', 'Sort: best fit'], ['new', 'Sort: newest'], ['company', 'Sort: company']],
 };
+const PF_MODES = [['all', 'Any work mode'], ['remote', 'Remote'], ['hybrid', 'Hybrid'], ['onsite', 'On-site'], ['not_stated', 'Work mode not stated']];
 const pfActive = kind => JSON.stringify(S.pf[kind]) !== JSON.stringify(pfDefaults(kind));
 // A score pill (fit or reviewer) for either bound: "min:N" is ≥ N, "max:N" is ≤ N, "custom" opens the range editor.
 // Shared by Discovery, Tailor and Approvals; a value no preset names gets its own option so the pill always shows it.
@@ -1238,6 +1255,7 @@ function pfActiveChips(kind, facets) {
   if (f.board && f.board !== 'all') add(['board'], f.board);
   if (f.location && f.location !== 'all') add(['location'], name(locationOptions(facets.locations || []), f.location));
   if (f.easy_apply === 'only') add(['easy_apply'], 'Easy Apply only');
+  if (f.work_mode && f.work_mode !== 'all') add(['work_mode'], PF_MODES.find(([k]) => k === f.work_mode)?.[1] || f.work_mode);
   return out;
 }
 function renderPacketFilters(kind, facets) {
@@ -1256,8 +1274,9 @@ function renderPacketFilters(kind, facets) {
       ${rangePill(kind, 'fit', `pf-${kind}-fit`)}
       ${rangePill(kind, 'review', `pf-${kind}-review`)}
       ${facets.boards?.length > 1 || f.board !== 'all' ? pillSel('board', [['all', 'All boards'], ...facets.boards.map(b => [b, b])], 'Board', f.board !== 'all') : ''}
-      ${pillSel('location', locationOptions(facets.locations || []), 'Location', f.location !== 'all')}
-      ${'easy_apply' in f ? `<label class="filter-toggle ${f.easy_apply === 'only' ? 'on' : ''}" title="Only jobs you can apply to with Easy Apply"><input type="checkbox" id="pf-${kind}-easy-apply" data-pf="${kind}" data-pfkey="easy_apply" ${f.easy_apply === 'only' ? 'checked' : ''}><span class="filter-toggle-mark" aria-hidden="true">✓</span>Easy Apply only <span class="pf-tab-count">${facets.easy_apply || 0}</span></label>` : ''}
+      ${pillSel('location', locationOptions(facets.locations || [], facets.preferred_locations || []), 'Location', f.location !== 'all')}
+      ${'work_mode' in f && facets.work_modes ? pillSel('work_mode', PF_MODES.map(([k, t]) => [k, k === 'all' ? t : `${t} (${facets.work_modes[k] || 0})`]), 'Work mode', f.work_mode !== 'all') : ''}
+      ${'easy_apply' in f && (facets.easy_apply || f.easy_apply === 'only') ? `<label class="filter-toggle ${f.easy_apply === 'only' ? 'on' : ''}" title="Only jobs you can apply to with Easy Apply"><input type="checkbox" id="pf-${kind}-easy-apply" data-pf="${kind}" data-pfkey="easy_apply" ${f.easy_apply === 'only' ? 'checked' : ''}><span class="filter-toggle-mark" aria-hidden="true">✓</span>Easy Apply only <span class="pf-tab-count">${facets.easy_apply || 0}</span></label>` : ''}
       <span class="grow"></span>
       <span class="xs muted">${shown}</span>
     </div>
@@ -1469,26 +1488,6 @@ function renderTailorSingle(queue) {
 
 /* ───────────── approvals ───────────── */
 const reviewNoteRow = n => `<div class="row top-align gap10"><span class="note-dot" style="background:${{ good: '#0f9c86', warn: '#e0a136', bad: '#c22f4e' }[n.tone]}"></span><div class="small ink2 pretty" style="line-height:1.55">${esc(n.text)}</div></div>`;
-// What the reviewer said about this packet, so it can be judged without going back to Tailor. Concerns come first
-// (blocking reasons ahead of gaps): they are what an approval has to weigh.
-function renderApprovalReview(job, r, minScore) {
-  const unreviewed = r.reviewer_score == null;
-  const notes = r.review || [];
-  // Each disputed claim is its own row (app.services.approval_review.review_notes): what to fix in the packet, then
-  // the job's requirements the resume doesn't show, then what holds up.
-  const packetIssues = notes.filter(n => n.tone === 'bad');
-  const gaps = notes.filter(n => n.tone === 'warn');
-  const strengths = notes.filter(n => n.tone === 'good');
-  const group = (title, items) => items.length ? `<div><div class="caps-sm mb8">${title} · ${items.length}</div><div class="col gap10">${items.map(reviewNoteRow).join('')}</div></div>` : '';
-  const body = unreviewed
-    ? `<div class="small muted">This packet has not been reviewed, so there are no notes yet. <a href="#" data-act="go" data-screen="tailor" data-job="${job.id}">Send it to review in Tailor</a>.</div>`
-    : notes.length
-      ? `<div class="col gap16">${group('FIX BEFORE SENDING', packetIssues)}${group('JOB REQUIREMENTS THE RESUME DOESN\'T SHOW', gaps)}${group('WHAT HOLDS UP', strengths)}</div>`
-      : '<div class="small muted">The reviewer left no notes.</div>';
-  return `<div id="approval-review" style="padding:18px 22px;border-bottom:1px solid var(--line2)">
-    <div class="row gap8 mb12">${pill('AI', 'brand')}<span class="base b">Reviewer notes</span>${unreviewed ? '' : `<span class="mono bb base" style="margin-left:auto;color:${r.reviewer_score >= minScore ? 'var(--good)' : 'var(--bad)'}">${fitTxt(r.reviewer_score)} / 100</span>`}</div>
-    ${body}</div>`;
-}
 // A queue row's two scores, labelled: the reviewer's score of the packet (coloured against your minimum) and the
 // job's fit. They are different numbers and read as one if either is unlabelled.
 function approvalRowScores(q, minScore) {
@@ -1509,8 +1508,161 @@ function renderJobAnswers(answers) {
 function renderApprovals() {
   const list = D.approvals; if (!list) return loading();
   if (!D.approvalFacets.total_all) return renderApprovalsBody(list);
-  return `<div class="stack">${renderPacketFilters('approvals', D.approvalFacets)}${list.length ? renderApprovalsBody(list) : pfNoMatch('approvals')}</div>`;
+  return `<div class="stack">${renderPacketFilters('approvals', D.approvalFacets)}${renderApprovalBulkBar(list)}${list.length ? renderApprovalsBody(list) : pfNoMatch('approvals')}</div>`;
 }
+// Postings of one role (same company, same title) collapse into one row; "+N" opens the rest. The first is the one
+// with the best reviewer score. Picking a collapsed row picks every posting in it, so one decision covers them all.
+function approvalGroups(list) {
+  const groups = new Map();
+  for (const q of list) {
+    const key = q.duplicate_key || `#${q.id}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(q);
+  }
+  return [...groups.values()];
+}
+const groupIds = (list, q) => list.filter(x => x.duplicate_key && x.duplicate_key === q.duplicate_key).map(x => x.id);
+// What a queue row needs for triage without opening it: where, how, pay and when the employer posted it.
+const approvalRowFacts = q => [q.location, APPR_MODE[q.work_mode] || '', q.salary || '', q.posted_ago ? `posted ${q.posted_ago}` : ''].filter(Boolean).join(' · ');
+// A sent-back packet with no revision running says so, so "sent back" is never a silent dead end.
+function approvalRevisionPill(q) {
+  if (q.status !== 'pending_approval' || activeTask(q.id)) return '';
+  const last = (D.tasks || []).filter(t => t.job_id === q.id).sort((a, b) => b.id - a.id)[0];
+  return last?.status === 'failed' ? `<span title="${attr(last.error || '')}">${pill('revision failed', 'bad')}</span>` : '';
+}
+function approvalRow(q, list, minScore, { extra = 0, child = false, open = false } = {}) {
+  const ids = extra && !open ? groupIds(list, q) : [q.id];
+  const on = ids.every(id => S.approvalPicked.has(id));
+  return `<div class="lrow click appr-row ${q.id === S.approvalJob ? 'sel' : ''} ${child ? 'appr-child' : ''}" data-act="select-approval" data-id="${q.id}">
+    <span class="appr-check" data-act="approval-check" data-id="${q.id}" data-ids="${ids.join(',')}" role="checkbox" aria-checked="${on}" tabindex="0" aria-label="Select ${attr(q.title)}${ids.length > 1 ? ` and its ${ids.length - 1} other postings` : ''}"><input type="checkbox" tabindex="-1" ${on ? 'checked' : ''} aria-hidden="true"></span>
+    ${starButton(q)}
+    <div class="grow" style="min-width:0"><div class="base b appr-title" title="${attr(q.title)}">${esc(q.title)}</div>
+      <div class="xs muted ellipsis" title="${attr(approvalRowFacts(q))}">${esc(q.company)} · ${esc(q.age)}</div>
+      ${approvalRowFacts(q) ? `<div class="xs faint ellipsis">${esc(approvalRowFacts(q))}</div>` : ''}
+      ${extra ? `<button type="button" class="linkish xs mt4" data-act="approval-dup-toggle" data-key="${attr(q.duplicate_key)}" aria-expanded="${open}">${open ? 'Hide' : `+${extra}`} other posting${extra === 1 ? '' : 's'} of this role</button>` : ''}</div>
+    <div class="col gap4" style="align-items:flex-end">${approvalRowScores(q, minScore)}<div class="row gap4 wrap end">${q.easy_apply ? pill('Easy Apply', 'brand') : ''}${q.approval_override ? pill('waived', 'warn') : ''}${approvalTaskPill(q)}${approvalRevisionPill(q)}${postingClosedPill(q)}</div></div></div>`;
+}
+const RG_TONE = { met: 'good', partial: 'warn', missing: 'bad', unknown: 'muted' };
+// The job's requirements against what the candidate's facts show (the Ranker's assessments).
+function renderRoleGaps(gaps) {
+  if (!gaps?.length) return '';
+  const shown = S.roleGapsAll ? gaps : gaps.filter(g => g.status !== 'met').slice(0, 8);
+  const met = gaps.filter(g => g.status === 'met').length;
+  return `<div class="mt16"><div class="caps-sm mb8">HOW YOU MEET THE REQUIREMENTS · ${met} of ${gaps.length} met</div>
+    <div class="col gap6">${shown.map(g => `<div class="rg-row"><div class="small"><b>${esc(g.requirement)}</b>${g.level === 'required' ? ' <span class="xs faint">required</span>' : ''}${g.fatal ? ` ${pill('hard requirement', 'bad')}` : ''}
+      ${g.supported ? `<div class="xs muted mt2">Shown: ${esc(g.supported)}</div>` : ''}${g.unsupported ? `<div class="xs mt2" style="color:var(--warn-deep)">Not shown: ${esc(g.unsupported)}</div>` : ''}</div>${pill(g.status, RG_TONE[g.status])}</div>`).join('') || '<div class="small muted">Every requirement the ranker assessed is met.</div>'}</div>
+    ${gaps.length > shown.length || S.roleGapsAll ? `<button type="button" class="linkish xs mt8" data-act="role-gaps-all">${S.roleGapsAll ? 'Show only what is not met' : `Show all ${gaps.length}, including what is met`}</button>` : ''}</div>`;
+}
+const APPR_MODE = { remote: 'Remote', hybrid: 'Hybrid', onsite: 'On-site' };
+// The role's facts the decision needs, under the title. A place outside your preferred locations is flagged amber.
+function renderApprovalFacts(f) {
+  if (!f) return '';
+  const item = (text, warn = false, title = '') => `<span class="fact ${warn ? 'warn' : ''}" ${title ? `title="${attr(title)}"` : ''}>${esc(text)}</span>`;
+  const out = [];
+  out.push(item(f.location || 'Location not listed', f.location_wanted === false, f.location_wanted === false ? 'Not one of your preferred locations (Settings)' : ''));
+  out.push(item(f.work_mode_label || 'Work mode not stated'));
+  out.push(item(f.salary ? f.salary.text : 'Salary not listed', false, f.salary ? 'As the posting states it' : 'The posting does not state a salary'));
+  if (f.seniority) out.push(item(f.seniority));
+  if (f.posted_at) out.push(item(`posted ${toDate(f.posted_at).toLocaleDateString(undefined, { day: "numeric", month: "short" })}`));
+  out.push(item(f.route?.label ? `${f.route.label}${f.route.auto_submit ? ' · can auto-apply' : ' · you apply'}` : 'No apply link', false, 'Where the application form lives'));
+  return `<div class="facts">${out.join('')}</div>`;
+}
+// Fix links on a check: the screen that fixes it, a settings page, or sending the packet back.
+function checkFix(c, job) {
+  const f = c.fix; if (!f) return '';
+  if (f.act) return `<button type="button" class="linkish xs" data-act="${attr(f.act)}" data-id="${job.id}">${esc(f.label)}</button>`;
+  if (f.href) return `<a class="xs" href="${attr(f.href)}">${esc(f.label)}</a>`;
+  return `<a class="xs" href="#" data-act="go" data-screen="${attr(f.screen)}" data-job="${job.id}">${esc(f.label)}</a>`;
+}
+// Blockers (fix before sending) are red, nudges amber, and passed checks fold into one line. Nothing here gates
+// Approve: the person may approve whatever the checks say.
+function renderApprovalChecks(list, job) {
+  const blockers = list.filter(c => c.state !== 'ok' && c.level === 'blocker');
+  const nudges = list.filter(c => c.state !== 'ok' && c.level !== 'blocker');
+  const passed = list.filter(c => c.state === 'ok');
+  const row = (c, tone) => `<div class="check-item ${tone}"><span class="mark">!</span><div class="grow"><div class="row between gap8 wrap"><span class="small b lbl">${esc(c.label)}</span>${checkFix(c, job)}</div><div class="xs muted mt4">${esc(c.detail)}</div></div></div>`;
+  return `<div class="appr-sec"><div class="row gap8 mb10"><span class="base b">Before you send it</span>${blockers.length ? pill(`${blockers.length} to fix`, 'bad') : pill('nothing to fix', 'good')}${nudges.length ? pill(`${nudges.length} to check`, 'warn') : ''}</div>
+    ${blockers.length || nudges.length ? `<div class="col gap8">${blockers.map(c => row(c, 'bad')).join('')}${nudges.map(c => row(c, 'warn')).join('')}</div>` : ''}
+    ${passed.length ? `<div class="row wrap gap6 mt10">${passed.map(c => `<span class="ok-chip" title="${attr(c.detail)}">✓ ${esc(c.label)}</span>`).join('')}</div>` : ''}</div>`;
+}
+// Sending a packet back: tick what the revision should change (the reviewer's findings) and add your own words.
+// The revision pass is queued at once unless you untick it.
+function renderRevisionPicker(job, r) {
+  const items = (r?.review || []).filter(n => n.tone !== 'good');
+  const picked = fv('revise', 'picked', null) || items.filter(n => n.tone === 'bad').map(n => n.text);
+  const retailor = fv('revise', 'retailor', true);
+  return `<div class="appr-sec" style="background:var(--brand-softer)">
+    <div class="row between wrap gap10 mb10"><div><div class="base b">Send back for revision</div>
+      <div class="xs muted mt4">Tick what the next version should fix. The Tailor still uses only your verified facts.</div></div>
+      <a href="#" class="small" data-act="revise-close">Cancel</a></div>
+    ${items.length ? `<div class="col gap6 mb10">${items.map((n, i) => `<label class="row top-align gap8 small"><input type="checkbox" data-act="revise-pick" data-i="${i}" ${picked.includes(n.text) ? 'checked' : ''}><span class="pretty">${esc(n.text)}</span></label>`).join('')}</div>` : ''}
+    ${inputF('revise', 'note', '', 'placeholder="Anything else to change (optional)" maxlength="400"')}
+    <label class="row gap8 small mt10"><input type="checkbox" data-act="revise-retailor" ${retailor ? 'checked' : ''}>Start the revision now (runs in the background)</label>
+    <div class="row gap8 wrap mt10">${btn(label('revise', 'Send back', 'Sending back…'), 'revise', { id: job.id }, 'primary', isBusy('revise'))}</div></div>`;
+}
+const APPR_TABS = [['resume', 'Resume'], ['edits', 'Edits'], ['cover', 'Cover letter']];
+// The packet as it will be sent: the full resume, the edits (accept or revert each here) and the cover letter.
+function renderApprovalPacket(job, r) {
+  const tab = S.apprTab || 'resume';
+  let body;
+  if (tab === 'edits') {
+    const edits = r.edits || [];
+    body = edits.length ? `<div class="col gap8">${edits.map(e => `<div class="diff ${e.status}"><div class="row between mb6"><span class="caps">${esc(e.section)}</span>${pill(e.status === 'review' ? 'review this' : e.status, { accepted: 'good', review: 'warn', reverted: 'muted' }[e.status])}</div>
+      <div class="diff-before pretty">${esc(e.before)}</div><div class="diff-after pretty">${esc(e.after)}</div>
+      <div class="row wrap gap8 mt8">${e.evidence ? pill('evidence · ' + e.evidence, 'good') : pill('no verified evidence matched', 'warn')}<span class="grow"></span>${e.status !== 'accepted' ? btn(e.status === 'reverted' ? 'Restore' : 'Accept', 'appr-edit', { index: e.index, resume: r.id, status: 'accepted', job: job.id }, 'sm soft') : ''}${e.status !== 'reverted' ? btn('Revert', 'appr-edit', { index: e.index, resume: r.id, status: 'reverted', job: job.id }, 'sm') : ''}</div></div>`).join('')}</div>`
+      : `<div class="small muted">${r.untailored ? 'This packet uses your master resume unchanged: there are no edits.' : 'No edits recorded for this version.'}</div>`;
+  } else if (tab === 'cover') {
+    body = r.cover_letter ? `<div class="doc pretty" style="white-space:pre-wrap">${esc(r.cover_letter)}</div><div class="xs muted mt6">${r.cover_words} words · edit it in Tailor</div>` : '<div class="small muted">This packet has no cover letter.</div>';
+  } else {
+    body = `<div class="doc ${S.apprFull ? '' : 'clip'}">${miniMarkdown(r.markdown)}</div><button type="button" class="linkish xs mt6" data-act="appr-full">${S.apprFull ? 'Collapse' : 'Show the whole resume'}</button>`;
+  }
+  return `<div class="appr-sec"><div class="row between wrap gap8 mb10"><div class="tabs under">${APPR_TABS.map(([id, t]) => `<button class="${tab === id ? 'on' : ''}" data-act="appr-tab" data-id="${id}">${t}${id === 'edits' && r.edits?.length ? ` <span class="faint">${r.edits.length}</span>` : ''}</button>`).join('')}</div>
+    <div class="row gap10"><a class="small" href="/api/jobs/${job.id}/resume.pdf" target="_blank" rel="noopener">Open PDF ↗</a><a class="small" href="#" data-act="go" data-screen="tailor" data-job="${job.id}">Edit in Tailor</a></div></div>${body}</div>`;
+}
+// The reviewer's findings: what to fix in the packet, what the reviewer suggests, then how the candidate meets the
+// job's requirements (the Ranker's assessments) and what holds up.
+function renderApprovalReview(job, r, minScore, gaps) {
+  const unreviewed = r.reviewer_score == null;
+  const notes = r.review || [];
+  const packetIssues = notes.filter(n => n.tone === 'bad');
+  const suggestions = notes.filter(n => n.tone === 'warn');
+  const strengths = notes.filter(n => n.tone === 'good');
+  const group = (title, items) => items.length ? `<div><div class="caps-sm mb8">${title} · ${items.length}</div><div class="col gap10">${items.map(reviewNoteRow).join('')}</div></div>` : '';
+  const body = unreviewed
+    ? `<div class="small muted">This packet has not been reviewed, so there are no notes yet. <a href="#" data-act="go" data-screen="tailor" data-job="${job.id}">Send it to review in Tailor</a>.</div>`
+    : notes.length
+      ? `<div class="col gap16">${group('WHAT HOLDS UP', strengths.slice(0, 3))}${group('FIX BEFORE SENDING', packetIssues)}${group('JOB REQUIREMENTS THE RESUME DOESN\'T SHOW', suggestions)}${strengths.length > 3 ? group('MORE THAT HOLDS UP', strengths.slice(3)) : ''}</div>`
+      : '<div class="small muted">The reviewer left no notes.</div>';
+  return `<div id="approval-review" class="appr-sec">
+    <div class="row gap8 mb12">${pill('AI', 'brand')}<span class="base b">Why it fits, and what to fix</span>${unreviewed ? '' : `<span class="mono bb base" style="margin-left:auto;color:${r.reviewer_score >= minScore ? 'var(--good)' : 'var(--bad)'}" title="Reviewer score · your minimum is ${minScore}">${fitTxt(r.reviewer_score)} / 100</span>`}</div>
+    ${body}${renderRoleGaps(gaps)}</div>`;
+}
+// The next job that still needs a decision after `id`, in the order the queue shows it (a collapsed group shows
+// only its first posting), wrapping round; null when none is left.
+function nextToDecide(id) {
+  const shown = [...document.querySelectorAll('.appr-row')].map(r => Number(r.dataset.id));
+  const order = shown.length ? shown : (D.approvals || []).map(q => q.id);
+  const open = new Set((D.approvals || []).filter(q => q.to_decide && q.id !== id).map(q => q.id));
+  const at = order.indexOf(id);
+  return order.slice(at + 1).find(x => open.has(x)) || order.find(x => open.has(x)) || null;
+}
+async function selectApproval(id) {
+  if (!id) return;
+  if (id !== S.approvalJob) { S.revising = null; S.rejecting = null; S.overriding = null; S.apprFull = false; S.roleGapsAll = false; }
+  S.approvalJob = id; render();
+  insEnsure(id);
+  D.approval = await api(`/api/approvals/${id}`).catch(() => null);
+  render();
+  document.querySelector(`.appr-row[data-id="${id}"]`)?.scrollIntoView?.({ block: 'nearest' });
+}
+// After a decision, move on to the next job that still needs one, so the queue is worked top to bottom.
+async function advanceApproval(id) {
+  const next = nextToDecide(id);
+  if (next) S.approvalJob = next;
+  S.revising = null; S.rejecting = null; S.apprFull = false;
+  await load();
+}
+const APPR_KEYS = [['J / K', 'Next / previous job'], ['A', 'Approve'], ['R', 'Send back for revision'], ['X', 'Reject'], ['S', 'Star'], ['Space', 'Select the job'], ['?', 'Show or hide these shortcuts']];
 function renderApprovalsBody(list) {
   if (!list.length) return `<section class="card">${empty('The queue is clear', 'Tailored packets land here for your sign-off.', btn('Go to Tailor', 'go', { screen: 'tailor' }, 'primary'))}</section>`;
   const a = D.approval;
@@ -1519,35 +1671,77 @@ function renderApprovalsBody(list) {
   const toDecide = list.filter(x => x.to_decide).length;
   const minScore = D.approvalFacets?.min_review_score ?? D.approval?.min_review_score ?? 70;
   const allOn = list.every(q => S.approvalPicked.has(q.id));
-  const queue = `<section class="card flush c-narrow"><div class="card-head row gap10"><input type="checkbox" data-act="approval-check-all" ${allOn ? 'checked' : ''} aria-label="Select every job in the queue"><span class="card-title sm grow">Queue · ${toDecide} to decide</span>${toDecide ? `<span class="xs muted none">${fresh} new · ${toDecide - fresh} sent back</span>` : ''}</div>
-    ${renderApprovalBulkBar(list)}
-    ${list.map(q => `<div class="lrow click ${q.id === S.approvalJob ? 'sel' : ''}" data-act="select-approval" data-id="${q.id}"><input type="checkbox" data-act="approval-check" data-id="${q.id}" ${S.approvalPicked.has(q.id) ? 'checked' : ''} aria-label="Select ${attr(q.title)}">${starButton(q)}<div class="grow"><div class="base b ellipsis">${esc(q.title)}</div><div class="xs muted">${esc(q.company)} · ${esc(q.age)}</div></div>${q.easy_apply ? pill('Easy Apply', 'brand') : ''}${q.approval_override ? pill('waived', 'warn') : ''}${approvalTaskPill(q)}${postingClosedPill(q)}${approvalRowScores(q, minScore)}</div>`).join('')}</section>`;
-  if (!a) return `<div class="split">${queue}<section class="card c-main">${loading()}</section></div>`;
+  const rows = approvalGroups(list).map(group => {
+    const [first, ...rest] = [...group].sort((x, y) => (y.reviewer_score ?? -1) - (x.reviewer_score ?? -1));
+    // The group holding the job on screen stays open, so the selected row is always visible.
+    const open = rest.length > 0 && (S.dupOpen.has(first.duplicate_key) || rest.some(q => q.id === S.approvalJob));
+    return approvalRow(first, list, minScore, { extra: rest.length, open }) + (open ? rest.map(q => approvalRow(q, list, minScore, { child: true })).join('') : '');
+  }).join('');
+  const queue = `<section class="card flush c-narrow appr-queue"><div class="card-head row gap10"><span class="appr-check" data-act="approval-check-all" role="checkbox" aria-checked="${allOn}" tabindex="0" aria-label="Select every job in the queue"><input type="checkbox" tabindex="-1" aria-hidden="true" ${allOn ? 'checked' : ''}></span><span class="card-title sm grow">Queue · ${toDecide} to decide</span>${toDecide ? `<span class="xs muted none">${fresh} new · ${toDecide - fresh} sent back</span>` : ''}</div>
+    <div class="appr-scroll">${rows}</div>
+    <div class="xs faint" style="padding:8px 16px;border-top:1px solid var(--line2)"><a href="#" data-act="appr-keys">Keyboard shortcuts (?)</a></div></section>`;
+  if (!a) return `<div class="split appr">${queue}<section class="card c-main">${loading()}</section></div>`;
   const r = a.resume, job = a.job;
   const approved = job.status === 'approved';
   // A packet the reviewer scored below your minimum can still be approved — deliberately, and on the record.
   const below = !!r && r.reviewer_score != null && r.reviewer_score < a.min_review_score;
   const approveAct = below ? 'approve-override-open' : 'approve';
-  return `<div class="split">${queue}
-  <section class="card flush c-main">
-    <div class="row between wrap gap12" style="padding:18px 22px;border-bottom:1px solid var(--line2)"><div><div class="row gap8" style="font-size:17px;font-weight:600">${starButton(job)}<span>${esc(job.title)} · ${esc(job.company)}</span></div><div class="small muted mt4">Fit ${fitTxt(job.fit)} · reviewer ${fitTxt(r?.reviewer_score)} · tailored ${esc(r?.generated || '')} · ${statusPill(job.status)} ${postingClosedPill(job)}${list.find(x => x.id === job.id)?.easy_apply ? ` ${pill('Easy Apply', 'brand')}` : ''}</div></div>
-      <div class="row gap8 wrap">${btn('Job details', 'open-job', { id: job.id })}${job.url ? `<a class="btn" href="${attr(job.url)}" target="_blank" rel="noopener">Open posting ↗</a>` : ''}${btn(label('reject', 'Reject', 'Rejecting…'), 'reject-open', { id: job.id }, 'ghost danger', isBusy('reject'))}${approved ? btn('Open apply kit', 'open-kit', { id: job.id }, 'good') : `${btn(label('revise', 'Needs revision', 'Sending back…'), 'revise', { id: job.id }, '', isBusy('revise'))}${btn(label('approve', below ? 'Approve anyway…' : 'Approve → apply kit', 'Approving…'), approveAct, { id: job.id }, 'good', isBusy('approve') || !r)}`}</div></div>
+  const effect = a.approve_effect || { label: 'Approve → apply kit', detail: '' };
+  const decide = approved ? btn('Open apply kit', 'open-kit', { id: job.id }, 'good')
+    : `<span title="${attr(effect.detail)}">${btn(label('approve', below ? 'Approve anyway…' : effect.label, 'Approving…'), approveAct, { id: job.id }, 'good', isBusy('approve') || !r)}</span>`;
+  const keys = S.apprKeys ? `<div class="appr-sec" style="background:var(--soft)"><div class="row between mb8"><span class="small b">Keyboard shortcuts</span><a href="#" class="small" data-act="appr-keys">Close</a></div><div class="grid-auto" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:6px">${APPR_KEYS.map(([k, t]) => `<div class="xs"><span class="kbd">${esc(k)}</span> ${esc(t)}</div>`).join('')}</div></div>` : '';
+  return `<div class="split appr">${queue}
+  <section class="card flush c-main appr-detail"><div class="appr-head">
+    <div class="row between wrap gap12"><div style="min-width:0"><div class="row gap8 wrap" style="font-size:17px;font-weight:600">${starButton(job)}<span>${esc(job.title)} · ${esc(job.company)}</span></div>
+      <div class="xs muted mt4">${statusPill(job.status)} Fit ${fitTxt(job.fit)} · reviewer ${fitTxt(r?.reviewer_score)} · tailored ${esc(r?.generated || '')} ${postingClosedPill(job)}${list.find(x => x.id === job.id)?.easy_apply ? ` ${pill('Easy Apply', 'brand')}` : ''}
+        · <a href="#" data-act="open-job" data-id="${job.id}">Job details</a>${job.url ? ` · <a href="${attr(job.url)}" target="_blank" rel="noopener">Open posting ↗</a>` : ''}</div></div>
+      <div class="row gap8 wrap">${btn(label('reject', 'Reject', 'Rejecting…'), 'reject-open', { id: job.id }, 'danger-outline', isBusy('reject'))}${approved ? '' : btn('Send back', 'revise-open', { id: job.id }, '', isBusy('revise') || !r)}${decide}</div></div>
+    ${renderApprovalFacts(a.facts)}</div>
+    <div class="appr-body">
+    ${keys}
     ${pipelineBanner({ ...job, pipeline: a.pipeline }, '12px 22px 0')}
-    ${a.approval?.override ? `<div class="banner warn" style="margin:0 22px;display:block"><b>Approved below your reviewer minimum.</b>${a.approval.note ? ` ${esc(a.approval.note)}` : ''}</div>` : ''}
+    ${a.approval?.override ? `<div class="banner warn" style="margin:12px 22px 0;display:block"><b>Approved below your reviewer minimum.</b>${a.approval.note ? ` ${esc(a.approval.note)}` : ''}</div>` : ''}
     ${S.rejecting === job.id ? renderRejectPicker(job, a) : ''}
+    ${S.revising === job.id ? renderRevisionPicker(job, r) : ''}
     ${S.overriding === job.id ? renderApprovalOverride(job, a, r) : ''}
+    ${r ? `${renderApprovalChecks(a.checklist, job)}
+    ${renderApprovalReview(job, r, a.min_review_score, a.role_gaps)}
+    ${renderApprovalPacket(job, r)}
+    <div class="appr-sec"><div class="base b mb10">This job's application questions</div>${renderJobAnswers(a.answers)}</div>
     ${renderInsightsCard(job.id)}
-    ${r ? `<div style="padding:18px 22px;border-bottom:1px solid var(--line2)"><div class="base b mb12">Pre-submit checklist</div>
-      <div class="grid-auto" style="grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px">${a.checklist.map(c => `<div class="check-item ${c.state}"><span class="mark">${c.state === 'ok' ? '✓' : '!'}</span><div><div class="small b lbl">${esc(c.label)}</div><div class="xs muted mt4">${esc(c.detail)}</div></div></div>`).join('')}</div></div>
-    ${renderApprovalReview(job, r, a.min_review_score)}
-    <div class="grid-auto" style="grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:0">
-      <div style="padding:18px 22px;border-right:1px solid var(--line2)"><div class="row between mb10"><div class="base b">Tailored resume</div><a class="small" href="#" data-act="go" data-screen="tailor" data-job="${job.id}">Edit in Tailor</a></div><div class="doc clip">${miniMarkdown(r.markdown)}</div></div>
-      <div style="padding:18px 22px"><div class="base b mb10">This job's application questions</div>
-        ${renderJobAnswers(a.answers)}
-        <textarea class="textarea mt12" id="approval-notes" data-act-blur="save-notes" data-id="${job.id}" placeholder="Notes for yourself — saved when you click away">${esc(fv('approvalNotes', job.id, a.notes))}</textarea></div></div>` : empty('No packet', 'This job has no tailored resume.')}
-  </section></div>`;
+    <div class="appr-sec"><div class="base b mb8">Notes for yourself</div><textarea class="textarea" id="approval-notes" data-act-blur="save-notes" data-id="${job.id}" placeholder="Saved when you click away. Sending back offers them to the revision.">${esc(fv('approvalNotes', job.id, a.notes))}</textarea></div>` : empty('No packet', 'This job has no tailored resume.')}
+  </div></section></div>`;
 }
-// Packets that can be made again (Retailor) or reviewed again (Re-review): not decided yet, and not already being
+// Acting on several picked jobs, across the full width above the queue. An action that applies to none of them is
+// hidden, not greyed out; each button says how many it acts on and, where some are left out, why.
+function renderApprovalBulkBar(list) {
+  const picked = list.filter(q => S.approvalPicked.has(q.id));
+  if (!picked.length) return '';
+  const n = approvalBulkCounts(picked), working = isBusy('bulkApproval');
+  const links = picked.filter(q => postingUrl(q.url)).length;
+  const left = (count, why) => count < picked.length ? ` · ${picked.length - count} ${why}` : '';
+  const approveWhy = left(n.approve, 'skipped: approved, unreviewed or below your minimum');
+  const head = `<section class="card flush appr-bulk"><div class="row wrap gap8" style="padding:10px 18px">
+    <span class="small b">${picked.length} selected</span><a href="#" class="small" data-act="approval-check-none">Clear</a><span class="grow"></span>
+    ${links ? `<span title="${attr(links < picked.length ? `${picked.length - links} selected job${picked.length - links === 1 ? ' has' : 's have'} no posting link` : 'Open each selected posting in a new tab')}">${btn(`Open ${links} posting${links === 1 ? '' : 's'} ↗`, 'bulk-open-postings', {}, 'sm ghost')}</span>` : ''}
+    ${n.review ? `<span title="Run the Reviewer again on each packet's current version. Nothing is rewritten.">${btn(label('bulkRereview', `Re-review ${n.review}`, 'Queueing…'), 'bulk-rereview', {}, 'sm', working || isBusy('bulkRereview'))}</span>` : ''}
+    ${n.retailor ? `<span title="Tailor again from each packet's last review, then review the new version. In the background: you can leave this page.">${btn(label('bulkRetailor', `Re-tailor ${n.retailor}`, 'Queueing…'), 'bulk-retailor', {}, 'sm', working || isBusy('bulkRetailor'))}</span>` : ''}
+    ${n.revise ? `<span title="Sends them back and starts a revision for each${attr(left(n.revise, 'already sent back'))}">${btn(label('bulkApproval', `Send back ${n.revise}`, 'Working…'), 'bulk-approval', { action: 'revise' }, 'sm', working)}</span>` : ''}
+    ${btn(`Reject ${picked.length}…`, 'bulk-reject-open', {}, 'sm danger-outline', working || S.bulkRejecting)}
+    ${n.approve ? `<span title="${attr(`Approves packets that cleared your reviewer minimum${approveWhy}. To waive the minimum, approve that packet on its own.`)}">${btn(label('bulkApproval', `Approve ${n.approve}`, 'Working…'), 'bulk-approval', { action: 'approve' }, 'sm good', working)}</span>` : ''}
+    </div>${n.approve < picked.length ? `<div class="xs muted" style="padding:0 18px 10px">${n.approve ? `Approve acts on ${n.approve} of ${picked.length}${approveWhy}.` : 'None of these can be approved in bulk: they are approved, unreviewed or below your minimum.'}</div>` : ''}`;
+  if (!S.bulkRejecting) return head + '</section>';
+  const reasons = D.approval?.rejection_reasons || [];
+  const chosen = fv('bulkReject', 'reason', '');
+  return head + `<div style="padding:12px 18px;border-top:1px solid var(--line2);background:var(--warn-soft)">
+    <div class="row between gap10 mb8"><div class="small b">Reject ${picked.length} job${picked.length === 1 ? '' : 's'}?</div><a href="#" class="small" data-act="bulk-reject-close">Cancel</a></div>
+    <div class="xs muted mb8">They leave the approval queue and your pipeline. Tailored resumes are kept, and nothing is sent to anyone.</div>
+    <div class="row gap6 wrap mb8">${reasons.map(x => `<button type="button" class="btn sm ${chosen === x.id ? 'soft' : ''}" data-act="bulk-reject-reason" data-id="${attr(x.id)}">${chosen === x.id ? '✓ ' : ''}${esc(x.label)}</button>`).join('')}</div>
+    ${inputF('bulkReject', 'notes', '', 'placeholder="Anything worth remembering (optional)" maxlength="2000"')}
+    <div class="row gap8 wrap mt10">${btn(label('bulkApproval', `Reject ${picked.length}${chosen ? ' with this reason' : ''}`, 'Rejecting…'), 'bulk-approval', { action: 'reject' }, 'danger-solid sm', working)}</div></div></section>`;
+}
+
+// Packets that can be made again (Re-tailor) or reviewed again (Re-review): not decided yet, and not already being
 // worked on. The server checks the same and skips the rest with a reason (app.services.tailor_tasks.enqueue).
 const approvalRedoable = picked => picked.filter(q => ['tailored', 'pending_approval'].includes(q.status) && !activeTask(q.id));
 // Acting on several queued jobs at once. Each button counts only the picked jobs it applies to; the server
@@ -1565,7 +1759,7 @@ function approvalBulkCounts(picked) {
 // A retailoring or re-review running in the background for this packet.
 function approvalTaskPill(q) {
   const task = activeTask(q.id);
-  return task ? pill(task.mode === 'review' ? 're-reviewing' : 'retailoring', 'brand') : '';
+  return task ? pill(task.mode === 'review' ? 're-reviewing' : 're-tailoring', 'brand') : '';
 }
 // The daily posting check found this posting closed; the job stays because you approved it.
 const postingClosedPill = job => job.posting_closed ? `<span title="${attr(`The posting was found closed ${job.posting_closed.ago || ''}. Kept because you approved it.`)}">${pill('posting closed', 'bad')}</span>` : '';
@@ -1597,30 +1791,6 @@ function bulkApprovalMsg(out) {
   const n = out.done.length, skipped = out.skipped.length;
   const first = skipped ? ` · ${skipped} skipped (${out.skipped[0].title ? `${out.skipped[0].title}: ` : ''}${out.skipped[0].reason}${skipped > 1 ? ', …' : ''})` : '';
   return `${BULK_APPROVAL_DONE[out.action]} ${n} job${n === 1 ? '' : 's'}${first}`;
-}
-function renderApprovalBulkBar(list) {
-  const picked = list.filter(q => S.approvalPicked.has(q.id));
-  if (!picked.length) return '';
-  const n = approvalBulkCounts(picked), working = isBusy('bulkApproval');
-  const links = picked.filter(q => postingUrl(q.url)).length;
-  const head = `<div class="row wrap gap8" style="padding:10px 18px;border-bottom:1px solid var(--line2);background:var(--brand-softer)">
-    <span class="small b grow">${picked.length} selected</span>
-    <span title="${attr(links < picked.length ? `${picked.length - links} selected job${picked.length - links === 1 ? ' has' : 's have'} no posting link` : 'Open each selected posting in a new tab')}">${btn(`Open postings${links ? ` ${links}` : ''} ↗`, 'bulk-open-postings', {}, 'sm', !links)}</span>
-    ${btn('Reject…', 'bulk-reject-open', {}, 'sm ghost danger', working || S.bulkRejecting)}
-    ${btn(label('bulkApproval', `Needs revision${n.revise ? ` ${n.revise}` : ''}`, 'Working…'), 'bulk-approval', { action: 'revise' }, 'sm', working || !n.revise)}
-    <span title="Tailor again from each packet's last review, then review the new version. In the background: you can leave this page.">${btn(label('bulkRetailor', `Retailor${n.retailor ? ` ${n.retailor}` : ''}`, 'Queueing…'), 'bulk-retailor', {}, 'sm', working || isBusy('bulkRetailor') || !n.retailor)}</span>
-    <span title="Run the Reviewer again on each packet's current version. Nothing is rewritten.">${btn(label('bulkRereview', `Re-review${n.review ? ` ${n.review}` : ''}`, 'Queueing…'), 'bulk-rereview', {}, 'sm', working || isBusy('bulkRereview') || !n.review)}</span>
-    <span title="Approves packets that cleared your reviewer minimum. To waive the minimum, approve that packet on its own.">${btn(label('bulkApproval', `Approve${n.approve ? ` ${n.approve}` : ''}`, 'Working…'), 'bulk-approval', { action: 'approve' }, 'sm good', working || !n.approve)}</span>
-    <a href="#" class="small" data-act="approval-check-none">Clear</a></div>`;
-  if (!S.bulkRejecting) return head;
-  const reasons = D.approval?.rejection_reasons || [];
-  const chosen = fv('bulkReject', 'reason', '');
-  return head + `<div style="padding:12px 18px;border-bottom:1px solid var(--line2);background:var(--warn-soft)">
-    <div class="row between gap10 mb8"><div class="small b">Reject ${picked.length} job${picked.length === 1 ? '' : 's'}?</div><a href="#" class="small" data-act="bulk-reject-close">Cancel</a></div>
-    <div class="xs muted mb8">They leave the approval queue and your pipeline. Tailored resumes are kept, and nothing is sent to anyone.</div>
-    <div class="row gap6 wrap mb8">${reasons.map(x => `<button type="button" class="btn sm ${chosen === x.id ? 'soft' : ''}" data-act="bulk-reject-reason" data-id="${attr(x.id)}">${chosen === x.id ? '✓ ' : ''}${esc(x.label)}</button>`).join('')}</div>
-    ${inputF('bulkReject', 'notes', '', 'placeholder="Anything worth remembering (optional)" maxlength="2000"')}
-    <div class="row gap8 wrap mt10">${btn(label('bulkApproval', `Reject ${picked.length}${chosen ? ' with this reason' : ''}`, 'Rejecting…'), 'bulk-approval', { action: 'reject' }, 'danger-solid sm', working)}</div></div>`;
 }
 // Approving a packet the reviewer scored below your minimum. The minimum can be waived for one packet; the
 // review itself cannot be skipped, so a packet nobody scored is not offered this.
@@ -2390,7 +2560,7 @@ function queueTailoring(ids, mode, regenerate, busyKey, onQueued, extra = {}) {
     return out;
   }, out => {
     const n = out.queued.length;
-    const verb = mode === 'skip' ? 'Skipping tailoring for' : mode === 'review' ? 'Reviewing' : extra.revise ? 'Retailoring' : 'Tailoring';
+    const verb = mode === 'skip' ? 'Skipping tailoring for' : mode === 'review' ? 'Reviewing' : extra.revise ? 'Re-tailoring' : 'Tailoring';
     if (!n) return `Nothing queued: ${out.skipped[0]?.reason || 'no eligible jobs'}`;
     return `${verb} ${n} job${n === 1 ? '' : 's'} in the background${out.skipped.length ? ` · ${out.skipped.length} skipped` : ''}`;
   });
@@ -3241,7 +3411,7 @@ const A = {
     delete S.forms['cover' + el.dataset.resume]; await load();
   }, 'Cover letter saved'),
   // approvals
-  'select-approval': async el => { S.approvalJob = Number(el.dataset.id); render(); insEnsure(S.approvalJob); D.approval = await api(`/api/approvals/${S.approvalJob}`).catch(() => null); render(); },
+  'select-approval': el => selectApproval(Number(el.dataset.id)),
   'approve-override-open': el => { S.overriding = Number(el.dataset.id); S.rejecting = null; delete S.forms.override; render(); },
   'approve-override-close': (el, e) => { e?.preventDefault?.(); S.overriding = null; delete S.forms.override; render(); },
   approve: el => busy('approve', async () => {
@@ -3249,15 +3419,56 @@ const A = {
     const out = await api(`/api/jobs/${el.dataset.id}/approve`, { method: 'POST',
       body: { override, note: override ? fv('override', 'note', '') : '' } });
     S.overriding = null; delete S.forms.override;
-    await load(); openKit(el.dataset.id); return out;
-  }, out => out.approval_override ? 'Approved below your minimum — here is your apply kit' : 'Approved — here is your apply kit'),
+    const id = Number(el.dataset.id), effect = D.approval?.approve_effect?.kind;
+    await advanceApproval(id);
+    if (effect !== 'auto') openKit(id);
+    return out;
+  }, out => `${out.approval_override ? 'Approved below your minimum' : 'Approved'}${S.kitJob ? ' — here is your apply kit' : ' — queued for the guarded submission'}`),
+  // The whole gutter toggles the row (a collapsed row of duplicate postings toggles them all); shift-click picks
+  // every row between this one and the last one picked.
   'approval-check': (el, e) => {
-    e.stopPropagation();
-    const id = Number(el.dataset.id);
-    S.approvalPicked.has(id) ? S.approvalPicked.delete(id) : S.approvalPicked.add(id);
+    e?.stopPropagation?.();
+    const id = Number(el.dataset.id), ids = (el.dataset.ids || String(id)).split(',').map(Number);
+    const turnOn = !ids.every(x => S.approvalPicked.has(x));
+    const shown = [...document.querySelectorAll('.appr-row .appr-check')].map(x => Number(x.dataset.id));
+    const from = shown.indexOf(S.approvalLast), to = shown.indexOf(id);
+    const range = e?.shiftKey && from >= 0 && to >= 0
+      ? [...document.querySelectorAll('.appr-row .appr-check')].slice(Math.min(from, to), Math.max(from, to) + 1).flatMap(x => x.dataset.ids.split(',').map(Number))
+      : ids;
+    range.forEach(x => turnOn ? S.approvalPicked.add(x) : S.approvalPicked.delete(x));
+    S.approvalLast = id;
     if (!S.approvalPicked.size) S.bulkRejecting = false;
     render();
   },
+  'approval-dup-toggle': (el, e) => {
+    e?.stopPropagation?.();
+    const k = el.dataset.key, open = el.getAttribute('aria-expanded') === 'true';
+    if (open) {
+      S.dupOpen.delete(k);
+      // Folding the group away from the job on screen shows the group's first posting instead.
+      const group = (D.approvals || []).filter(q => q.duplicate_key === k);
+      if (group.some(q => q.id === S.approvalJob)) { selectApproval(group.sort((x, y) => (y.reviewer_score ?? -1) - (x.reviewer_score ?? -1))[0].id); return; }
+    } else S.dupOpen.add(k);
+    render();
+  },
+  'role-gaps-all': () => { S.roleGapsAll = !S.roleGapsAll; render(); },
+  'appr-tab': el => { S.apprTab = el.dataset.id; render(); },
+  'appr-full': () => { S.apprFull = !S.apprFull; render(); },
+  'appr-keys': (el, e) => { e?.preventDefault?.(); S.apprKeys = !S.apprKeys; render(); },
+  'appr-edit': el => busy('appr-edit', async () => {
+    await api(`/api/resumes/${el.dataset.resume}/edits/${el.dataset.index}`, { method: 'PATCH', body: { status: el.dataset.status } });
+    D.approval = await api(`/api/approvals/${el.dataset.job}`);
+  }, el.dataset.status === 'reverted' ? 'Edit reverted' : 'Edit accepted'),
+  'revise-open': el => { S.revising = Number(el.dataset.id); S.rejecting = null; S.overriding = null; delete S.forms.revise; render(); document.querySelector('[data-act="revise-close"]')?.closest('.appr-sec')?.scrollIntoView?.({ block: 'nearest' }); },
+  'revise-close': (el, e) => { e?.preventDefault?.(); S.revising = null; delete S.forms.revise; render(); },
+  'revise-pick': el => {
+    const items = (D.approval?.resume?.review || []).filter(n => n.tone !== 'good');
+    const picked = new Set(fv('revise', 'picked', null) || items.filter(n => n.tone === 'bad').map(n => n.text));
+    const text = items[Number(el.dataset.i)]?.text;
+    if (text) picked.has(text) ? picked.delete(text) : picked.add(text);
+    setF('revise', 'picked', [...picked]);
+  },
+  'revise-retailor': el => setF('revise', 'retailor', el.checked),
   'approval-check-all': () => {
     const list = D.approvals || [];
     S.approvalPicked = list.every(q => S.approvalPicked.has(q.id)) ? new Set() : new Set(list.map(q => q.id));
@@ -3311,14 +3522,22 @@ const A = {
     const out = await api(`/api/jobs/${el.dataset.id}/reject`, { method: 'POST', body: {
       reason: fv('reject', 'reason', ''), notes: fv('reject', 'notes', '') } });
     S.rejecting = null; delete S.forms.reject;
-    S.approvalJob = null; D.approval = null;
-    await load();
+    await advanceApproval(Number(el.dataset.id));
     return out;
   }, out => `Rejected${out.rejection?.reason ? ` · ${out.rejection.label.toLowerCase()}` : ''}`),
   revise: el => busy('revise', async () => {
-    await api(`/api/jobs/${el.dataset.id}/revision`, { method: 'POST', body: { notes: fv('approvalNotes', el.dataset.id, D.approval?.job?.id === Number(el.dataset.id) ? D.approval.notes || '' : '') } });
-    await load();
-  }, 'Sent back for revision'),
+    const id = Number(el.dataset.id);
+    const items = (D.approval?.resume?.review || []).filter(n => n.tone !== 'good');
+    const picked = fv('revise', 'picked', null) || items.filter(n => n.tone === 'bad').map(n => n.text);
+    const note = String(fv('revise', 'note', '')).trim();
+    const out = await api(`/api/jobs/${id}/revision`, { method: 'POST', body: {
+      notes: fv('approvalNotes', id, D.approval?.job?.id === id ? D.approval.notes || '' : ''),
+      requests: [...picked, ...(note ? [note] : [])], retailor: fv('revise', 'retailor', true) } });
+    S.revising = null; delete S.forms.revise;
+    await advanceApproval(id);
+    refreshTasks();
+    return out;
+  }, out => out.retailor?.queued?.length ? 'Sent back · the revision is running' : out.retailor?.skipped?.length ? `Sent back · revision not started: ${out.retailor.skipped[0].reason}` : 'Sent back for revision'),
   'open-kit': el => openKit(el.dataset.id),
   'close-kit': () => { S.kitJob = null; S.kitEmailCode = null; render(); },
   'copy-answer': el => { copyText(el.dataset.text); api(`/api/knowledge/${el.dataset.id}/used`, { method: 'POST' }).catch(() => {}); },
@@ -3605,6 +3824,23 @@ function commitTag(el, redraw = true) {
   if (redraw) render();
   else { const box = el.closest('.tagbox'); if (box) { box.querySelectorAll('.chip').forEach(c => c.remove()); el.insertAdjacentHTML('beforebegin', chips(form, tag, tagFallback(form, tag))); } }
 }
+// Approvals shortcuts (APPR_KEYS). Each one clicks the same control the screen shows, so it does exactly what the
+// button does and nothing a button would not. True when the key was handled.
+function approvalKey(e) {
+  const key = e.key.toLowerCase(), rows = [...document.querySelectorAll('.appr-row')].map(x => Number(x.dataset.id));
+  const at = rows.indexOf(S.approvalJob);
+  const click = act => { const b = document.querySelector(`.appr-head [data-act="${act}"]:not([disabled])`); if (b) b.click(); return !!b; };
+  if (key === 'j' || key === 'k') { const next = rows[Math.min(rows.length - 1, Math.max(0, at + (key === 'j' ? 1 : -1)))]; if (next) selectApproval(next); }
+  else if (key === 'a') { if (!click('approve') && !click('approve-override-open')) return false; }
+  else if (key === 'r') { if (!click('revise-open')) return false; }
+  else if (key === 'x') { if (!click('reject-open')) return false; }
+  else if (key === 's') { if (!click('approval-star')) return false; }
+  else if (key === ' ' || key === 'spacebar') { const g = document.activeElement?.classList?.contains('appr-check') ? document.activeElement : document.querySelector(`.appr-row[data-id="${S.approvalJob}"] .appr-check`); if (!g) return false; A[g.dataset.act](g, e); }
+  else if (e.key === '?') { S.apprKeys = !S.apprKeys; render(); }
+  else return false;
+  e.preventDefault();
+  return true;
+}
 document.addEventListener('keydown', e => {
   const el = e.target;
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); A.palette(); return; }
@@ -3628,6 +3864,7 @@ document.addEventListener('keydown', e => {
   if (el.dataset && el.dataset.palette && e.key === 'Enter') { const first = S.paletteJobs[0]; if (first) { S.paletteOpen = false; openJob(first.id); } return; }
   const typing = ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName);
   if (typing || e.metaKey || e.ctrlKey || e.altKey || S.jobOpen || S.kitJob || S.paletteOpen) return;
+  if (S.screen === 'approvals' && D.approvals?.length && approvalKey(e)) return;
   if (S.screen === 'discovery' && S.discMode === 'triage' && D.queue?.items[0]) {
     const id = D.queue.items[0].id;
     const map = { x: 'skip', m: 'maybe', s: 'shortlist' };

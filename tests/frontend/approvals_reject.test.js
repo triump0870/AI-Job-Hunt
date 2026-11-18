@@ -66,7 +66,7 @@ describe('reviewer notes on Approvals', () => {
     return view().querySelector('#approval-review');
   };
 
-  it('shows the score and separates packet issues, job gaps and strengths, issues first', () => {
+  it('shows the score, leads with what holds up, then packet issues and job gaps', () => {
     const section = show({ reviewer_score: 45, review: [
       { tone: 'good', text: 'Strong Python backend' },
       { tone: 'warn', text: 'No Salesforce experience' },
@@ -76,7 +76,7 @@ describe('reviewer notes on Approvals', () => {
     expect(section.textContent).toContain("JOB REQUIREMENTS THE RESUME DOESN'T SHOW · 1");
     expect(section.textContent).toContain('WHAT HOLDS UP · 1');
     expect([...section.querySelectorAll('.pretty')].map(n => n.textContent)).toEqual(
-      ['Cites evidence that does not exist', 'No Salesforce experience', 'Strong Python backend']);
+      ['Strong Python backend', 'Cites evidence that does not exist', 'No Salesforce experience']);
   });
 
   it('treats a note as text, not markup', () => {
@@ -134,7 +134,7 @@ describe('rejecting a job from Approvals', () => {
   it('offers Reject beside the other decisions', () => {
     const actions = [...view().querySelectorAll('[data-act]')].map(b => b.dataset.act);
     // This packet scored below the minimum, so the approve button routes through the override panel.
-    expect(actions).toEqual(expect.arrayContaining(['reject-open', 'revise', 'approve-override-open']));
+    expect(actions).toEqual(expect.arrayContaining(['reject-open', 'revise-open', 'approve-override-open']));
     expect(view().querySelector('[data-act="reject-open"]').textContent).toBe('Reject');
     expect(view().textContent).not.toContain('Reject this job?');
   });
