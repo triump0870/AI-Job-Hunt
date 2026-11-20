@@ -636,6 +636,15 @@ def _flat(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {"value": value}
 
 
+def _changed(old: dict[str, Any], new: dict[str, Any]) -> list[str]:
+    """The keys whose value differs. A key one side lacks equals an empty value, so a field added to the schema later
+    (a project's result, say) never reads as an edit of data saved before it existed."""
+    def value(content: dict[str, Any], key: str) -> Any:
+        v = content.get(key)
+        return None if v in ("", [], {}) else v
+    return [key for key in sorted(set(old) | set(new)) if value(old, key) != value(new, key)]
+
+
 def apply_edit(db: Session, resume: Resume, payload: StructuredResumeIn, expected_revision: int,
                source: str = "USER") -> dict[str, Any]:
     """Save edited structured data. Changed VERIFIED/REJECTED units become EDITED; new units start UNVERIFIED."""
@@ -652,7 +661,7 @@ def apply_edit(db: Session, resume: Resume, payload: StructuredResumeIn, expecte
             record(db, resume, unit.path, "ADD", source, item_id=item_id, new=unit.content())
             continue
         old_content, new_content = _flat(previous.content()), _flat(unit.content())
-        diff = [key for key in sorted(set(old_content) | set(new_content)) if old_content.get(key) != new_content.get(key)]
+        diff = _changed(old_content, new_content)
         for key in diff:
             record(db, resume, f"{unit.path}.{key}", "UPDATE", source, item_id=item_id, old=old_content.get(key),
                    new=new_content.get(key))
@@ -802,12 +811,11 @@ def compare(db: Session, resume: Resume, source: dict[str, Any], *, parser: str,
                             "proposed": copy.deepcopy(unit.node), "current_status": None})
             continue
         old_content, new_content = _flat(previous.content()), _flat(unit.content())
-        for key in sorted(set(old_content) | set(new_content)):
-            if old_content.get(key) != new_content.get(key):
-                changes.append({"type": "update", "path": f"{previous.path}.{key}", "item_id": item_id, "field": key,
-                                "section": unit.section, "label": f"{label} · {key.replace('_', ' ')}",
-                                "current": old_content.get(key), "proposed": new_content.get(key),
-                                "current_status": previous.status})
+        for key in _changed(old_content, new_content):
+            changes.append({"type": "update", "path": f"{previous.path}.{key}", "item_id": item_id, "field": key,
+                            "section": unit.section, "label": f"{label} · {key.replace('_', ' ')}",
+                            "current": old_content.get(key), "proposed": new_content.get(key),
+                            "current_status": previous.status})
     for item_id, unit in old_units.items():
         if item_id not in new_units and (unit.parent is None or unit.parent["id"] in new_units):
             changes.append({"type": "remove", "path": unit.path, "item_id": item_id, "section": unit.section,

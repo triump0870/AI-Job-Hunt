@@ -253,10 +253,14 @@ class Settings(BaseSettings):
     resume_parse_graph_mode: str = "on"
     # RESUME_EXTRACTION_V2: read uploaded PDFs and Word documents with app.services.resume_extraction (PDFium, which
     # honours the /ActualText some producers write for ligature glyphs; Word tables and list bullets; section headings
-    # and a structure-marked parse view; a quality report) instead of pypdf / paragraphs only. Off by default; off, extraction is exactly as before. The server's default: an account can choose for its
-    # own resume uploads (worker setting resume_parsing.extraction_v2, Settings → Resumes). Job description files
-    # follow this value.
+    # and a structure-marked parse view; a quality report) instead of pypdf / paragraphs only. Off by default; off, extraction is exactly as before. Job description files follow this
+    # value. An account's own resume uploads follow resume_upload_reader_v2 below.
     resume_extraction_v2: bool = False
+    # The account defaults for resume uploads (worker settings resume_parsing.ai_only / extraction_v2, no longer on the
+    # Resumes screen): on, a new upload is structured by the Resume Parser model straight away (the quick parse only a
+    # fallback) and its PDF/DOCX is read with resume extraction V2. An account that saved its own choice keeps it.
+    resume_upload_ai_only: bool = True
+    resume_upload_reader_v2: bool = True
     # OCR for resume extraction V2 (app.services.resume_extraction.ocr): only for a PDF the quality report flags, on
     # this machine (Tesseract's own binary; nothing leaves the server), bounded so an upload never waits long. Without
     # the engine installed, corrections fall back to consistent substitution rules alone.

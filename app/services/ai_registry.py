@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 from app.models import AIModel
 from app.prompts import build_model_health_prompt, build_worker_test_prompt
 from app.services import ai_model_config as config
-from app.services import model_resolution
+from app.services import model_market, model_resolution
 from app.services.ai_workers import WORKERS
 from app.services.litellm_client import LiteLLMError, ollama_tags
 from app.services.litellm_config_manager import classify_live, owner_tag
@@ -201,6 +201,107 @@ def discover(db: Session, user_id: int) -> dict[str, Any]:
             "ollama_enriched": sorted(base for base, tags in ollama.items() if tags)}
 
 
+# ───────────── OpenRouter: choose the top models, then add them to the catalog ─────────────
+
+OPENROUTER_PREFIX = model_resolution.OPENROUTER_PREFIX
+OPENROUTER_SOURCE = "OPENROUTER"
+OPENROUTER_RANKS = ("cheapest", "context", "newest", "quality")
+OPENROUTER_MAX_PICK = 50
+
+
+def _openrouter_rows(user_id: int, *, refresh: bool = False) -> list[model_market.MarketModel]:
+    """OpenRouter's public model list (cached for MODEL_MARKET_CACHE_HOURS); raises when there is none to offer."""
+    if not get_settings().model_market_enabled:
+        raise config.AIConfigError("Reading public model catalogs is switched off on this server (MODEL_MARKET_ENABLED)")
+    state = model_market.load(user_id, ["openrouter"], refresh=refresh)["openrouter"]
+    rows = model_market.parse_openrouter(state.data) if state.data is not None else []
+    if not rows:
+        raise config.AIConfigError(f"Could not read OpenRouter's model list: {state.error or 'it listed no models'}",
+                                   status="UNAVAILABLE")
+    return rows
+
+
+def _quality_available() -> bool:
+    return bool(get_settings().artificial_analysis_api_key)
+
+
+def openrouter_candidates(db: Session, user_id: int, criteria: model_market.PickCriteria, *,
+                          refresh: bool = False) -> dict[str, Any]:
+    """The top `limit` OpenRouter models for the criteria, for the person to choose from. Adds nothing."""
+    if criteria.rank not in OPENROUTER_RANKS:
+        raise config.AIConfigError(f"Rank by one of: {', '.join(OPENROUTER_RANKS)}")
+    if criteria.rank == "quality" and not _quality_available():
+        raise config.AIConfigError("Ranking by quality needs ARTIFICIAL_ANALYSIS_API_KEY on the server")
+    rows = _openrouter_rows(user_id, refresh=refresh)
+    if criteria.rank == "quality":
+        state = model_market.load(user_id, ["artificial_analysis"])["artificial_analysis"]
+        model_market.attach_benchmarks(rows, model_market.parse_artificial_analysis(state.data)
+                                       if state.data is not None else {})
+    in_catalog = set(db.scalars(select(AIModel.litellm_model_name).where(
+        AIModel.user_id == user_id, AIModel.removed_at.is_(None),
+        AIModel.litellm_model_name.startswith(OPENROUTER_PREFIX))).all())
+    have = {name[len(OPENROUTER_PREFIX):] for name in in_catalog}
+    picked, matching = model_market.pick_top(rows, criteria, have, max_pick=OPENROUTER_MAX_PICK)
+    return {"models": picked, "matching": matching, "listed": len(rows),
+            "ranks": [r for r in OPENROUTER_RANKS if r != "quality" or _quality_available()]}
+
+
+def _openrouter_facts(row: model_market.MarketModel) -> dict[str, Any]:
+    return {"provider": "openrouter", "underlying_model": row.model_id, "context_window": row.context_window,
+            "max_output_tokens": row.max_output_tokens, "supports_structured_output": row.structured_output,
+            "supports_tools": row.tools, "supports_reasoning": row.reasoning, "supports_vision": row.vision}
+
+
+def discover_openrouter(db: Session, user_id: int, ids: list[str]) -> dict[str, Any]:
+    """Add the chosen OpenRouter models to the catalog, and refresh what OpenRouter states about the ones already in
+    it. Never adds a model nobody chose, and never deletes one OpenRouter stopped listing (an assignment may use it)."""
+    config.ensure_seeded(db, user_id)
+    chosen = list(dict.fromkeys(str(i).strip() for i in ids or [] if str(i).strip()))
+    if len(chosen) > OPENROUTER_MAX_PICK:
+        raise config.AIConfigError(f"Add at most {OPENROUTER_MAX_PICK} OpenRouter models at a time")
+    started = config.utcnow()
+    listed = {row.model_id: row for row in _openrouter_rows(user_id, refresh=True)}
+    unknown = [i for i in chosen if i not in listed]
+    if unknown:
+        raise config.AIConfigError(f"OpenRouter does not list {', '.join(unknown[:5])}", unknown=unknown)
+    rows = {m.litellm_model_name: m for m in db.scalars(select(AIModel).where(AIModel.user_id == user_id)).all()}
+    before = {name: config.model_snapshot(row) for name, row in rows.items()}
+    known = [row.underlying_model for name, row in rows.items()
+             if row.source == OPENROUTER_SOURCE and row.removed_at is None and row.underlying_model]
+    added, missing = [], []
+    for model_id in dict.fromkeys([*chosen, *known]):
+        name = OPENROUTER_PREFIX + model_id
+        row = rows.get(name)
+        if model_id not in listed:
+            if row is not None:
+                missing.append(name)
+            continue
+        if row is not None and row.removed_at is not None:
+            if model_id not in chosen:
+                continue  # a person removed it: a refresh leaves it removed
+            row.removed_at, row.enabled = None, True  # choosing it again brings it back usable, as Restore does
+        market = listed[model_id]
+        if row is None:
+            row = AIModel(user_id=user_id, litellm_model_name=name, display_name=market.name or model_id,
+                          source=OPENROUTER_SOURCE, model_type="CUSTOM", created_at=started)
+            db.add(row)
+            rows[name] = row
+            added.append(name)
+        for key, value in _openrouter_facts(market).items():
+            setattr(row, key, value)
+        row.last_synced_at = row.updated_at = started
+    db.flush()
+    changed = any(config.model_snapshot(row) != before.get(name) for name, row in rows.items() if name in before)
+    conn = config._locked_connection(db, user_id)
+    if changed or added:
+        conn.draft_revision += 1
+    config.audit(db, user_id, "DISCOVER", actor=config._actor(db, user_id),
+                 changes=[{"source": "openrouter", "added": added, "missing": missing, "models": len(chosen)}])
+    db.commit()
+    return {"models": len(chosen), "added": added, "missing": missing, "facts_changed": changed,
+            "draft_revision": conn.draft_revision}
+
+
 TEST_MAX_TOKENS = 512
 
 
@@ -243,6 +344,9 @@ def test_model(db: Session, user_id: int, name: str) -> dict[str, Any]:
     row = db.scalar(select(AIModel).where(AIModel.user_id == user_id, AIModel.litellm_model_name == name))
     if row is not None and row.model_type == "EMBEDDING":
         return test_embedding_model(db, user_id, name, row)
+    if row is not None and _direct_openrouter(db, user_id) and model_resolution.is_openrouter_model(
+            name, {"provider": row.provider, "underlying_model": row.underlying_model}):
+        return _test_model_direct(db, user_id, row)
     prompt = build_model_health_prompt()
     structured = row is None or row.supports_structured_output is not False
     # The same model timeout as real requests (LLM_REQUEST_TIMEOUT_SECONDS): a slow or cold-loading local model
@@ -288,6 +392,51 @@ def test_model(db: Session, user_id: int, name: str) -> dict[str, Any]:
     return result
 
 
+def _direct_openrouter(db: Session, user_id: int) -> bool:
+    """Workers call OpenRouter directly (the LiteLLM route is off and the direct provider is OpenRouter)."""
+    status = config.gateway_status(db, user_id)
+    return not status["gateway_enabled"] and status["direct_provider"] == "openrouter"
+
+
+def _test_model_direct(db: Session, user_id: int, row: AIModel) -> dict[str, Any]:
+    """The health test of a model synced from OpenRouter, sent the way a worker would send it on the direct route
+    (the LLM layer, with the account's own OpenRouter key and free-only guard). A configuration problem (no key, the
+    free-only guard) is reported without calling the model unhealthy."""
+    from app.services.llm import LLMCall, LLMClient, LLMConfigError, LLMError
+
+    name = row.litellm_model_name
+    worker = model_resolution.ResolvedWorker(worker_type="MODEL_TEST", mode="FIXED", configured=name, model=name)
+    route = model_resolution.DirectRoute(worker, str(row.underlying_model), ())
+    client = LLMClient.for_user(db, user_id)
+    db.commit()  # no transaction across the model call; its telemetry is written from another session
+    result: dict[str, Any] = {"model": name, "route": "OPENROUTER", "success": False, "latency_ms": None,
+                              "model_group": None, "underlying_model": row.underlying_model,
+                              "structured_output": None, "error": None}
+    clock = time.monotonic()
+    health = True
+    try:
+        answer = client.generate_prompt(build_model_health_prompt(),
+                                        LLMCall(workflow_type="system", worker_type="MODEL_TEST", direct=route))
+        result.update(success=True, underlying_model=answer.model or row.underlying_model,
+                      structured_output=isinstance(answer.data, dict) and answer.data.get("ok") is True)
+    except LLMConfigError as exc:
+        health = False
+        result["error"] = redact_text(str(exc), 500)
+    except (LLMError, ValueError) as exc:
+        result["error"] = redact_text(str(exc), 500)
+    result["latency_ms"] = int((time.monotonic() - clock) * 1000)
+    row = db.get(AIModel, row.id)
+    if row is not None and health:
+        row.health_status = "HEALTHY" if result["success"] else "UNHEALTHY"
+        row.health_checked_at, row.health_latency_ms, row.health_error = config.utcnow(), result["latency_ms"], \
+            result["error"]
+    config.audit(db, user_id, "MODEL_TEST", actor=config._actor(db, user_id),
+                 result="SUCCEEDED" if result["success"] else "FAILED", changes=[{"model": name, "route": "OPENROUTER"}],
+                 error=result["error"])
+    db.commit()
+    return result
+
+
 def _schema_check(expected: dict[str, str]):
     def check(data: dict[str, Any]) -> dict[str, Any]:
         def wrong(value: Any, kind: str) -> bool:
@@ -327,8 +476,12 @@ def test_worker(db: Session, user_id: int, worker_type: str, *, use_draft: bool 
         return {"worker_type": worker_type, "configuration": "draft" if use_draft else "active", **out}
     resolved = model_resolution.resolve(snapshot, worker_type, None if use_draft else active.version_number)
     prompt, expected = build_worker_test_prompt(worker_type)
-    client = LLMClient(overrides={"llm_provider": "litellm"}, user_id=user_id,
-                       gateway=config.gateway_settings(db, user_id))
+    # On the direct OpenRouter route a worker assigned a model synced from OpenRouter is tested the way it runs:
+    # straight to OpenRouter. Anything else is tested through the gateway, as before.
+    direct = model_resolution.direct_route_for(snapshot, resolved) if _direct_openrouter(db, user_id) else None
+    client = (LLMClient.for_user(db, user_id) if direct is not None else
+              LLMClient(overrides={"llm_provider": "litellm"}, user_id=user_id,
+                        gateway=config.gateway_settings(db, user_id)))
     db.commit()  # no transaction across the model call; its telemetry is written from another session
     out: dict[str, Any] = {"worker_type": worker_type, "configuration": "draft" if use_draft else "active",
                            "model": resolved.model, "assignment": resolved.configured, "note": resolved.note,
@@ -336,7 +489,8 @@ def test_worker(db: Session, user_id: int, worker_type: str, *, use_draft: bool 
     clock = time.monotonic()
     try:
         result = client.generate_prompt(prompt, LLMCall(workflow_type="system", worker_type=worker_type,
-                                                        resolved=resolved, validate=_schema_check(expected)))
+                                                        resolved=resolved, direct=direct,
+                                                        validate=_schema_check(expected)))
         out.update(success=True, schema_ok=True, routing=result.routing,
                    answered_by=result.model, latency_ms=(result.routing or {}).get("latency_ms"),
                    input_tokens=result.usage.input_tokens if result.usage else None,

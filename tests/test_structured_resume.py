@@ -250,6 +250,38 @@ def test_added_removed_and_reordered_items_are_recorded(user):
     assert {"ADD", "REMOVE", "REORDER"} <= types
 
 
+def test_a_project_keeps_an_image_link_details_and_result_and_additional_information_a_website(user):
+    detail = upload("jane.txt", RESUME) and active(user)
+    verify_all(detail["id"], sr.REQUIRED_SECTIONS)
+    detail = active(user)
+
+    def add(data):
+        data["projects"].append({"name": "Atlas", "url": "github.com/jane/atlas", "image_url": "https://x.test/a.png",
+                                 "description": "Search over podcasts", "result": "Served 2M users",
+                                 "technologies": ["Python"], "achievements": []})
+        data["additional_information"] += [{"text": "Blog", "url": "https://jane.dev"}, {"url": "https://jane.blog"}]
+    out = put(detail, add).json()
+    project = out["structured"]["projects"][-1]
+    assert (project["url"], project["image_url"], project["description"], project["result"]) == (
+        "github.com/jane/atlas", "https://x.test/a.png", "Search over podcasts", "Served 2M users")
+    assert project["verification"]["status"] == "UNVERIFIED"  # the person's addition is reviewed like any other
+    extra = out["structured"]["additional_information"]
+    assert {"text": "Blog", "url": "https://jane.dev"} in [{k: e.get(k) for k in ("text", "url")} for e in extra]
+    assert any(e.get("url") == "https://jane.blog" and e["text"] == "" for e in extra), "a link alone is kept"
+    # Experience saved before these fields existed is not marked edited by a save that never touched it.
+    assert all(r["verification"]["status"] == "VERIFIED" for r in out["structured"]["experience"])
+    rendered = sr.render_document(out["structured"])
+    assert "Atlas: Search over podcasts\n- Result: Served 2M users" in rendered
+    assert "Blog | https://jane.dev" in rendered
+
+
+def test_a_parse_never_supplies_a_project_image_or_result():
+    raw = "Projects\nAtlas: Search over podcasts\n"
+    data, _ = resume_parsing.ground({"projects": [{"name": "Atlas", "description": "Search over podcasts",
+                                                   "image_url": "https://evil.test/x.png", "result": "Made up"}]}, raw)
+    assert not data["projects"][0].get("image_url") and not data["projects"][0].get("result")
+
+
 # ───────────── re-parse ─────────────
 
 def test_reparse_is_a_comparison_and_never_overwrites_verified_values(user):

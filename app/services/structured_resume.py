@@ -126,8 +126,11 @@ class ExperienceIn(_In):
 class ProjectIn(_In):
     id: str | None = Field(default=None, max_length=120)
     name: str = Short
-    description: str = Field(default="", max_length=3000)
-    url: str = Short
+    description: str = Field(default="", max_length=3000)  # "Details" in the editor
+    url: str = Short  # the project's link
+    # Optional, entered by the person (never by a parse): a link to an image of the project, and its result/outcome.
+    image_url: str = Field(default="", max_length=1000)
+    result: str = Field(default="", max_length=2000)
     technologies: list[str] = Field(default_factory=list, max_length=80)
     skills: list[str] = Field(default_factory=list, max_length=80)
     achievements: list[BulletIn | str] = Field(default_factory=list, max_length=40)
@@ -176,6 +179,7 @@ class LanguageIn(_In):
 class AdditionalIn(_In):
     id: str | None = Field(default=None, max_length=120)
     text: str = Field(default="", max_length=3000)
+    url: str = Short  # an optional website link for this detail
 
 
 class StructuredResumeIn(_In):
@@ -597,8 +601,9 @@ def materialize(source: StructuredResumeIn | dict[str, Any], previous: dict[str,
     out["languages"] = [{"id": ids.take(lang.id, f"lang_{slug(lang.name)}"), **lang.model_dump(exclude={"id"})}
                         for lang in data.languages if lang.name]
     additional = [a if isinstance(a, AdditionalIn) else AdditionalIn(text=str(a)) for a in data.additional_information]
-    out["additional_information"] = [{"id": ids.take(a.id, f"info_{short_hash(a.text)}"), "text": a.text}
-                                     for a in additional if a.text]
+    out["additional_information"] = [{"id": ids.take(a.id, f"info_{short_hash(a.text or a.url)}"), "text": a.text,
+                                      **({"url": a.url} if a.url else {})}
+                                     for a in additional if a.text or a.url]
     for unit in iter_units(out):
         unit.node["verification"] = status(unit.item_id)
     out["derived_information"] = derive(out)
@@ -841,6 +846,8 @@ def render_document(data: dict[str, Any] | None) -> str:
             head = ": ".join(part for part in ((project.get("name") or "").strip(),
                                                 (project.get("description") or "").strip()) if part)
             out.append(head)
+            if (project.get("result") or "").strip():  # a bullet: a plain line here would read as another project
+                out.append(f"- Result: {project['result'].strip()}")
             out += [f"- {b['text'].strip()}" for b in project.get("achievements") or []
                     if isinstance(b, dict) and (b.get("text") or "").strip() and keep(b)]
     education = [e for e in data.get("education") or [] if keep(e)]
@@ -856,7 +863,8 @@ def render_document(data: dict[str, Any] | None) -> str:
         items = [i for i in data.get(section) or [] if keep(i)]
         if items:
             out += ["", f"## {label}", *[" | ".join(str(i[f]) for f in fields if i.get(f)) for i in items]]
-    extra = [i.get("text") for i in data.get("additional_information") or [] if keep(i) and i.get("text")]
+    extra = [" | ".join(p for p in (i.get("text"), i.get("url")) if p)
+             for i in data.get("additional_information") or [] if keep(i) and (i.get("text") or i.get("url"))]
     if extra:
         out += ["", "## Additional Information", *extra]
     return "\n".join(out).strip() + "\n" if out else ""
@@ -888,7 +896,7 @@ def render_text(data: dict[str, Any], *, statuses: tuple[str, ...] = REVIEWED[:1
                 f"{'present' if role.get('is_current') else role.get('end_date') or role.get('raw_end_date') or '?'}"
         lines += ["", " | ".join(filter(None, [role.get("job_title"), role.get("company"), role.get("location"), dates]))]
         lines += [f"- {b['text']}" for b in role.get("achievements", []) + role.get("responsibilities", []) if ok(b)]
-    for label, section, fields in (("Projects", "projects", ("name", "description")),
+    for label, section, fields in (("Projects", "projects", ("name", "description", "result", "url")),
                                    ("Education", "education", ("degree", "field_of_study", "institution", "university",
                                                                   "grade", "end_date")),
                                    ("Certifications", "certifications", ("name", "issuer", "issue_date")),

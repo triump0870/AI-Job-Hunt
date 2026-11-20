@@ -393,7 +393,19 @@ class LLMClient:
         config = self._config()
         if config["llm_provider"] == "litellm":
             return "litellm", model_resolution.get(self.user_id, STAGE_WORKERS.get(task)).model or ""
-        return config["llm_provider"], config["stage_models"].get(task) or config["model"]
+        route = self._direct_route(config, STAGE_WORKERS.get(task))
+        return config["llm_provider"], route.model if route else config["stage_models"].get(task) or config["model"]
+
+    def _direct_route(self, config: dict[str, Any], worker_type: str | None) -> model_resolution.DirectRoute | None:
+        """On the direct OpenRouter route, the worker's assignment when it is a model synced from OpenRouter."""
+        if config["llm_provider"] != "openrouter" or self.user_id is None or not worker_type:
+            return None
+        try:
+            return model_resolution.openrouter_route(self.user_id, worker_type)
+        except Exception:  # an unreadable configuration keeps the Settings model, as before
+            log.warning("could not read the model assignment for %s; using the Settings model", worker_type,
+                        exc_info=True)
+            return None
 
     def route_for(self, worker_type: str) -> dict[str, Any]:
         """Where this worker's next request goes, without calling anything: the route (LITELLM or a direct provider),
@@ -405,6 +417,10 @@ class LLMClient:
             return {"route": "LITELLM", "model": resolved.model, "primary": primary.model, "mode": resolved.mode,
                     "configured": resolved.configured, "failed_over_from": resolved.failed_over_from,
                     "backups": resolved.chain()}
+        route = self._direct_route(config, worker_type)
+        if route is not None:
+            return {"route": "OPENROUTER", "model": route.model, "primary": route.model, "mode": route.worker.mode,
+                    "configured": route.worker.configured, "failed_over_from": None, "backups": list(route.backups)}
         stage = next((name for name, worker in STAGE_WORKERS.items() if worker == worker_type), None)
         model = config["stage_models"].get(stage) or config["model"]
         return {"route": str(config["llm_provider"]).upper(), "model": model, "primary": model, "mode": None,
@@ -419,9 +435,17 @@ class LLMClient:
                 return self._gateway(system, user, task, prompt_name, prompt_version, call or LLMCall())
             except RateLimitedCooldown as waiting:
                 raise _rate_limited(waiting) from waiting
-        model = config["stage_models"].get(task) or config["model"]
-        attempt = Attempt(provider=provider, requested_model=model, user_id=self.user_id, call=call or LLMCall(),
+        call = call or LLMCall()
+        route = (call.direct if call.direct is not None and provider == "openrouter"
+                 else self._direct_route(config, call.worker_type or worker_for_prompt(prompt_name)
+                                         or STAGE_WORKERS.get(task)))
+        model = route.model if route else config["stage_models"].get(task) or config["model"]
+        attempt = Attempt(provider=provider, requested_model=model, user_id=self.user_id, call=call,
                           prompt_name=prompt_name, prompt_version=prompt_version, system=system, user=user)
+        if route is not None:  # the worker's assignment from Models & routing, recorded like a gateway request's
+            attempt.worker_type, attempt.model_mode = route.worker.worker_type, route.worker.mode
+            attempt.configured_model, attempt.config_version = route.worker.configured, route.worker.config_version
+            attempt.backup_models = route.backups
         started = time.monotonic()
         # A provider that just rate limited this account is left alone (app.services.backoff). The wait is
         # reported as a rate limit, so the ranker and the workers retry it later exactly as they already do.
@@ -521,7 +545,7 @@ class LLMClient:
             return self._gemini(system, user, model, attempt)
         if provider == "openrouter":
             return self._openrouter(system, user, task=task, model=model, require_free=config["require_free"],
-                                    attempt=attempt)
+                                    attempt=attempt, backups=attempt.backup_models)
         raise LLMConfigError(f"Unsupported LLM_PROVIDER={provider}")
 
     # ───────────── LiteLLM gateway mode ─────────────
@@ -820,12 +844,14 @@ class LLMClient:
         return LLMResult(_extract_json(attempt.response_text), "gemini", attempt.model, attempt.usage)
 
     def _openrouter(self, system: str, user: str, task: str, model: str, require_free: bool,
-                    attempt: Attempt) -> LLMResult:
+                    attempt: Attempt, backups: tuple[str, ...] = ()) -> LLMResult:
         if not self.keys.get("openrouter"):
             raise LLMConfigError("OPENROUTER_API_KEY is missing: add your OpenRouter API key in Settings")
 
         primary = model
-        fallbacks = _csv_models(self.settings.openrouter_fallback_models)
+        # The worker's own backups (Models & routing) first, then the server's OPENROUTER_FALLBACK_MODELS.
+        fallbacks = [m for m in dict.fromkeys([*backups, *_csv_models(self.settings.openrouter_fallback_models)])
+                     if m != primary]
         all_models = [primary, *fallbacks]
 
         # Avoid accidental spend when the user intends to run on free inference. Checked before any request.

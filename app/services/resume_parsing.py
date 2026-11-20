@@ -471,6 +471,8 @@ def ground(data: dict[str, Any], raw_text: str) -> tuple[dict[str, Any], dict[st
     projects = []
     for project in out.get("projects") or []:
         project = dict(project)
+        project.pop("image_url", None)  # the person's own additions: a parse never supplies them
+        project.pop("result", None)
         if project.get("description") and not src.has_passage(project["description"]):
             project["description"] = ""
             count.drop("project_fields")
@@ -534,7 +536,9 @@ def ground(data: dict[str, Any], raw_text: str) -> tuple[dict[str, Any], dict[st
         if lang.get("proficiency") and not src.has(lang["proficiency"]):
             lang["proficiency"] = ""
     out["languages"] = languages
-    out["additional_information"] = _passages(out.get("additional_information"), src, count, "additional")
+    out["additional_information"] = [
+        {**v, "url": v["url"] if src.has_link(v["url"]) else ""} if isinstance(v, dict) and v.get("url") else v
+        for v in _passages(out.get("additional_information"), src, count, "additional")]
     return sr.fit_parser_output(out), count.dropped
 
 

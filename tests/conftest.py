@@ -23,6 +23,9 @@ for key in ("APIFY_API_TOKEN", "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPI
     os.environ[key] = ""
 # No real Gmail: the inbox tests turn the worker on and serve Google from tests/gmail_fake.py.
 os.environ["APPLICATION_INBOX_ENABLED"] = "false"
+# Most tests were written for the quick parse and the original reader; the tests of the new defaults turn them on.
+os.environ["RESUME_UPLOAD_AI_ONLY"] = "false"
+os.environ["RESUME_UPLOAD_READER_V2"] = "false"
 # Agent graphs and their LangSmith export are off; the agent tests turn them on and never reach LangSmith.
 os.environ["AGENT_GRAPHS_ENABLED"] = "false"
 os.environ["AGENT_LANGSMITH_EXPORT_ENABLED"] = "false"

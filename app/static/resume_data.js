@@ -14,12 +14,12 @@ const RD_FIELDS = {
   summary: [['text', 'Summary', 'textarea']],
   skills: [['name', 'Skill'], ['category', 'Category']],
   experience: [['job_title', 'Job title'], ['company', 'Company'], ['location', 'Location'], ['employment_type', 'Employment type'], ['start_date', 'Start (YYYY-MM)', 'month'], ['end_date', 'End (YYYY-MM)', 'month'], ['is_current', 'Current role', 'bool'], ['technologies', 'Technologies', 'list']],
-  projects: [['name', 'Name'], ['url', 'URL'], ['description', 'Description', 'textarea'], ['technologies', 'Technologies', 'list']],
+  projects: [['name', 'Name'], ['url', 'Link (optional)'], ['image_url', 'Image link (optional)'], ['description', 'Details', 'textarea'], ['result', 'Result', 'textarea'], ['technologies', 'Technologies', 'list']],
   education: [['degree', 'Degree'], ['field_of_study', 'Field of study'], ['institution', 'Institution'], ['university', 'University'], ['location', 'Location'], ['start_date', 'Start (YYYY-MM)', 'month'], ['end_date', 'End (YYYY-MM)', 'month'], ['grade', 'Grade (GPA / %)']],
   certifications: [['name', 'Name'], ['issuer', 'Issuer'], ['issue_date', 'Issued'], ['expiration_date', 'Expires'], ['credential_id', 'Credential ID'], ['url', 'URL']],
   awards: [['title', 'Title'], ['issuer', 'Issuer'], ['date', 'Date'], ['description', 'Description', 'textarea']],
   languages: [['name', 'Language'], ['proficiency', 'Proficiency']],
-  additional_information: [['text', 'Detail', 'textarea']],
+  additional_information: [['text', 'Detail', 'textarea'], ['url', 'Website link (optional)']],
 };
 const RD_BULLETS = { experience: [['achievements', 'Achievements'], ['responsibilities', 'Responsibilities']], projects: [['achievements', 'Achievements']] };
 const RD_STATUS = { VERIFIED: ['✓', 'Verified', 'good'], REJECTED: ['✕', 'Rejected', 'bad'], EDITED: ['!', 'Edited · needs review', 'warn'], UNVERIFIED: ['?', 'Unverified', 'muted'] };
@@ -160,11 +160,29 @@ function rdTitle(section, item) {
   if (section === 'skills') return item.category ? `${item.name} (${item.category})` : item.name;
   return item.name || item.title || item.text || '';
 }
+// An http(s) URL for a link or image the person typed ("github.com/x" reads as https); anything else (javascript:,
+// data:) is never made clickable or loaded.
+function rdHttpUrl(value) {
+  const text = String(value || '').trim();
+  if (!text || /[\s<>"'`\\]/.test(text)) return '';
+  const href = /^https?:\/\//i.test(text) ? text : /^[a-z][a-z0-9+.-]*:/i.test(text) ? '' : `https://${text.replace(/^\/+/, '')}`;
+  return /^https?:\/\/[^/?#]+\.[^/?#]+/i.test(href) ? href : '';
+}
+function rdLink(value, text) {
+  const href = rdHttpUrl(value);
+  return href ? `<a href="${attr(href)}" target="_blank" rel="noopener noreferrer">${esc(text || value)} ↗</a>` : esc(value || '');
+}
 function rdViewItem(section, item) {
   const meta = [section === 'experience' || section === 'education' ? rdDates(item) : '', item.university, item.location, item.grade, item.issuer, item.issue_date || item.date,
-    (item.technologies || []).join(', '), item.description].filter(Boolean);
+    (item.technologies || []).join(', '), section === 'projects' ? '' : item.description].filter(Boolean);
+  const image = section === 'projects' && rdHttpUrl(item.image_url) ? `<img class="rd-project-image" src="${attr(rdHttpUrl(item.image_url))}" alt="${attr(item.name ? `${item.name} image` : 'Project image')}" loading="lazy" referrerpolicy="no-referrer">` : '';
+  const extra = [
+    section === 'projects' && item.description ? `<p class="rd-text"><span class="caps-sm">Details</span> ${esc(item.description)}</p>` : '',
+    section === 'projects' && item.result ? `<p class="rd-text"><span class="caps-sm">Result</span> ${esc(item.result)}</p>` : '',
+    (section === 'projects' || section === 'additional_information') && item.url ? `<p class="small">${rdLink(item.url, section === 'projects' ? 'Project link' : item.url)}</p>` : '',
+  ].join('');
   const bullets = (RD_BULLETS[section] || []).map(([key, label]) => (item[key] || []).length ? `<div class="rd-bullets"><div class="caps-sm">${label}</div>${item[key].map(b => `<div class="rd-bullet" data-rd-item="${attr(b.id)}">${rdBadge(b)}<span class="grow">${esc(b.text)}</span>${rdItemActions(b)}</div>`).join('')}</div>` : '').join('');
-  return `<article class="rd-item" data-rd-item="${attr(item.id)}"><div class="rd-item-head">${rdBadge(item)}<div class="grow"><strong>${esc(rdTitle(section, item) || 'Untitled')}</strong>${meta.length ? `<p>${esc(meta.join(' · '))}</p>` : ''}</div>${rdItemActions(item)}</div>${bullets}</article>`;
+  return `<article class="rd-item" data-rd-item="${attr(item.id)}"><div class="rd-item-head">${rdBadge(item)}${image}<div class="grow"><strong>${esc(rdTitle(section, item) || (section === 'additional_information' && item.url ? 'Website link' : 'Untitled'))}</strong>${meta.length ? `<p>${esc(meta.join(' · '))}</p>` : ''}${extra}</div>${rdItemActions(item)}</div>${bullets}</article>`;
 }
 function rdInput(path, label, kind, value) {
   const id = `rd-${path.replace(/\./g, '-')}`;
@@ -352,11 +370,8 @@ function rdResumeList(current) {
 // Everything that changes how resumes are read and used, in one place, folded away by default.
 function rdOptions() {
   const policy = D.resumeData.policy || {};
-  return settingsDetails('resume-options', 'Reading, AI and policy options', `
-    <div class="caps-sm mb8">Reading new uploads</div>
-    <label class="settings-check" for="rd-extraction-v2"><input type="checkbox" id="rd-extraction-v2" data-act-change="rd-extraction-v2" ${D.resumeData.extraction_v2 ? 'checked' : ''}> Read PDF uploads with the new reader</label><p class="settings-help rd-option-help">Reads the text a PDF states for ligatures (“Kafka”, not “Kaga”) and joins words a line break split.</p>
-    <label class="settings-check mt8" for="rd-ai-only"><input type="checkbox" id="rd-ai-only" data-act-change="rd-ai-only" ${D.resumeData.ai_only ? 'checked' : ''}> Structure uploads with AI only</label><p class="settings-help rd-option-help">The Resume Parser model reads a new upload right away; the quick parse is kept only as a fallback.</p>
-    <div class="caps-sm mt16 mb8">What AI works from (every resume)</div>
+  return settingsDetails('resume-options', 'AI and policy options', `
+    <div class="caps-sm mb8">What AI works from (every resume)</div>
     <fieldset class="settings-options" style="border:0;padding:0;margin:0 0 10px"><legend class="sr-only">Resume source for AI</legend>${RD_POLICY_SOURCES.map(([value, title, help]) => `<label class="settings-check" style="align-items:flex-start"><input type="radio" name="rd-resume-source" data-act-change="rd-policy-source" value="${value}" ${(policy.resume_source || 'structured') === value ? 'checked' : ''}><span><b>${title}</b><br><span class="settings-help">${help}</span></span></label>`).join('')}</fieldset>
     <div class="settings-checks" style="margin-top:6px"><label class="settings-check" for="rd-policy-allow"><input type="checkbox" id="rd-policy-allow" data-act-change="rd-policy" data-key="allow_unverified_resume_facts" ${policy.allow_unverified_resume_facts ? 'checked' : ''}> Allow unverified facts in tailored resumes and follow-ups</label><label class="settings-check" for="rd-policy-rank"><input type="checkbox" id="rd-policy-rank" data-act-change="rd-policy" data-key="ranking_uses_unverified" ${policy.ranking_uses_unverified ? 'checked' : ''}> Let ranking read unverified facts as lower-confidence context</label></div>`);
 }
@@ -597,13 +612,5 @@ const RESUME_DATA_ACTIONS = {
       rdApply(await api(`/api/resumes/${active.id}/sections`, { method: 'POST', body: { line: Number(el.dataset.line), kind: el.value } }));
     }, () => (rdActive()?.pending_reparse ? 'Read again with that section: compare the changes below' : 'Read again with that section'));
   },
-  'rd-ai-only': el => rdRun(async () => {
-    await api('/api/workers/settings', { method: 'PUT', body: { workers: { resume_parsing: { ai_only: el.checked } } } });
-    D.resumeData = { ...D.resumeData, ai_only: el.checked };
-  }, el.checked ? 'New uploads are structured with AI only' : 'New uploads show the quick parse first, then the AI refines it'),
-  'rd-extraction-v2': el => rdRun(async () => {
-    await api('/api/workers/settings', { method: 'PUT', body: { workers: { resume_parsing: { extraction_v2: el.checked } } } });
-    D.resumeData = { ...D.resumeData, extraction_v2: el.checked };
-  }, el.checked ? 'New PDF uploads are read with the new reader' : 'New PDF uploads are read as before'),
   'rd-policy': el => rdRun(async () => { D.resumeData = { ...D.resumeData, policy: await api('/api/settings/resume/policy', { method: 'PUT', body: { [el.dataset.key]: el.checked } }) }; }, 'Candidate policy saved'),
 };

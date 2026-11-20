@@ -756,7 +756,9 @@ def validate(snapshot: dict[str, Any], *, live: LiveState | None = None, gateway
             return None
         if entry is not None and not entry.get("enabled", True):
             errors.append(_issue(path, f"{what.capitalize()} {name} is disabled"))
-        if live.known and name not in live.names and name not in managed_names:
+        # A model synced from OpenRouter is called directly on the direct route; it needs LiteLLM only on the gateway.
+        if live.known and name not in live.names and name not in managed_names and (
+                gateway or not model_resolution.is_openrouter_model(name, entry)):
             errors.append(_issue(path, f"{what.capitalize()} {name} is not served by LiteLLM"))
         return entry
 

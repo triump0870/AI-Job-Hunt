@@ -835,6 +835,56 @@ describe('Settings → AI Models actions', () => {
     await open('models');
     expect(text()).toContain('No models yet');
   });
+  it('previews the top OpenRouter models by the chosen criteria and adds only the picked ones', async () => {
+    const direct = () => ({ ...overview(), gateway_enabled: false, llm_provider: 'openrouter', gateway: { ...overview().gateway, gateway_enabled: false },
+      models: [...overview().models, model('openrouter/vendor/cheap:free', { provider: 'openrouter', underlying_model: 'vendor/cheap:free', source: 'OPENROUTER', present_in_litellm: false })] });
+    routes['GET /api/settings/ai'] = direct;
+    const listed = { listed: 4, matching: 3, ranks: ['cheapest', 'context', 'newest'], models: [
+      { model_id: 'vendor/cheap:free', name: 'Cheap', input_per_million: 0, output_per_million: 0, context_window: 32000, free: true, structured_output: true, in_catalog: true },
+      { model_id: 'vendor/mid', name: 'Mid', input_per_million: 1, output_per_million: 2, context_window: 128000, structured_output: true, reasoning: true, in_catalog: false },
+      { model_id: 'vendor/big', name: 'Big', input_per_million: 5, output_per_million: 15, context_window: 1000000, in_catalog: false }] };
+    routes['GET /api/settings/ai/openrouter/models'] = () => listed;
+    const orAsked = () => fetchMock.mock.calls.map(([u]) => u).filter(u => u.startsWith('/api/settings/ai/openrouter/models?'));
+    routes['POST /api/settings/ai/models/sync-openrouter'] = () => ({ models: 1, added: ['openrouter/vendor/mid'], missing: [], facts_changed: false, draft_revision: 8 });
+    await open('workers');
+    expect(text()).toContain('A worker assigned a model you added from OpenRouter uses it');
+    await open('models');
+    const buttons = [...document.querySelectorAll('#view .aim-section-head button')].map(b => b.textContent);
+    expect(buttons.slice(0, 2)).toEqual(['Sync from OpenRouter', 'Sync from LiteLLM']);
+    expect(document.querySelector('#view .aim-section-head [data-act="aim-or-toggle"]').className).toContain('primary');
+    const card = document.querySelector('#view [data-model="openrouter/vendor/cheap:free"]');
+    expect(card.textContent).toContain('OpenRouter'); expect(card.textContent).not.toContain('Not in LiteLLM');
+    await ui.A['aim-or-toggle'](); await flush();
+    const asked = orAsked().at(-1);
+    expect(asked).toContain('rank=cheapest'); expect(asked).toContain('limit=10'); expect(asked).toContain('structured=true');
+    expect(document.querySelectorAll('#view [data-or-model]').length).toBe(3);
+    expect(text()).toContain('Top 3 of 3 matching');
+    expect([...ui.AIM.orPicked]).toEqual(['vendor/mid', 'vendor/big']);  // the one already in the catalog starts unticked
+    ui.A['aim-or-pick']({ checked: false, dataset: { id: 'vendor/big' } });
+    expect(document.querySelector('#view [data-act="aim-or-add"]').textContent).toBe('Add 1 model');
+    ui.setF('aim-or', 'rank', 'context'); ui.setF('aim-or', 'free', true); ui.setF('aim-or', 'min_context', '64000'); ui.setF('aim-or', 'limit', '99');
+    await ui.A['aim-or-preview']({ dataset: { refresh: '1' } });
+    const again = orAsked().at(-1);
+    expect(again).toContain('rank=context'); expect(again).toContain('free=true'); expect(again).toContain('min_context=64000');
+    expect(again).toContain('limit=50'); expect(again).toContain('refresh=true');
+    ui.A['aim-or-pick']({ checked: false, dataset: { id: 'vendor/big' } });
+    await ui.A['aim-or-add']();
+    expect(body('POST', '/api/settings/ai/models/sync-openrouter')).toEqual({ ids: ['vendor/mid'] });
+    expect(document.getElementById('toast').textContent).toContain('1 OpenRouter model added');
+    expect(ui.AIM.orOpen).toBe(false);
+  });
+  it('filters the catalog by source and by OpenRouter free models', async () => {
+    routes['GET /api/settings/ai'] = () => ({ ...overview(), models: [...overview().models,
+      model('openrouter/vendor/cheap:free', { provider: 'openrouter', underlying_model: 'vendor/cheap:free', source: 'OPENROUTER', present_in_litellm: false }),
+      model('openrouter/vendor/mid', { provider: 'openrouter', underlying_model: 'vendor/mid', source: 'OPENROUTER', present_in_litellm: false })] });
+    await open('models');
+    const chip = id => document.querySelector(`#view [data-chip="${id}"]`);
+    expect(chip('source:OPENROUTER').textContent).toContain('2'); expect(chip('price:FREE').textContent).toContain('1');
+    ui.A['aim-mf-chip']({ dataset: { chip: 'price:FREE' } });
+    expect([...document.querySelectorAll('#view .aim-mcard')].map(c => c.dataset.model)).toEqual(['openrouter/vendor/cheap:free']);
+    // On the LiteLLM route a model LiteLLM does not serve still says so.
+    expect(document.querySelector('#view [data-model="openrouter/vendor/cheap:free"]').textContent).toContain('Not in LiteLLM');
+  });
   it('adds a model even when Ollama is unreachable, and requires a name', async () => {
     routes['GET /api/settings/ai/ollama'] = () => [{ detail: 'down' }, 500];
     await open('models');

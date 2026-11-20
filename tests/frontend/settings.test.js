@@ -656,28 +656,39 @@ describe('resume data', () => {
     ui.A['rd-jump']({ dataset: { section: 'skills' } }, { preventDefault() {} });
     expect(ui.RD.tab).toBe('structured');
   });
-  it('structures uploads with AI only: the toggle saves the worker setting, a waiting version shows no regex data', async () => {
-    let saved;
+  it('structures uploads with AI only by default: no reading toggles on the screen, a waiting version shows no regex data', async () => {
     const waiting = detail({ parser: 'deterministic', ai_parse: { active: true, status: 'PROCESSING', note: 'Structuring with AI…' } });
-    await open(waiting, { 'GET /api/settings/resume': { active: waiting, versions: [waiting], policy: {}, ai_only: true },
-      'PUT /api/workers/settings': body => { saved = body; return { account: {} }; } });
+    await open(waiting, { 'GET /api/settings/resume': { active: waiting, versions: [waiting], policy: {}, ai_only: true, extraction_v2: true } });
     const view = document.getElementById('view');
     expect(view.textContent).toContain('the Resume Parser model is reading this resume');
     expect(view.innerHTML).not.toContain('Builds &lt;platforms&gt;');
-    expect(document.getElementById('rd-ai-only').checked).toBe(true);
-    await ui.A['rd-ai-only']({ checked: false }); await settle();
-    expect(saved).toEqual({ workers: { resume_parsing: { ai_only: false } } });
-    expect(view.innerHTML).toContain('Builds &lt;platforms&gt;');
+    expect(document.getElementById('rd-ai-only')).toBeNull();
+    expect(document.getElementById('rd-extraction-v2')).toBeNull();
+    expect(view.textContent).not.toContain('Read PDF uploads with the new reader');
+    expect(ui.A['rd-ai-only']).toBeUndefined();
+    expect(ui.A['rd-extraction-v2']).toBeUndefined();
   });
-  it('reads PDF uploads with the new reader: the toggle shows the account value and saves the worker setting', async () => {
-    let saved;
-    const active = detail({ parser: 'deterministic' });
-    await open(active, { 'GET /api/settings/resume': { active, versions: [active], policy: {}, ai_only: false, extraction_v2: true },
-      'PUT /api/workers/settings': body => { saved = body; return { account: {} }; } });
-    expect(document.getElementById('rd-extraction-v2').checked).toBe(true);
-    await ui.A['rd-extraction-v2']({ checked: false }); await settle();
-    expect(saved).toEqual({ workers: { resume_parsing: { extraction_v2: false } } });
-    expect(ui.D.resumeData.extraction_v2).toBe(false);
+  it('shows a project’s image, link, details and result, and an additional website link, only for http(s)', async () => {
+    const v = verification('UNVERIFIED');
+    const base = detail();
+    const structured = { ...base.structured,
+      projects: [{ id: 'proj_a', name: 'Atlas', url: 'github.com/jane/atlas', image_url: 'https://img.test/a.png', description: 'Podcast search', result: 'Served 2M users', technologies: [], achievements: [], verification: v },
+        { id: 'proj_b', name: 'Bad', url: 'javascript:alert(1)', image_url: 'data:image/png;base64,xx', description: '', result: '', technologies: [], achievements: [], verification: v }],
+      additional_information: [{ id: 'info_1', text: 'Blog', url: 'https://jane.dev', verification: v }] };
+    const active = { ...base, structured };
+    await open(active, { 'GET /api/settings/resume': { active, versions: [active], policy: {} } });
+    const atlas = document.querySelector('[data-rd-item="proj_a"]');
+    expect(atlas.querySelector('img.rd-project-image').getAttribute('src')).toBe('https://img.test/a.png');
+    expect(atlas.querySelector('a').getAttribute('href')).toBe('https://github.com/jane/atlas');
+    expect(atlas.textContent).toContain('Podcast search');
+    expect(atlas.textContent).toContain('Served 2M users');
+    const bad = document.querySelector('[data-rd-item="proj_b"]');
+    expect(bad.querySelector('img')).toBeNull();
+    expect(bad.querySelector('a')).toBeNull();
+    expect(document.querySelector('[data-rd-item="info_1"] a').getAttribute('href')).toBe('https://jane.dev');
+    ui.A['rd-edit']({ dataset: { section: 'projects' } });
+    expect(document.getElementById('rd-projects-0-image_url').value).toBe('https://img.test/a.png');
+    expect(document.getElementById('rd-projects-0-result').value).toBe('Served 2M users');
   });
   it('renders every section type and edits single-object sections', async () => {
     const v = verification('UNVERIFIED');

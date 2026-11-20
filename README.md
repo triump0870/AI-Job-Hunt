@@ -758,9 +758,23 @@ version, models resting):
 | Tab | What you do there |
 |---|---|
 | Workers | Pick each worker's model from its row (a tier, a model, or the auto router). **Edit** opens the worker: model, backups (tried in order when the model is rate limited or failing) and on/off; generation settings and quality escalation are folded away. |
-| Models | The catalog from LiteLLM (sync, add a local Ollama model, test, enable), the tiers, and the auto router (folded away). |
+| Models | The catalog from LiteLLM or OpenRouter (sync, add a local Ollama model, test, enable), the tiers, and the auto router (folded away). |
 | Reliability | Automatic failover: on/off, routing algorithm, browser alerts, model health; thresholds folded away. |
 | Settings | The route (LiteLLM gateway or a direct provider), the LiteLLM connection and synchronization, the direct provider's models, version history with roll back, and the audit trail. |
+
+**Sync from OpenRouter** (Models tab; the main button on the direct OpenRouter route) reads OpenRouter's public model
+list (`/api/v1/models`, cached for `MODEL_MARKET_CACHE_HOURS`, no key needed) and shows the top models for what you
+choose: rank by cheapest, largest context, newest or (with `ARTIFICIAL_ANALYSIS_API_KEY`) benchmark quality; must-haves
+free only, JSON output, tools, reasoning, vision, a minimum context and a maximum price; and how many (10 by default,
+up to 50). Only what OpenRouter states counts: a model that does not say it supports something does not pass that
+filter. You tick the ones to add; they join the catalog as `openrouter/<id>` with OpenRouter's context and
+capabilities, unassigned. A later sync refreshes them, keeps a model you removed removed, and never deletes one that
+OpenRouter stopped listing. `GET /api/settings/ai/openrouter/models`, `POST /api/settings/ai/models/sync-openrouter`.
+
+**On the direct OpenRouter route**, a worker whose model (fixed or through its tier) is one you added from OpenRouter
+calls it, with its OpenRouter backups sent as OpenRouter's own fallbacks (then `OPENROUTER_FALLBACK_MODELS`); the
+free-only guard checks every one of them. A worker with nothing assigned, or assigned a LiteLLM model, uses the
+models in Settings exactly as before. Escalation, failover resting and token pacing stay LiteLLM-route features.
 
 ### Saving applies at once
 

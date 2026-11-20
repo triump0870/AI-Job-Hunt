@@ -319,6 +319,20 @@ def test_without_ai_only_an_upload_waits_its_turn(user):
     assert client.get("/api/settings/resume").json()["ai_only"] is False
 
 
+def test_new_uploads_use_ai_and_the_new_reader_by_default(user, monkeypatch):
+    """Both reading options are defaults, off the Resumes screen: on for every account that never chose."""
+    from app.settings import Settings, get_settings
+
+    assert Settings.model_fields["resume_upload_ai_only"].default is True
+    assert Settings.model_fields["resume_upload_reader_v2"].default is True
+    monkeypatch.setattr(get_settings(), "resume_upload_ai_only", True)
+    monkeypatch.setattr(get_settings(), "resume_upload_reader_v2", True)
+    shown = client.get("/api/settings/resume").json()
+    assert shown["ai_only"] is True and shown["extraction_v2"] is True
+    detail = upload()
+    assert task_row(user, detail["id"]).run_now_at is not None, "the Resume Parser model reads it straight away"
+
+
 def test_the_pdf_reader_follows_the_server_until_the_account_chooses(user, monkeypatch):
     from app.services import document_text, worker_settings
     from app.settings import get_settings
@@ -331,10 +345,10 @@ def test_the_pdf_reader_follows_the_server_until_the_account_chooses(user, monke
         return real(kind, data, **kwargs)
 
     monkeypatch.setattr(document_text, "extract", spy)
-    monkeypatch.setattr(get_settings(), "resume_extraction_v2", False)
+    monkeypatch.setattr(get_settings(), "resume_upload_reader_v2", False)
     assert client.get("/api/settings/resume").json()["extraction_v2"] is False
     upload()
-    monkeypatch.setattr(get_settings(), "resume_extraction_v2", True)  # the server default moves: so does the account
+    monkeypatch.setattr(get_settings(), "resume_upload_reader_v2", True)  # the server default moves: so does the account
     assert client.get("/api/settings/resume").json()["extraction_v2"] is True
     with sessions_for(user)() as db:
         worker_settings.update(db, user, {"resume_parsing": {"extraction_v2": False}})  # the account's own choice wins

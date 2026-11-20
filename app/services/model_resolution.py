@@ -286,6 +286,55 @@ def get(user_id: int | None, worker_type: str | None) -> ResolvedWorker:
     return resolve(snapshot, worker_type, version)
 
 
+OPENROUTER_PREFIX = "openrouter/"
+
+
+def is_openrouter_model(name: str | None, entry: dict[str, Any] | None) -> bool:
+    """A catalog model added by Sync from OpenRouter: named "openrouter/<its OpenRouter id>". A LiteLLM alias that
+    happens to route to OpenRouter is not one: its assignment stays a LiteLLM assignment."""
+    entry = entry or {}
+    model = str(entry.get("underlying_model") or "").strip()
+    return entry.get("provider") == "openrouter" and bool(model) and name == OPENROUTER_PREFIX + model
+
+
+def openrouter_id(snapshot: dict[str, Any], name: str | None) -> str | None:
+    """The OpenRouter model id behind a catalog name, when it is an enabled model synced from OpenRouter."""
+    entry = (snapshot.get("models") or {}).get(name or "")
+    if not is_openrouter_model(name, entry) or not entry.get("enabled", True):
+        return None
+    return str(entry["underlying_model"]).strip()
+
+
+@dataclass(frozen=True)
+class DirectRoute:
+    """A worker's assignment on the direct OpenRouter route: its model and backups as OpenRouter ids."""
+
+    worker: ResolvedWorker
+    model: str
+    backups: tuple[str, ...]
+
+
+def openrouter_route(user_id: int | None, worker_type: str | None) -> DirectRoute | None:
+    """The worker's assigned model when the direct route is OpenRouter and the assignment (fixed model or tier) is a
+    model synced from OpenRouter; None otherwise, and the request keeps the Settings model exactly as before.
+
+    Only the model and its backups carry over: escalation, failover resting and token pacing stay LiteLLM features.
+    The backups go to OpenRouter as its own fallbacks, so a backup that is not an OpenRouter model is left out."""
+    version, snapshot = active_snapshot(user_id)
+    return direct_route_for(snapshot, resolve(snapshot, worker_type, version))
+
+
+def direct_route_for(snapshot: dict[str, Any], worker: ResolvedWorker) -> DirectRoute | None:
+    """`worker` (resolved from `snapshot`, active or draft) on the direct OpenRouter route, or None when its model is
+    not a model synced from OpenRouter."""
+    model = openrouter_id(snapshot, worker.model)
+    if model is None:
+        return None
+    names = (worker.fallback_model, *worker.secondary_models, *worker.model_fallbacks)
+    backups = tuple(dict.fromkeys(i for i in (openrouter_id(snapshot, n) for n in names) if i and i != model))
+    return DirectRoute(worker, model, backups)
+
+
 # ───────────── per-request policy ─────────────
 
 def request_params(worker: ResolvedWorker, model: str, contract: Any = None) -> tuple[dict[str, Any], list[str]]:

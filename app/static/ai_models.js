@@ -14,7 +14,7 @@ const AIM_CONDITIONS = { LOW_CONFIDENCE: 'Confidence below threshold', SCHEMA_FA
 const AIM_SYNC = { SYNCED: ['Synced', 'good'], PENDING: ['Pending', 'warn'], APPLYING: ['Applying', 'brand'], OUT_OF_SYNC: ['Out of sync', 'bad'], FAILED: ['Failed', 'bad'] };
 const AIM_CONN = { CONNECTED: ['Connected', 'good'], DISCONNECTED: ['Disconnected', 'muted'], AUTH_FAILED: ['Authentication failed', 'bad'], UNAVAILABLE: ['LiteLLM unavailable', 'bad'], UNKNOWN: ['Not tested', 'muted'] };
 const AIM_BACKUPS = 4;  // fallback model + up to three secondary models
-const AIM = { tab: 'workers', data: undefined, loading: false, error: '', drawer: null, failed: null, runtime: null, versions: null, audit: null, tests: {}, ollama: null, adding: false, insights: undefined, insightOpen: {} };
+const AIM = { tab: 'workers', data: undefined, loading: false, error: '', drawer: null, failed: null, runtime: null, versions: null, audit: null, tests: {}, ollama: null, adding: false, insights: undefined, insightOpen: {}, orOpen: false, or: null, orPicked: null };
 
 const aimData = () => AIM.data || {};
 const aimRev = () => aimData().connection?.draft_revision;
@@ -301,7 +301,9 @@ function aimWorkers() {
   const chips = AIM_WF.filter(([k]) => counts[k] || on.includes(k)).map(([k, label]) => `<button type="button" class="aim-mf-chip ${on.includes(k) ? 'on' : ''}" data-act="aim-wf-chip" data-chip="${k}" aria-pressed="${on.includes(k)}">${label}<b>${counts[k]}</b></button>`).join('');
   const filtered = q.length || on.length;
   const bar = all.length > 1 ? `<div class="aim-mf aim-wf" role="search"><div class="aim-mf-top"><label class="aim-mf-search"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10.5 10.5L14 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg><input type="search" id="aim-wf-q" data-form="aim-wf" data-field="q" data-live="1" value="${attr(fv('aim-wf', 'q', ''))}" placeholder="Search ${all.length} workers by name or model" aria-label="Search workers" autocomplete="off" spellcheck="false"></label>${chips ? `<div class="aim-mf-group" role="group" aria-label="Show">${chips}</div>` : ''}${filtered ? `<span class="aim-wf-count" role="status">Showing <b>${shown.length}</b> of ${all.length}</span>${btn('Clear', 'aim-wf-clear', {}, 'sm ghost')}` : ''}</div></div>` : '';
-  const direct = d.gateway_enabled ? '' : `<p class="settings-notice">Workers call ${esc(d.gateway?.direct_label || 'the direct provider')} directly right now (Settings). These assignments apply when the LiteLLM route is on.</p>`;
+  const direct = d.gateway_enabled ? '' : aimDirectOpenRouter(d)
+    ? '<p class="settings-notice">Workers call OpenRouter directly right now. A worker assigned a model you added from OpenRouter uses it, with its OpenRouter backups; the others use the models in Settings. Escalation and failover need the LiteLLM route.</p>'
+    : `<p class="settings-notice">Workers call ${esc(d.gateway?.direct_label || 'the direct provider')} directly right now (Settings). These assignments apply when the LiteLLM route is on.</p>`;
   const table = rows ? `<div class="aim-wk-wrap"><table class="aim-workers"><colgroup><col class="c-worker"><col class="c-model"><col class="c-backups"><col class="c-status"><col class="c-act"></colgroup><thead><tr><th>Worker</th><th>Model</th><th>Backups</th><th>Health</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody>${rows}</tbody></table></div>` : `<div class="settings-empty"><strong>No workers match</strong>${btn('Clear', 'aim-wf-clear', {}, 'sm')}</div>`;
   return aimRequestSize() + aimPanel(settingsGroup('Workers', 'Pick the model each worker uses. Backups take over when it is rate limited or failing.', `${direct}${bar}${table}`));
 }
@@ -484,7 +486,12 @@ const AIM_MF = {
   health: ['Health', [['HEALTHY', 'Healthy', m => m.health_status === 'HEALTHY'], ['UNHEALTHY', 'Unhealthy', m => m.health_status === 'UNHEALTHY'], ['UNTESTED', 'Not tested', m => !AIM_HEALTH[m.health_status]]]],
   host: ['Runs', [['LOCAL', 'Local', m => m.hosting === 'LOCAL'], ['CLOUD', 'Cloud', m => m.hosting === 'CLOUD'], ['MIXED', 'Local + Cloud', m => m.hosting === 'MIXED']]],
   use: ['Use', [['USED', 'In use', m => (m.used_by || []).length > 0], ['UNUSED', 'Unused', m => !(m.used_by || []).length], ['OFF', 'Disabled', m => !m.enabled]]],
+  source: ['Source', [['LITELLM', 'LiteLLM', m => !!m.present_in_litellm], ['OPENROUTER', 'OpenRouter', m => m.source === 'OPENROUTER'], ['OTHER', 'Added here', m => !m.present_in_litellm && m.source !== 'OPENROUTER']]],
+  price: ['Price', [['FREE', 'Free', m => aimFree(m)], ['PAID', 'Paid or unknown', m => !aimFree(m)]]],
 };
+// OpenRouter's free models: its free router, and any ":free" variant (the free-only guard's own rule).
+const aimFree = m => m.provider === 'openrouter' && (/:free$/.test(m.underlying_model || '') || m.underlying_model === 'openrouter/free' || m.underlying_model === 'free');
+const aimDirectOpenRouter = d => !d.gateway_enabled && (d.gateway?.direct_provider || d.llm_provider) === 'openrouter';
 const AIM_MF_SORT = { catalog: ['Catalog order', () => 0], name: ['Name', (a, b) => a.name.localeCompare(b.name)], health: ['Health', (a, b) => aimHealthRank(a) - aimHealthRank(b) || a.name.localeCompare(b.name)],
   used: ['Most used', (a, b) => (b.used_by || []).length - (a.used_by || []).length || a.name.localeCompare(b.name)],
   latency: ['Fastest', (a, b) => (a.health_latency_ms ?? Infinity) - (b.health_latency_ms ?? Infinity) || a.name.localeCompare(b.name)] };
@@ -521,9 +528,13 @@ function aimModelsTab() {
   const list = all.filter(m => aimModelMatches(m, q, on, labels)).sort((AIM_MF_SORT[fv('aim-mf', 'sort', 'catalog')] || AIM_MF_SORT.catalog)[1]);
   const cards = list.map(m => aimModelCard(m, labels, d)).join('');
   const none = all.length && !list.length ? `<section class="card aim-mf-none"><div class="settings-empty"><strong>No models match</strong><p>${q ? `Nothing matches “${esc(q)}”${on.length ? ' with these filters' : ''}.` : 'No model fits these filters.'}</p>${btn('Clear filters', 'aim-mf-clear', {}, 'sm')}</div></section>` : '';
-  return `<div class="aim-section-head row between wrap gap10"><div><div class="card-title">Models</div><div class="card-sub">What LiteLLM serves. Values LiteLLM or Ollama do not report stay unknown.</div></div>
-      <div class="row gap8">${btn(isBusy('aim-sync') ? 'Syncing…' : 'Sync from LiteLLM', 'aim-sync', {}, 'primary sm', isBusy('aim-sync'))}${btn(AIM.adding ? 'Cancel' : 'Add local Ollama model', 'aim-add-toggle', {}, 'sm')}</div></div>
-    ${AIM.adding ? aimPanel(aimAddForm()) : ''}${all.length > 1 ? aimModelFilters(all, list.length, labels) : ''}${none}${cards ? `<div class="aim-grid">${cards}</div>` : none ? '' : `<section class="card"><div class="settings-empty"><strong>No models yet</strong><p>Connect LiteLLM in Settings, then sync to discover its models.</p></div></section>`}
+  const direct = aimDirectOpenRouter(d);
+  const litellm = btn(isBusy('aim-sync') ? 'Syncing…' : 'Sync from LiteLLM', 'aim-sync', {}, direct ? 'sm' : 'primary sm', isBusy('aim-sync'));
+  const openrouter = btn(AIM.orOpen ? 'Close OpenRouter' : 'Sync from OpenRouter', 'aim-or-toggle', {}, direct ? 'primary sm' : 'sm');
+  const sub = direct ? 'What you added from OpenRouter or LiteLLM serves. Values a source does not report stay unknown.' : 'What LiteLLM serves. Values LiteLLM or Ollama do not report stay unknown.';
+  return `<div class="aim-section-head row between wrap gap10"><div><div class="card-title">Models</div><div class="card-sub">${sub}</div></div>
+      <div class="row gap8 wrap">${direct ? openrouter + litellm : litellm + openrouter}${btn(AIM.adding ? 'Cancel' : 'Add local Ollama model', 'aim-add-toggle', {}, 'sm')}</div></div>
+    ${AIM.orOpen ? aimPanel(aimOpenRouterPanel()) : ''}${AIM.adding ? aimPanel(aimAddForm()) : ''}${all.length > 1 ? aimModelFilters(all, list.length, labels) : ''}${none}${cards ? `<div class="aim-grid">${cards}</div>` : none ? '' : `<section class="card"><div class="settings-empty"><strong>No models yet</strong><p>Sync from OpenRouter to choose its models, or connect LiteLLM in Settings and sync to discover what it serves.</p></div></section>`}
     ${aimRemoved()}${aimTiers()}`;
 }
 /* ── a model card: who it is, how it is doing, what it can do, who uses it ── */
@@ -549,7 +560,7 @@ function aimModelCard(m, labels, d) {
   const sub = [m.provider || 'provider unknown', m.underlying_model && m.underlying_model !== m.name ? m.underlying_model : ''].filter(Boolean).join(' · ');
   const caps = AIM_CAPS.map(([n, key, icon]) => { const v = m[key]; return `<span class="aim-cap ${v === true ? 'yes' : v === false ? 'no' : 'unk'}" title="${attr(`${n}: ${aimYes(v)}`)}"><i aria-hidden="true">${icon}</i>${n}<b aria-hidden="true">${v === true ? '✓' : v === false ? '✗' : '?'}</b></span>`; }).join('');
   const stat = (k, v, hint = '') => `<div><dt>${k}</dt><dd>${v}${hint ? `<small>${hint}</small>` : ''}</dd></div>`;
-  const tags = [aimHostTag(m.name), m.managed ? pill('Managed', 'brand') : '', m.present_in_litellm ? '' : pill('Not in LiteLLM', 'warn'), m.enabled ? '' : pill('Disabled', 'muted'), m.model_type && m.model_type !== 'CUSTOM' ? pill(m.model_type.replace('_', ' ').toLowerCase(), 'plain') : ''].join('');
+  const tags = [aimHostTag(m.name), m.managed ? pill('Managed', 'brand') : '', m.source === 'OPENROUTER' ? pill('OpenRouter', 'brand') : '', m.present_in_litellm || (m.source === 'OPENROUTER' && !d.gateway_enabled) ? '' : pill('Not in LiteLLM', 'warn'), m.enabled ? '' : pill('Disabled', 'muted'), m.model_type && m.model_type !== 'CUSTOM' ? pill(m.model_type.replace('_', ' ').toLowerCase(), 'plain') : ''].join('');
   const more = open ? `<div class="aim-mcard-more"><label class="field" for="aim-type-${attr(m.name)}"><span>Type</span><select class="select" id="aim-type-${attr(m.name)}" data-act-change="aim-model-type" data-name="${attr(m.name)}">${(d.options?.model_types || []).map(t => aimOpt(t, t.replace('_', ' ').toLowerCase(), m.model_type)).join('')}</select></label>${m.model_type === 'EMBEDDING' ? `<label class="field" for="aim-dims-${attr(m.name)}"><span>Vector size (dimensions)</span><input class="input" type="number" min="1" max="65536" id="aim-dims-${attr(m.name)}" value="${attr(m.embedding_dimensions ?? '')}" placeholder="${attr(m.discovered?.embedding_dimensions ? `Discovered: ${m.discovered.embedding_dimensions}` : 'Unknown — run Test')}" data-act-change="aim-model-dims" data-name="${attr(m.name)}"></label>` : ''}${m.managed ? btn('Stop managing', 'aim-model-unmanage', { name: m.name }, 'sm') : ''}${btn(isBusy('aim-model-remove') ? 'Deleting…' : 'Delete model', 'aim-model-remove', { name: m.name, managed: m.managed ? '1' : '' }, 'sm danger', isBusy('aim-model-remove'))}</div>` : '';
   const refs = AIM.refs?.[m.name];
   return `<article class="card aim-mcard ${m.enabled ? '' : 'off'}" style="--h:${aimHue(m.name)}" data-model="${attr(m.name)}" tabindex="-1">
@@ -595,6 +606,57 @@ function aimRemoved() {
   if (!list.length) return '';
   const rows = list.map(r => `<div class="row between gap10" style="padding:6px 0"><span><span class="mono">${esc(r.name)}</span> <span class="xs muted">removed ${esc(fmtDateTime(r.removed_at))}</span></span>${btn(isBusy('aim-model-restore') ? 'Restoring…' : 'Restore', 'aim-model-restore', { name: r.name }, 'sm', isBusy('aim-model-restore'))}</div>`).join('');
   return aimPanel(settingsDetails('aim-removed', `Removed models (${list.length})`, `<p class="settings-help">Removed from Job Hunt OS; a sync does not bring them back. A model LiteLLM serves on its own is still there.</p>${rows}`));
+}
+/* ── Sync from OpenRouter: choose the top models by a ranking and must-haves, then add the ones picked ── */
+const AIM_OR_RANKS = { cheapest: 'Cheapest', context: 'Largest context', newest: 'Newest', quality: 'Quality (benchmarks)' };
+const AIM_OR_NEEDS = [['free', 'Free only'], ['structured', 'JSON output'], ['tools', 'Tools'], ['reasoning', 'Reasoning'], ['vision', 'Vision'], ['hide_in_catalog', 'Hide ones I have']];
+const AIM_OR_KEY = 'jobhunt.aim.openrouter';
+const AIM_OR_DEFAULT = { rank: 'cheapest', limit: '10', structured: true };
+function aimOrCriteria() {
+  const f = { ...AIM_OR_DEFAULT, ...(S.forms['aim-or'] || {}) };
+  const out = { rank: f.rank || 'cheapest', limit: String(Math.max(1, Math.min(50, Number(f.limit) || 10))) };
+  for (const [key] of AIM_OR_NEEDS) if (f[key]) out[key] = 'true';
+  if (Number(f.min_context) > 0) out.min_context = String(Math.round(Number(f.min_context)));
+  if (f.max_price !== undefined && f.max_price !== '' && Number(f.max_price) >= 0) out.max_price = String(Number(f.max_price));
+  return out;
+}
+function aimOrRestore() {
+  if (S.forms['aim-or']) return;
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem(AIM_OR_KEY) || 'null'); } catch { saved = null; }
+  S.forms['aim-or'] = { ...AIM_OR_DEFAULT, ...(saved && typeof saved === 'object' ? saved : {}) };
+}
+function aimOrRemember() {
+  try { localStorage.setItem(AIM_OR_KEY, JSON.stringify(S.forms['aim-or'] || {})); } catch { /* a private window: nothing to remember */ }
+}
+const aimPrice = n => n == null ? 'unknown' : n === 0 ? 'free' : `$${n < 1 ? n.toFixed(2) : n.toFixed(n < 10 ? 1 : 0)}`;
+function aimOpenRouterPanel() {
+  const f = { ...AIM_OR_DEFAULT, ...(S.forms['aim-or'] || {}) }, r = AIM.or, ranks = r?.ranks || ['cheapest', 'context', 'newest'];
+  const rank = `<label class="field" for="aim-or-rank"><span>Rank by</span><select class="select" id="aim-or-rank" data-form="aim-or" data-field="rank">${ranks.map(k => aimOpt(k, AIM_OR_RANKS[k] || k, f.rank)).join('')}</select></label>`;
+  const count = `<label class="field" for="aim-or-limit"><span>How many</span>${inputF('aim-or', 'limit', f.limit, 'type="number" min="1" max="50"')}</label>`;
+  const ctx = `<label class="field" for="aim-or-min_context"><span>Minimum context (tokens)</span>${inputF('aim-or', 'min_context', '', 'type="number" min="0" step="1000" placeholder="Any"')}</label>`;
+  const price = `<label class="field" for="aim-or-max_price"><span>Max price ($ per 1M tokens)</span>${inputF('aim-or', 'max_price', '', 'type="number" min="0" step="0.1" placeholder="Any"')}</label>`;
+  const needs = `<div class="row gap12 wrap" role="group" aria-label="Must have">${AIM_OR_NEEDS.map(([key, text]) => checkF('aim-or', key, f[key], text)).join('')}</div>`;
+  const loadingNow = isBusy('aim-or-preview');
+  const head = `<div class="row between wrap gap8"><p class="settings-help" style="margin:0">Pick what matters, preview the top models from OpenRouter’s list, and add the ones you want. Only what OpenRouter states counts: a model that does not say it supports something does not pass that filter.</p></div>`;
+  const actions = `<div class="row gap8 wrap">${btn(loadingNow ? 'Finding…' : 'Preview top models', 'aim-or-preview', {}, 'primary sm', loadingNow)}${r ? btn('Refresh list', 'aim-or-preview', { refresh: '1' }, 'sm ghost', loadingNow) : ''}</div>`;
+  return `<div class="settings-group aim-or">${head}<div class="settings-grid">${rank}${count}${ctx}${price}</div>${needs}${actions}${r ? aimOrResults(r) : ''}</div>`;
+}
+function aimOrResults(r) {
+  if (!r.models.length) return `<div class="settings-empty"><strong>No OpenRouter model fits</strong><p>None of the ${r.listed} models OpenRouter lists meet these must-haves. Loosen one and preview again.</p></div>`;
+  const picked = AIM.orPicked || new Set();
+  const rows = r.models.map(m => {
+    const id = m.model_id, caps = [['JSON', m.structured_output], ['tools', m.tools], ['reasoning', m.reasoning], ['vision', m.vision]].filter(([, v]) => v).map(([n]) => pill(n, 'plain')).join('');
+    return `<tr data-or-model="${attr(id)}"><td><input type="checkbox" data-act-change="aim-or-pick" data-id="${attr(id)}" ${picked.has(id) ? 'checked' : ''} aria-label="Add ${attr(m.name || id)}"></td>
+      <td><div class="b">${esc(m.name || id)}</div><div class="xs muted mono">${esc(id)}</div></td>
+      <td class="nowrap">${esc(aimPrice(m.input_per_million))} / ${esc(aimPrice(m.output_per_million))}</td>
+      <td class="nowrap">${esc(aimTokens(m.context_window))}</td>
+      <td><div class="row gap4 wrap">${m.free ? pill('Free', 'good') : ''}${caps}${m.in_catalog ? pill('In catalog', 'muted') : ''}</div></td></tr>`;
+  }).join('');
+  const n = r.models.filter(m => picked.has(m.model_id)).length;
+  return `<p class="small muted mt10" role="status">Top ${r.models.length} of ${r.matching} matching · ${r.listed} listed by OpenRouter</p>
+    <div class="aim-wk-wrap"><table class="aim-or-table"><thead><tr><th><span class="sr-only">Add</span></th><th>Model</th><th>Price in / out (1M)</th><th>Context</th><th>Has</th></tr></thead><tbody>${rows}</tbody></table></div>
+    <div class="row gap8 wrap mt10">${btn(isBusy('aim-or-add') ? 'Adding…' : `Add ${n} model${n === 1 ? '' : 's'}`, 'aim-or-add', {}, 'primary sm', !n || isBusy('aim-or-add'))}<span class="settings-help">Added models start unassigned: pick them for a tier or worker. Free models can still be rate limited by OpenRouter.</span></div>`;
 }
 function aimAddForm() {
   const o = AIM.ollama, local = (o?.models || []).map(m => aimOpt(m.name, `${m.name}${m.context_length ? ` · ${aimTokens(m.context_length)} ctx` : ''}`, fv('aim-add', 'ollama_model', ''))).join('');
@@ -789,6 +851,31 @@ const AI_MODELS_ACTIONS = {
   'aim-mf-chip': el => { const c = el.dataset.chip, on = aimMfOn(); setF('aim-mf', 'on', on.includes(c) ? on.filter(x => x !== c) : [...on, c]); render(); },
   'aim-mf-clear': () => { setF('aim-mf', 'q', ''); setF('aim-mf', 'on', []); render(); },
   'aim-model-more': el => { AIM.more = { ...(AIM.more || {}), [el.dataset.name]: !AIM.more?.[el.dataset.name] }; render(); },
+  'aim-or-toggle': () => {
+    AIM.orOpen = !AIM.orOpen;
+    if (!AIM.orOpen) { render(); return; }
+    aimOrRestore(); render();
+    if (!AIM.or) return AI_MODELS_ACTIONS['aim-or-preview']({ dataset: {} });
+  },
+  'aim-or-preview': el => busy('aim-or-preview', async () => {
+    const query = new URLSearchParams({ ...aimOrCriteria(), ...(el?.dataset?.refresh ? { refresh: 'true' } : {}) });
+    AIM.or = await api(`/api/settings/ai/openrouter/models?${query}`);
+    AIM.orPicked = new Set(AIM.or.models.filter(m => !m.in_catalog).map(m => m.model_id));
+    aimOrRemember();
+  }),
+  'aim-or-pick': el => {
+    const picked = AIM.orPicked || new Set();
+    if (el.checked) picked.add(el.dataset.id); else picked.delete(el.dataset.id);
+    AIM.orPicked = picked; render();
+  },
+  'aim-or-add': () => {
+    const ids = (AIM.or?.models || []).map(m => m.model_id).filter(id => AIM.orPicked?.has(id));
+    if (!ids.length) return;
+    return aimSave('aim-or-add', async () => {
+      AIM.tests.orSync = await api('/api/settings/ai/models/sync-openrouter', { method: 'POST', body: { ids } });
+      AIM.orOpen = false; AIM.or = null; AIM.orPicked = null;
+    }, () => { const s = AIM.tests.orSync || {}; const n = s.added?.length || 0; return `${n} OpenRouter model${n === 1 ? '' : 's'} added${s.facts_changed ? ', details refreshed' : ''}`; });
+  },
   'aim-add-toggle': async () => { AIM.adding = !AIM.adding; render(); if (AIM.adding && !AIM.ollama) { AIM.ollama = await api('/api/settings/ai/ollama').catch(() => ({ reachable: false, models: [] })); render(); } },
   'aim-add': () => {
     const f = S.forms['aim-add'] || {};

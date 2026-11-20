@@ -178,9 +178,14 @@ def _unwrap_headers(rows: list[LineInfo]) -> tuple[list[LineInfo], list[str]]:
     return kept, texts
 
 
+_MD_HEADING = re.compile(r"^#{1,6}\s+")
+
+
 def _experience(infos: list[LineInfo]) -> list[str]:
     out: list[str] = []
     rows, texts = _unwrap_headers([i for i in infos if i.text.strip()])
+    # A text resume already written with "### " role headers (this app's own export, a Markdown file) is marked once.
+    texts = [_MD_HEADING.sub("", t) for t in texts]
     company = location = ""
     body: list[tuple[str, bool]] = []
 

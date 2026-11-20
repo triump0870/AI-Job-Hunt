@@ -157,6 +157,9 @@ class LLMCall:
     worker_type: str | None = None
     resolved: Any = None
     escalate: bool = False
+    # Direct OpenRouter route chosen by the caller (a model or worker test: model_resolution.DirectRoute); real
+    # requests leave it None and the route comes from the active configuration.
+    direct: Any = None
     # Set by the LLM layer: the prompt's output contract, schema corrections used, and whether escalation is off
     # (a correction retry is never escalated again).
     contract: Any = None
@@ -224,6 +227,8 @@ class Attempt:
     queue_wait_ms: int | None = None
     gateway_overhead_ms: int | None = None
     service_tier: str | None = None
+    # Direct OpenRouter route: the worker's backups as OpenRouter ids, sent as OpenRouter's own fallbacks. Not stored.
+    backup_models: tuple[str, ...] = ()
 
 
 _sessions: Callable[[], Session] | None = None

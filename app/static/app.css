@@ -704,7 +704,7 @@ p.settings-help{margin:10px 0}
 .rd-chip:hover .rd-item-actions,.rd-chip:focus-within .rd-item-actions{max-width:90px;opacity:1}
 @media (hover:none){.rd-chip .rd-item-actions{max-width:none;opacity:1}}
 .rd-item-head .rd-item-actions,.rd-bullet .rd-item-actions{margin-left:auto;flex-shrink:0}
-.rd-option-help{margin:2px 0 0 24px}
+.rd-project-image{width:56px;height:56px;object-fit:cover;border-radius:8px;border:1px solid var(--line);flex:none}
 .rd-sections>summary{gap:12px}
 .rd-sec-sum{display:inline-flex;align-items:center;gap:8px;font-size:13px;flex-wrap:wrap}
 .rd-sec-sum em{font-style:normal;font-size:12px;font-weight:500}
@@ -847,6 +847,12 @@ p.settings-help{margin:10px 0}
 .aim-fix:hover{color:var(--ink,inherit)}
 .aim-wk-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:14px;background:#fff}
 .aim-workers{width:100%;border-collapse:collapse;font-size:13px}
+.aim-or{display:flex;flex-direction:column;gap:12px}
+.aim-or-table{width:100%;border-collapse:collapse;font-size:13px}
+.aim-or-table th{text-align:left;font-size:10.5px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--caps);background:var(--softer);padding:8px 10px;border-bottom:1px solid var(--line)}
+.aim-or-table td{vertical-align:middle;padding:9px 10px;border-bottom:1px solid var(--line2)}
+.aim-or-table tbody tr:last-child td{border-bottom:0}
+.aim-or-table td:first-child{width:28px}
 .aim-workers thead th{position:sticky;top:0;text-align:left;font-size:10.5px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--caps);background:var(--softer);padding:10px;border-bottom:1px solid var(--line)}
 .aim-workers td{vertical-align:middle;padding:11px 10px;border-bottom:1px solid var(--line2)}
 .aim-workers td:first-child,.aim-workers th:first-child{padding-left:16px}.aim-workers td:last-child,.aim-workers th:last-child{padding-right:16px}

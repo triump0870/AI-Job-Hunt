@@ -118,12 +118,13 @@ FIELDS: dict[str, tuple[Field, ...]] = {
                        Field("ai_only", "Structure uploads with AI only",
                              "On: a new upload goes straight to the Resume Parser model (ahead of the queue, even "
                              "while paused), and its data is shown once the model is done. The quick regex parse is "
-                             "kept only as the fallback when the model cannot answer.", "bool", False),
+                             "kept only as the fallback when the model cannot answer. Follows the server "
+                             "(RESUME_UPLOAD_AI_ONLY, on) until you change it.", "bool", "resume_upload_ai_only"),
                        Field("extraction_v2", "Read PDF uploads with the new reader",
                              "Reads the text a PDF states for ligatures (\"Kafka\", not \"Kaga\"), joins words a "
                              "line break split, and checks how far the text can be trusted. Applies to new uploads; "
-                             "off, PDFs are read as before. Follows the server (RESUME_EXTRACTION_V2) until you "
-                             "change it.", "bool", "resume_extraction_v2")),
+                             "off, PDFs are read as before. Follows the server (RESUME_UPLOAD_READER_V2, on) until you "
+                             "change it.", "bool", "resume_upload_reader_v2")),
     "tailoring": (AUTO,
                   Field("max_attempts", "Attempts per packet",
                         "How often an interrupted tailoring run is restarted before it is marked failed.", "int", 2,

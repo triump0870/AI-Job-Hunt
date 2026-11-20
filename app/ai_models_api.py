@@ -9,14 +9,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.auth import CurrentUser, current_user, get_user_db
 from app.security import SecretsUnavailable
 from app.services import ai_model_config as config
-from app.services import ai_registry
+from app.services import ai_registry, model_market
 from app.services.external_api import RateLimitedCooldown
 from app.services.litellm_client import ollama_tags
 from app.services.user_settings import lock_settings_row, settings_for
@@ -202,6 +202,29 @@ def models_list(db: Session = Depends(get_user_db)):
 @router.post("/models/sync")
 def models_sync(db: Session = Depends(get_user_db)):
     return _call(ai_registry.discover, db, require_user_id(db))
+
+
+@router.get("/openrouter/models")
+def openrouter_models(rank: str = "cheapest", limit: int = Query(10, ge=1, le=ai_registry.OPENROUTER_MAX_PICK),
+                      free: bool = False, structured: bool = False, tools: bool = False, reasoning: bool = False,
+                      vision: bool = False, min_context: int | None = Query(None, ge=0),
+                      max_price: float | None = Query(None, ge=0), hide_in_catalog: bool = False,
+                      refresh: bool = False, db: Session = Depends(get_user_db)):
+    """The top OpenRouter models for the chosen criteria, to pick from before adding them. Adds nothing."""
+    criteria = model_market.PickCriteria(
+        rank=rank, limit=limit, free=free, structured=structured, tools=tools, reasoning=reasoning, vision=vision,
+        min_context=min_context or None, max_price=max_price, hide_in_catalog=hide_in_catalog)
+    return _call(ai_registry.openrouter_candidates, db, require_user_id(db), criteria, refresh=refresh)
+
+
+class OpenRouterSyncIn(BaseModel):
+    ids: list[str] = Field(default_factory=list, max_length=ai_registry.OPENROUTER_MAX_PICK)
+
+
+@router.post("/models/sync-openrouter")
+def models_sync_openrouter(payload: OpenRouterSyncIn, db: Session = Depends(get_user_db)):
+    """Add the chosen OpenRouter models to the catalog and refresh the OpenRouter models already in it."""
+    return _call(ai_registry.discover_openrouter, db, require_user_id(db), payload.ids)
 
 
 @router.get("/ollama")

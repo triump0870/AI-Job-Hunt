@@ -99,6 +99,7 @@ class MarketModel:
     active: bool | None = None  # the platform lists it as served right now
     description: str | None = None
     parameter_size: str | None = None
+    created: int | None = None  # when the platform first listed it (OpenRouter's `created`, epoch seconds)
     # Your gateway and your own requests
     in_gateway: bool = False
     gateway_names: list[str] = field(default_factory=list)
@@ -211,7 +212,8 @@ def parse_openrouter(body: Any) -> list[MarketModel]:
             else False,
             tools=("tools" in params) if params else None, reasoning=("reasoning" in params) if params else None,
             vision=("image" in modalities) if isinstance(modalities, list) else None,
-            active=True, description=_text(item.get("description")), sources=["openrouter"]))
+            active=True, description=_text(item.get("description")), created=_int(item.get("created")),
+            sources=["openrouter"]))
     return out
 
 
@@ -402,6 +404,70 @@ def attach_benchmarks(rows: Iterable[MarketModel], benchmarks: dict[str, Benchma
         row.quality_index, row.tokens_per_second, row.ttft_seconds = (
             bench.quality_index, bench.tokens_per_second, bench.ttft_seconds)
         row.sources.append(f"artificial_analysis:{base_name(row.model_id)}")
+
+
+# ───────────── choosing models to add (Sync from OpenRouter) ─────────────
+
+@dataclass(frozen=True)
+class PickCriteria:
+    """How to pick OpenRouter models before adding them: one ranking, some must-haves, and how many."""
+
+    rank: str = "cheapest"
+    limit: int = 10
+    free: bool = False
+    structured: bool = False
+    tools: bool = False
+    reasoning: bool = False
+    vision: bool = False
+    min_context: int | None = None
+    max_price: float | None = None  # $ per million tokens, input and output averaged
+    hide_in_catalog: bool = False
+
+
+def average_price(row: MarketModel) -> float | None:
+    if row.input_per_million is None or row.output_per_million is None:
+        return None
+    return (row.input_per_million + row.output_per_million) / 2
+
+
+def _pick_matches(row: MarketModel, c: PickCriteria) -> bool:
+    """Only what OpenRouter states counts: an unknown capability or price never passes a must-have."""
+    if c.free and row.free is not True:
+        return False
+    if any(want and getattr(row, name) is not True for want, name in (
+            (c.structured, "structured_output"), (c.tools, "tools"), (c.reasoning, "reasoning"),
+            (c.vision, "vision"))):
+        return False
+    if c.min_context and (row.context_window or 0) < c.min_context:
+        return False
+    if c.max_price is not None:
+        price = average_price(row)
+        if price is None or price > c.max_price:
+            return False
+    return True
+
+
+def _pick_order(row: MarketModel, rank: str) -> tuple[Any, ...]:
+    """Best first; a figure OpenRouter does not state sorts last; ties go by id, so the order is stable."""
+    if rank == "cheapest":
+        price = average_price(row)
+        return (price is None, price or 0.0, row.model_id)
+    if rank == "context":
+        return (row.context_window is None, -(row.context_window or 0), row.model_id)
+    if rank == "newest":
+        return (row.created is None, -(row.created or 0), row.model_id)
+    return (row.quality_index is None, -(row.quality_index or 0.0), row.model_id)
+
+
+def pick_top(rows: list[MarketModel], c: PickCriteria, in_catalog: set[str], *,
+             max_pick: int = 50) -> tuple[list[dict[str, Any]], int]:
+    """The best `c.limit` rows for the criteria (list prices reported for choosing, never a recorded cost), each with
+    whether the account already has it; and how many matched in all."""
+    matching = [row for row in rows if _pick_matches(row, c) and not (c.hide_in_catalog and row.model_id in in_catalog)]
+    matching.sort(key=lambda row: _pick_order(row, c.rank))
+    limit = max(1, min(max_pick, int(c.limit or 10)))
+    return ([{**row.public(), "average_per_million": average_price(row), "in_catalog": row.model_id in in_catalog}
+             for row in matching[:limit]], len(matching))
 
 
 # ───────────── fetching (cached) ─────────────
