@@ -146,8 +146,8 @@ def save_reviewed(db: Session, insight: JobInsight, job: Job, qid: str, answer: 
                               answer_type="text", source_job_id=job.id)
         db.add(row)
     row.answer, row.verified, row.sensitive = answer, True, bool(row.sensitive) or sensitive
-    if row.source_job_id is None:
-        row.source_job_id = job.id
+    if row.source_job_id is None or knowledge.job_specific(question):
+        row.source_job_id = job.id  # a "why this company" answer is now this job's (knowledge.fits_job)
     db.flush()
     from app.services import application_execution
 
@@ -206,7 +206,7 @@ CLOSEST_LABEL = "Draft from your closest experience — check it fits before you
 
 
 def before_model(db: Session, qid: str, question: str, origin: str,
-                 pending: set[str] | None = None) -> dict[str, Any] | None:
+                 pending: set[str] | None = None, job_id: int | None = None) -> dict[str, Any] | None:
     """What the person's own data settles without a model: a verified saved answer (or a contact detail from the
     profile), a sensitive saved answer, or a personal question. A question already waiting in the Answer library is
     not settled: it still gets a draft (its id goes into `pending`), and saving that draft answers the waiting row."""
@@ -217,6 +217,11 @@ def before_model(db: Session, qid: str, question: str, origin: str,
     if status == "ANSWERED":
         source = found.get("answer_source") or ""
         knowledge_id = int(source.split(":", 1)[1]) if source.startswith("knowledge_answer:") else None
+        row = db.get(KnowledgeAnswer, knowledge_id) if knowledge_id else None
+        if row is not None and job_id is not None and not knowledge.fits_job(row, job_id):
+            if pending is not None:
+                pending.add(qid)  # drafted for this job; saving the draft makes the saved answer this job's
+            return None
         return _item(qid, question, origin, LIBRARY, answer=found["answer"], answer_source=source,
                      knowledge_answer_id=knowledge_id,
                      reason=None if knowledge_id else "From your profile")
@@ -238,8 +243,11 @@ def known_answers(db: Session, user_id: int) -> list[dict[str, Any]]:
         KnowledgeAnswer.user_id == user_id, KnowledgeAnswer.verified.is_(True), KnowledgeAnswer.sensitive.is_(False),
         KnowledgeAnswer.category.not_in(PERSONAL_KNOWLEDGE))
         .order_by(desc(KnowledgeAnswer.use_count), KnowledgeAnswer.id).limit(MAX_KNOWN_ANSWERS * 3)).all()
+    from app.services.knowledge import job_specific
+
+    # A "why this company" answer is about one employer: the model never sees another job's as material.
     out = [{"id": r.id, "question": r.question[:300], "answer": r.answer[:800]} for r in rows
-           if (r.answer or "").strip() and not personal(r.question)]
+           if (r.answer or "").strip() and not personal(r.question) and not job_specific(r.question)]
     return out[:MAX_KNOWN_ANSWERS]
 
 
@@ -406,7 +414,7 @@ def draft(db: Session, client: Any, job: Job, *, attempt: int, ctx: dict[str, An
     ask: list[dict[str, str]] = []
     waiting: set[str] = set()
     for n, q in enumerate(pasted, start=1):
-        early = before_model(db, q["id"], q["question"], FORM, waiting)
+        early = before_model(db, q["id"], q["question"], FORM, waiting, job.id)
         if early is not None:
             settled[q["id"]] = early
         else:
@@ -471,7 +479,7 @@ def draft(db: Session, client: Any, job: Job, *, attempt: int, ctx: dict[str, An
                     if question_id(FORM, item.form_question) in seen or qid in seen:
                         continue
                     seen.add(qid)
-                    predicted_items.append(before_model(db, qid, item.form_question, PREDICTED, waiting) or after_model(
+                    predicted_items.append(before_model(db, qid, item.form_question, PREDICTED, waiting, job.id) or after_model(
                         db, job, profile, item, qid=qid, question=item.form_question, origin=PREDICTED,
                         requirement_labels=ctx["requirements"], evidence_labels=evidence_labels,
                         resume_facts=resume_facts, waiting=qid in waiting))

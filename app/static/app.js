@@ -8,7 +8,7 @@ const attr = esc;
 
 /* ───────────── state ───────────── */
 // Filters on the Tailor and Approvals screens, sent to /api/tailor/queue and /api/approvals.
-function pfDefaults(kind) { return { q: '', min_fit: 0, max_fit: 0, min_review: 0, max_review: 0, board: 'all', location: 'all', status: 'all', ...(kind === 'approvals' ? { easy_apply: 'all', work_mode: 'all' } : {}), sort: kind === 'tailor' ? 'fit' : 'default' }; }
+function pfDefaults(kind) { return { q: '', min_fit: 0, max_fit: 0, min_review: 0, max_review: 0, board: 'all', location: 'all', status: 'all', ...(kind === 'approvals' ? { easy_apply: 'all', work_mode: 'all', salary: 'all' } : {}), sort: kind === 'tailor' ? 'fit' : 'default' }; }
 // Discovery table filters, sent to /api/jobs/search. The date filter is one of: within (last N), older_than, a
 // date_from–date_to range, or posted_unknown (Posted only); date_field says which date they look at.
 const DEFAULT_FILTERS = { q: '', min_fit: 0, max_fit: 0, board: 'all', location: 'all', stage: 'all', description: 'all', domain: 'matching',
@@ -27,6 +27,9 @@ function storedFilters() {
     return freshFilters(kept);
   } catch { return freshFilters(); }
 }
+// A per-browser preference (the Approvals queue collapsed). Storage may be unavailable: then it is simply not kept.
+function storedFlag(key) { try { return localStorage.getItem(`jh:${key}`) === '1'; } catch { return false; } }
+function storeFlag(key, on) { try { localStorage.setItem(`jh:${key}`, on ? '1' : '0'); } catch { /* not kept */ } }
 const S = {
   screen: 'overview', knowledgeSection: 'answers', settingsSection: 'profile', todayVariant: 'focus', discMode: 'triage',
   filters: storedFilters(), datePop: false, dateMode: null, moreFilters: false,
@@ -36,7 +39,7 @@ const S = {
   kitJob: null, tailorJob: null, tailorTab: 'diff', editing: null,
   tailorMode: 'single', tailorChecked: new Set(), tailorRegenerate: false, tailorPages: '',  // '' = the default length in Settings
   pf: { tailor: pfDefaults('tailor'), approvals: pfDefaults('approvals') },
-  approvalJob: null, approvalPicked: new Set(), approvalLast: null, dupOpen: new Set(), revising: null, apprTab: 'resume', apprFull: false, apprKeys: false, roleGapsAll: false, bulkRejecting: false, rejecting: null, overriding: null, selApp: null, trackerView: 'board', trackerArchive: null, showArchived: false, addingStage: false, tf: { q: '', location: 'all', min_fit: 0 }, rf: { q: '', location: 'all' }, runSel: null, setupSel: null,
+  approvalJob: null, approvalPicked: new Set(), approvalLast: null, dupOpen: new Set(), revising: null, apprTab: 'resume', apprFull: false, apprEditing: null, pendingApprove: null, apprNotes: null, apprFocus: false, apprQueueHidden: storedFlag('appr-queue-hidden'), pfOpen: null, apprKeys: false, roleGapsAll: false, bulkRejecting: false, rejecting: null, overriding: null, selApp: null, trackerView: 'board', trackerArchive: null, showArchived: false, addingStage: false, tf: { q: '', location: 'all', min_fit: 0 }, rf: { q: '', location: 'all' }, runSel: null, setupSel: null,
   scheduling: false, editingRecruiter: false, recruiterDraft: [], ivDraft: null, manualMissing: null,
   polling: null, busy: {}, forms: {}, apifyImport: false, importPick: new Set(), autoRefreshed: false,
 };
@@ -465,7 +468,7 @@ function renderTop() {
   return `<div class="top-row"><div><h1>${esc(title)}</h1><div class="sub">${esc(sub)}</div></div>
     <div class="row gap8 wrap">${seg ? `<div class="seg">${seg}</div>` : ''}
       <button class="btn" data-act="palette">Search · ⌘K</button>
-      ${S.screen === 'settings' ? '' : '<button class="btn primary" data-act="go" data-screen="discovery" data-mode="setup">New search</button>'}</div></div>`;
+      ${S.screen === 'settings' ? '' : `<button class="btn ${S.screen === 'approvals' ? '' : 'primary'}" data-act="go" data-screen="discovery" data-mode="setup">New search</button>`}</div></div>`;
 }
 
 /* ───────────── overview ───────────── */
@@ -920,6 +923,7 @@ function activeFilters(j) {
   if (f.location && f.location !== 'all') add(['location'], name(locationOptions(j.locations), f.location), true);
   if (f.domain && f.domain !== 'matching') add(['domain'], f.domain === 'all' ? 'Any domain' : 'Not matching', true);
   if (f.description && f.description !== 'all') add(['description'], name(j.description_states || [], f.description), true);
+  if (f.salary === 'only') add(['salary'], 'Salary listed');
   if (f.work_mode && f.work_mode !== 'all') add(['work_mode'], WORK_MODE_NAMES[f.work_mode] || f.work_mode, true);
   if (f.job_type && f.job_type !== 'all') add(['job_type'], titleCase(f.job_type), true);
   if (f.setup_id) add(['setup_id'], `Setup: ${name(j.setups || [], f.setup_id)}`, true);
@@ -1201,7 +1205,7 @@ const PF_STATUS = {
 };
 const PF_SORT = {
   tailor: [['fit', 'Sort: best fit'], ['reviewer', 'Sort: reviewer score'], ['new', 'Sort: newest'], ['company', 'Sort: company']],
-  approvals: [['default', 'Sort: waiting first'], ['reviewer', 'Sort: reviewer score'], ['fit', 'Sort: best fit'], ['new', 'Sort: newest'], ['company', 'Sort: company']],
+  approvals: [['default', 'Sort: waiting first'], ['reviewer', 'Sort: reviewer score'], ['fit', 'Sort: best fit'], ['posted', 'Sort: posted most recently'], ['new', 'Sort: found most recently'], ['company', 'Sort: company']],
 };
 const PF_MODES = [['all', 'Any work mode'], ['remote', 'Remote'], ['hybrid', 'Hybrid'], ['onsite', 'On-site'], ['not_stated', 'Work mode not stated']];
 const pfActive = kind => JSON.stringify(S.pf[kind]) !== JSON.stringify(pfDefaults(kind));
@@ -1264,24 +1268,40 @@ function renderPacketFilters(kind, facets) {
   const pillSel = (key, list, label, on) => `<select class="select filter-pill ${on ? 'on' : ''}" id="pf-${kind}-${key}" data-pf="${kind}" data-pfkey="${key}" aria-label="${attr(label)}">${opts(list, f[key])}</select>`;
   const status = f.status || 'all';
   const shown = facets.total === facets.total_all ? `${facets.total_all} job${facets.total_all === 1 ? '' : 's'}` : `${facets.total} of ${facets.total_all} jobs`;
-  return `<section class="card flush filterbar packet-filters">
-    <div class="toolbar filter-find">
-      <input class="input grow filter-search" id="pf-${kind}-q" data-pf="${kind}" data-pfkey="q" value="${attr(f.q)}" placeholder="Search title, company or location…" aria-label="Search jobs">
-      <select class="select" id="pf-${kind}-sort" data-pf="${kind}" data-pfkey="sort" aria-label="Sort">${opts(PF_SORT[kind], f.sort)}</select>
-    </div>
-    <div class="pf-status" role="tablist" aria-label="Status">${PF_STATUS[kind].map(([k, t]) => `<button type="button" role="tab" class="pf-tab ${status === k ? 'on' : ''}" aria-selected="${status === k}" data-act="pf-status" data-kind="${kind}" data-status="${k}">${esc(k === 'all' ? 'All' : t)}${counts[k] === undefined ? '' : `<span class="pf-tab-count">${counts[k]}</span>`}</button>`).join('')}</div>
-    <div class="filter-pills">
-      ${rangePill(kind, 'fit', `pf-${kind}-fit`)}
+  const toggle = (key, text, title, count) => `<label class="filter-toggle ${f[key] === 'only' ? 'on' : ''}" title="${attr(title)}"><input type="checkbox" id="pf-${kind}-${key.replace('_', '-')}" data-pf="${kind}" data-pfkey="${key}" ${f[key] === 'only' ? 'checked' : ''}><span class="filter-toggle-mark" aria-hidden="true">✓</span>${text} <span class="pf-tab-count">${count || 0}</span></label>`;
+  const search = `<input class="input grow filter-search" id="pf-${kind}-q" data-pf="${kind}" data-pfkey="q" value="${attr(f.q)}" placeholder="Search title, company or location…" aria-label="Search jobs">`;
+  const sort = `<select class="select" id="pf-${kind}-sort" data-pf="${kind}" data-pfkey="sort" aria-label="Sort">${opts(PF_SORT[kind], f.sort)}</select>`;
+  const tabs = `<div class="pf-status" role="tablist" aria-label="Status">${PF_STATUS[kind].map(([k, t]) => `<button type="button" role="tab" class="pf-tab ${status === k ? 'on' : ''}" aria-selected="${status === k}" data-act="pf-status" data-kind="${kind}" data-status="${k}">${esc(k === 'all' ? 'All' : t)}${counts[k] === undefined ? '' : `<span class="pf-tab-count">${counts[k]}</span>`}</button>`).join('')}</div>`;
+  const pills = `${rangePill(kind, 'fit', `pf-${kind}-fit`)}
       ${rangePill(kind, 'review', `pf-${kind}-review`)}
       ${facets.boards?.length > 1 || f.board !== 'all' ? pillSel('board', [['all', 'All boards'], ...facets.boards.map(b => [b, b])], 'Board', f.board !== 'all') : ''}
       ${pillSel('location', locationOptions(facets.locations || [], facets.preferred_locations || []), 'Location', f.location !== 'all')}
       ${'work_mode' in f && facets.work_modes ? pillSel('work_mode', PF_MODES.map(([k, t]) => [k, k === 'all' ? t : `${t} (${facets.work_modes[k] || 0})`]), 'Work mode', f.work_mode !== 'all') : ''}
-      ${'easy_apply' in f && (facets.easy_apply || f.easy_apply === 'only') ? `<label class="filter-toggle ${f.easy_apply === 'only' ? 'on' : ''}" title="Only jobs you can apply to with Easy Apply"><input type="checkbox" id="pf-${kind}-easy-apply" data-pf="${kind}" data-pfkey="easy_apply" ${f.easy_apply === 'only' ? 'checked' : ''}><span class="filter-toggle-mark" aria-hidden="true">✓</span>Easy Apply only <span class="pf-tab-count">${facets.easy_apply || 0}</span></label>` : ''}
+      ${'salary' in f && (facets.with_salary || f.salary === 'only') ? toggle('salary', 'Salary listed', 'Only jobs whose posting states a salary', facets.with_salary) : ''}
+      ${'easy_apply' in f && (facets.easy_apply || f.easy_apply === 'only') ? toggle('easy_apply', 'Easy Apply only', 'Only jobs you can apply to with Easy Apply', facets.easy_apply) : ''}`;
+  const chipRow = chips.length || status !== 'all' ? `<div class="filter-chips" aria-label="Active filters">${chips.map(a => `<span class="chip">${esc(a.text)}<button type="button" aria-label="Remove filter ${attr(a.text)}" data-act="pf-clear" data-kind="${kind}" data-keys="${a.keys.join(',')}">×</button></span>`).join('')}<a href="#" class="xs" data-act="pf-reset" data-kind="${kind}">Clear all</a></div>` : '';
+  if (kind === 'approvals') {
+    // One row: search, status, a Filters popover holding every other filter, and sort. Active filters show as
+    // chips under it only when there are any.
+    const active = chips.filter(c => c.keys[0] !== 'q').length;
+    return `<section class="card flush filterbar packet-filters pf-compact">
+    <div class="pf-bar">${search}${tabs}
+      <div class="pf-pop-anchor"><button type="button" class="btn sm ${active ? 'soft' : ''}" data-act="pf-open" data-kind="${kind}" aria-expanded="${S.pfOpen === kind}" aria-haspopup="true">Filters${active ? ` <span class="pf-tab-count">${active}</span>` : ''} ▾</button>
+        ${S.pfOpen === kind ? `<div class="pf-pop" role="group" aria-label="Filters"><div class="filter-pills">${pills}</div>${rangeEditor(kind)}<div class="row between mt10"><span class="xs muted">${shown}</span><a href="#" class="xs" data-act="pf-open" data-kind="${kind}">Done</a></div></div>` : ''}</div>
+      ${sort}<span class="xs muted none pf-shown">${shown}</span></div>
+    ${chipRow}
+  </section>`;
+  }
+  return `<section class="card flush filterbar packet-filters">
+    <div class="toolbar filter-find">${search}${sort}</div>
+    ${tabs}
+    <div class="filter-pills">
+      ${pills}
       <span class="grow"></span>
       <span class="xs muted">${shown}</span>
     </div>
     ${rangeEditor(kind)}
-    ${chips.length || status !== 'all' ? `<div class="filter-chips" aria-label="Active filters">${chips.map(a => `<span class="chip">${esc(a.text)}<button type="button" aria-label="Remove filter ${attr(a.text)}" data-act="pf-clear" data-kind="${kind}" data-keys="${a.keys.join(',')}">×</button></span>`).join('')}<a href="#" class="xs" data-act="pf-reset" data-kind="${kind}">Clear all</a></div>` : ''}
+    ${chipRow}
   </section>`;
 }
 const pfNoMatch = kind => `<section class="card">${empty('No jobs match these filters', `${S.pf[kind].q ? `Nothing matches “${esc(S.pf[kind].q)}” with the current filters. ` : ''}Loosen or reset the filters to see all ${(kind === 'tailor' ? D.tailorFacets : D.approvalFacets).total_all}.`, btn('Reset filters', 'pf-reset', { kind }, 'primary'))}</section>`;
@@ -1508,7 +1528,7 @@ function renderJobAnswers(answers) {
 function renderApprovals() {
   const list = D.approvals; if (!list) return loading();
   if (!D.approvalFacets.total_all) return renderApprovalsBody(list);
-  return `<div class="stack">${renderPacketFilters('approvals', D.approvalFacets)}${renderApprovalBulkBar(list)}${list.length ? renderApprovalsBody(list) : pfNoMatch('approvals')}</div>`;
+  return `<div class="stack">${renderPacketFilters('approvals', D.approvalFacets)}${renderApprovalBulkBar(list)}${list.length ? renderApprovalsBody(list) : pfNoMatch('approvals')}${renderApproveUndo()}</div>`;
 }
 // Postings of one role (same company, same title) collapse into one row; "+N" opens the rest. The first is the one
 // with the best reviewer score. Picking a collapsed row picks every posting in it, so one decision covers them all.
@@ -1533,14 +1553,14 @@ function approvalRevisionPill(q) {
 function approvalRow(q, list, minScore, { extra = 0, child = false, open = false } = {}) {
   const ids = extra && !open ? groupIds(list, q) : [q.id];
   const on = ids.every(id => S.approvalPicked.has(id));
+  const line = [q.company, q.age, approvalRowFacts(q)].filter(Boolean).join(' · ');
   return `<div class="lrow click appr-row ${q.id === S.approvalJob ? 'sel' : ''} ${child ? 'appr-child' : ''}" data-act="select-approval" data-id="${q.id}">
     <span class="appr-check" data-act="approval-check" data-id="${q.id}" data-ids="${ids.join(',')}" role="checkbox" aria-checked="${on}" tabindex="0" aria-label="Select ${attr(q.title)}${ids.length > 1 ? ` and its ${ids.length - 1} other postings` : ''}"><input type="checkbox" tabindex="-1" ${on ? 'checked' : ''} aria-hidden="true"></span>
     ${starButton(q)}
-    <div class="grow" style="min-width:0"><div class="base b appr-title" title="${attr(q.title)}">${esc(q.title)}</div>
-      <div class="xs muted ellipsis" title="${attr(approvalRowFacts(q))}">${esc(q.company)} · ${esc(q.age)}</div>
-      ${approvalRowFacts(q) ? `<div class="xs faint ellipsis">${esc(approvalRowFacts(q))}</div>` : ''}
-      ${extra ? `<button type="button" class="linkish xs mt4" data-act="approval-dup-toggle" data-key="${attr(q.duplicate_key)}" aria-expanded="${open}">${open ? 'Hide' : `+${extra}`} other posting${extra === 1 ? '' : 's'} of this role</button>` : ''}</div>
-    <div class="col gap4" style="align-items:flex-end">${approvalRowScores(q, minScore)}<div class="row gap4 wrap end">${q.easy_apply ? pill('Easy Apply', 'brand') : ''}${q.approval_override ? pill('waived', 'warn') : ''}${approvalTaskPill(q)}${approvalRevisionPill(q)}${postingClosedPill(q)}</div></div></div>`;
+    <div class="grow" style="min-width:0"><div class="row gap6" style="min-width:0"><span class="small b appr-title" title="${attr(q.title)}">${esc(q.title)}</span>${extra ? `<button type="button" class="dup-chip" data-act="approval-dup-toggle" data-key="${attr(q.duplicate_key)}" aria-expanded="${open}" title="${open ? 'Hide' : 'Show'} the ${extra} other posting${extra === 1 ? '' : 's'} of this role">${open ? '−' : '+'}${extra}</button>` : ''}</div>
+      <div class="xs muted ellipsis" title="${attr(line)}">${esc(line)}</div>
+      ${q.easy_apply || q.approval_override || activeTask(q.id) || q.posting_closed || approvalRevisionPill(q) ? `<div class="row gap4 wrap mt2">${q.easy_apply ? pill('Easy Apply', 'brand') : ''}${q.approval_override ? pill('waived', 'warn') : ''}${approvalTaskPill(q)}${approvalRevisionPill(q)}${postingClosedPill(q)}</div>` : ''}</div>
+    ${approvalRowScores(q, minScore)}</div>`;
 }
 const RG_TONE = { met: 'good', partial: 'warn', missing: 'bad', unknown: 'muted' };
 // The job's requirements against what the candidate's facts show (the Ranker's assessments).
@@ -1555,7 +1575,7 @@ function renderRoleGaps(gaps) {
 }
 const APPR_MODE = { remote: 'Remote', hybrid: 'Hybrid', onsite: 'On-site' };
 // The role's facts the decision needs, under the title. A place outside your preferred locations is flagged amber.
-function renderApprovalFacts(f) {
+function renderApprovalFacts(f, job) {
   if (!f) return '';
   const item = (text, warn = false, title = '') => `<span class="fact ${warn ? 'warn' : ''}" ${title ? `title="${attr(title)}"` : ''}>${esc(text)}</span>`;
   const out = [];
@@ -1563,9 +1583,10 @@ function renderApprovalFacts(f) {
   out.push(item(f.work_mode_label || 'Work mode not stated'));
   out.push(item(f.salary ? f.salary.text : 'Salary not listed', false, f.salary ? 'As the posting states it' : 'The posting does not state a salary'));
   if (f.seniority) out.push(item(f.seniority));
-  if (f.posted_at) out.push(item(`posted ${toDate(f.posted_at).toLocaleDateString(undefined, { day: "numeric", month: "short" })}`));
+  if (f.posted_at) out.push(item(`posted ${toDate(f.posted_at).toLocaleDateString(undefined, { day: 'numeric', month: 'short' })}`));
   out.push(item(f.route?.label ? `${f.route.label}${f.route.auto_submit ? ' · can auto-apply' : ' · you apply'}` : 'No apply link', false, 'Where the application form lives'));
-  return `<div class="facts">${out.join('')}</div>`;
+  const links = job ? `<a class="xs" href="#" data-act="open-job" data-id="${job.id}">Job details</a>${job.url ? `<a class="xs" href="${attr(job.url)}" target="_blank" rel="noopener">Open posting ↗</a>` : ''}` : '';
+  return `<div class="facts">${out.join('')}${links ? `<span class="facts-links">${links}</span>` : ''}</div>`;
 }
 // Fix links on a check: the screen that fixes it, a settings page, or sending the packet back.
 function checkFix(c, job) {
@@ -1580,10 +1601,9 @@ function renderApprovalChecks(list, job) {
   const blockers = list.filter(c => c.state !== 'ok' && c.level === 'blocker');
   const nudges = list.filter(c => c.state !== 'ok' && c.level !== 'blocker');
   const passed = list.filter(c => c.state === 'ok');
-  const row = (c, tone) => `<div class="check-item ${tone}"><span class="mark">!</span><div class="grow"><div class="row between gap8 wrap"><span class="small b lbl">${esc(c.label)}</span>${checkFix(c, job)}</div><div class="xs muted mt4">${esc(c.detail)}</div></div></div>`;
-  return `<div class="appr-sec"><div class="row gap8 mb10"><span class="base b">Before you send it</span>${blockers.length ? pill(`${blockers.length} to fix`, 'bad') : pill('nothing to fix', 'good')}${nudges.length ? pill(`${nudges.length} to check`, 'warn') : ''}</div>
-    ${blockers.length || nudges.length ? `<div class="col gap8">${blockers.map(c => row(c, 'bad')).join('')}${nudges.map(c => row(c, 'warn')).join('')}</div>` : ''}
-    ${passed.length ? `<div class="row wrap gap6 mt10">${passed.map(c => `<span class="ok-chip" title="${attr(c.detail)}">✓ ${esc(c.label)}</span>`).join('')}</div>` : ''}</div>`;
+  const row = (c, tone) => `<div class="check-row ${tone}"><span class="small"><b class="lbl">${esc(c.label)}</b> <span class="muted">— ${esc(c.detail)}</span></span>${checkFix(c, job)}</div>`;
+  return `<div class="appr-sec"><div class="row wrap gap6 mb8"><span class="base b mr4">Before you send it</span>${blockers.length ? pill(`${blockers.length} to fix`, 'bad') : pill('nothing to fix', 'good')}${nudges.length ? pill(`${nudges.length} to check`, 'warn') : ''}${passed.map(c => `<span class="ok-chip" title="${attr(c.detail)}">✓ ${esc(c.label)}</span>`).join('')}</div>
+    ${blockers.length || nudges.length ? `<div class="col gap6">${blockers.map(c => row(c, 'bad')).join('')}${nudges.map(c => row(c, 'warn')).join('')}</div>` : ''}</div>`;
 }
 // Sending a packet back: tick what the revision should change (the reviewer's findings) and add your own words.
 // The revision pass is queued at once unless you untick it.
@@ -1597,24 +1617,26 @@ function renderRevisionPicker(job, r) {
       <a href="#" class="small" data-act="revise-close">Cancel</a></div>
     ${items.length ? `<div class="col gap6 mb10">${items.map((n, i) => `<label class="row top-align gap8 small"><input type="checkbox" data-act="revise-pick" data-i="${i}" ${picked.includes(n.text) ? 'checked' : ''}><span class="pretty">${esc(n.text)}</span></label>`).join('')}</div>` : ''}
     ${inputF('revise', 'note', '', 'placeholder="Anything else to change (optional)" maxlength="400"')}
+    ${(fv('approvalNotes', job.id, D.approval?.notes) || '').trim() ? `<label class="row top-align gap8 small mt8"><input type="checkbox" data-act="revise-notes" ${fv('revise', 'with_notes', false) ? 'checked' : ''}><span>Also send my notes: <span class="muted">${esc(String(fv('approvalNotes', job.id, D.approval?.notes)).slice(0, 160))}</span></span></label>` : ''}
     <label class="row gap8 small mt10"><input type="checkbox" data-act="revise-retailor" ${retailor ? 'checked' : ''}>Start the revision now (runs in the background)</label>
     <div class="row gap8 wrap mt10">${btn(label('revise', 'Send back', 'Sending back…'), 'revise', { id: job.id }, 'primary', isBusy('revise'))}</div></div>`;
 }
 const APPR_TABS = [['resume', 'Resume'], ['edits', 'Edits'], ['cover', 'Cover letter']];
 // The packet as it will be sent: the full resume, the edits (accept or revert each here) and the cover letter.
-function renderApprovalPacket(job, r) {
-  const tab = S.apprTab || 'resume';
+function renderApprovalPacket(job, r, focus = false) {
+  const tab = S.apprTab || 'resume', approved = job.status === 'approved';
   let body;
   if (tab === 'edits') {
     const edits = r.edits || [];
     body = edits.length ? `<div class="col gap8">${edits.map(e => `<div class="diff ${e.status}"><div class="row between mb6"><span class="caps">${esc(e.section)}</span>${pill(e.status === 'review' ? 'review this' : e.status, { accepted: 'good', review: 'warn', reverted: 'muted' }[e.status])}</div>
-      <div class="diff-before pretty">${esc(e.before)}</div><div class="diff-after pretty">${esc(e.after)}</div>
-      <div class="row wrap gap8 mt8">${e.evidence ? pill('evidence · ' + e.evidence, 'good') : pill('no verified evidence matched', 'warn')}<span class="grow"></span>${e.status !== 'accepted' ? btn(e.status === 'reverted' ? 'Restore' : 'Accept', 'appr-edit', { index: e.index, resume: r.id, status: 'accepted', job: job.id }, 'sm soft') : ''}${e.status !== 'reverted' ? btn('Revert', 'appr-edit', { index: e.index, resume: r.id, status: 'reverted', job: job.id }, 'sm') : ''}</div></div>`).join('')}</div>`
+      <div class="diff-before pretty">${esc(e.before)}</div>${S.apprEditing === e.index ? `<textarea class="textarea" id="appr-edit-text-${e.index}" aria-label="Edited text">${esc(e.after)}</textarea>` : `<div class="diff-after pretty">${esc(e.after)}</div>`}
+      <div class="row wrap gap8 mt8">${e.evidence ? pill('evidence · ' + e.evidence, 'good') : pill('no verified evidence matched', 'warn')}<span class="grow"></span>${S.apprEditing === e.index ? `${btn('Cancel', 'appr-edit-cancel', {}, 'sm')}${btn(label('appr-edit', 'Save edit', 'Saving…'), 'appr-edit-save', { index: e.index, resume: r.id, job: job.id }, 'sm primary', isBusy('appr-edit'))}` : btn('Edit', 'appr-edit-start', { index: e.index }, 'sm')}${S.apprEditing === e.index ? '' : e.status !== 'accepted' ? btn(e.status === 'reverted' ? 'Restore' : 'Accept', 'appr-edit', { index: e.index, resume: r.id, status: 'accepted', job: job.id }, 'sm soft') : ''}${e.status !== 'reverted' ? btn('Revert', 'appr-edit', { index: e.index, resume: r.id, status: 'reverted', job: job.id }, 'sm') : ''}</div></div>`).join('')}</div>`
       : `<div class="small muted">${r.untailored ? 'This packet uses your master resume unchanged: there are no edits.' : 'No edits recorded for this version.'}</div>`;
   } else if (tab === 'cover') {
-    body = r.cover_letter ? `<div class="doc pretty" style="white-space:pre-wrap">${esc(r.cover_letter)}</div><div class="xs muted mt6">${r.cover_words} words · edit it in Tailor</div>` : '<div class="small muted">This packet has no cover letter.</div>';
+    body = `${textareaF('cover' + r.id, 'text', r.cover_letter || '', 'style="min-height:220px;font-size:13px" aria-label="Cover letter"')}<div class="row gap8 mt8"><span class="xs muted grow">${r.cover_words} words${approved ? ' · editing withdraws the approval' : ''}</span>${btn(label('cover', 'Save cover letter', 'Saving…'), 'appr-cover-save', { resume: r.id, job: job.id }, 'sm primary', isBusy('cover'))}</div>`;
   } else {
-    body = `<div class="doc ${S.apprFull ? '' : 'clip'}">${miniMarkdown(r.markdown)}</div><button type="button" class="linkish xs mt6" data-act="appr-full">${S.apprFull ? 'Collapse' : 'Show the whole resume'}</button>`;
+    body = focus ? `<div class="doc">${miniMarkdown(r.markdown)}</div>`
+      : `<div class="doc ${S.apprFull ? '' : 'clip'}">${miniMarkdown(r.markdown)}</div><button type="button" class="linkish xs mt6" data-act="appr-full">${S.apprFull ? 'Collapse' : 'Show the whole resume'}</button>`;
   }
   return `<div class="appr-sec"><div class="row between wrap gap8 mb10"><div class="tabs under">${APPR_TABS.map(([id, t]) => `<button class="${tab === id ? 'on' : ''}" data-act="appr-tab" data-id="${id}">${t}${id === 'edits' && r.edits?.length ? ` <span class="faint">${r.edits.length}</span>` : ''}</button>`).join('')}</div>
     <div class="row gap10"><a class="small" href="/api/jobs/${job.id}/resume.pdf" target="_blank" rel="noopener">Open PDF ↗</a><a class="small" href="#" data-act="go" data-screen="tailor" data-job="${job.id}">Edit in Tailor</a></div></div>${body}</div>`;
@@ -1635,7 +1657,15 @@ function renderApprovalReview(job, r, minScore, gaps) {
       : '<div class="small muted">The reviewer left no notes.</div>';
   return `<div id="approval-review" class="appr-sec">
     <div class="row gap8 mb12">${pill('AI', 'brand')}<span class="base b">Why it fits, and what to fix</span>${unreviewed ? '' : `<span class="mono bb base" style="margin-left:auto;color:${r.reviewer_score >= minScore ? 'var(--good)' : 'var(--bad)'}" title="Reviewer score · your minimum is ${minScore}">${fitTxt(r.reviewer_score)} / 100</span>`}</div>
-    ${body}${renderRoleGaps(gaps)}</div>`;
+    ${renderScoreWhy(D.approval?.score_why)}${body}${renderRoleGaps(gaps)}</div>`;
+}
+// What stands behind the reviewer's score, from its own stored review (nothing recomputed).
+function renderScoreWhy(w) {
+  if (!w) return '';
+  const facts = [w.recommendation && `recommends ${String(w.recommendation).toLowerCase().replaceAll('_', ' ')}`, w.confidence != null && `${w.confidence}% confident`,
+    `${w.disputed} disputed claim${w.disputed === 1 ? '' : 's'}`, `${w.checks_failed} evidence check${w.checks_failed === 1 ? '' : 's'} failed`].filter(Boolean);
+  return `<details class="mb12"><summary class="xs" style="cursor:pointer;color:var(--brand-ink)">Why ${fitTxt(w.score)}? ${w.score >= w.minimum ? `clears your minimum of ${w.minimum}` : `${w.minimum - Math.round(w.score)} below your minimum of ${w.minimum}`}</summary>
+    <div class="box mt8 xs">${w.summary ? `<div class="pretty mb6">${esc(w.summary)}</div>` : ''}<div class="muted">${esc(facts.join(' · '))}</div>${w.decision_reasons.length ? `<ul class="mt6" style="padding-left:16px">${w.decision_reasons.map(r => `<li>${esc(r)}</li>`).join('')}</ul>` : ''}</div></details>`;
 }
 // The next job that still needs a decision after `id`, in the order the queue shows it (a collapsed group shows
 // only its first posting), wrapping round; null when none is left.
@@ -1648,12 +1678,29 @@ function nextToDecide(id) {
 }
 async function selectApproval(id) {
   if (!id) return;
-  if (id !== S.approvalJob) { S.revising = null; S.rejecting = null; S.overriding = null; S.apprFull = false; S.roleGapsAll = false; }
+  if (id !== S.approvalJob) { S.revising = null; S.rejecting = null; S.overriding = null; S.apprFull = false; S.roleGapsAll = false; S.apprEditing = null; }
   S.approvalJob = id; render();
   insEnsure(id);
   D.approval = await api(`/api/approvals/${id}`).catch(() => null);
   render();
   document.querySelector(`.appr-row[data-id="${id}"]`)?.scrollIntoView?.({ block: 'nearest' });
+}
+const UNDO_MS = 5000;
+// Send the approval that is counting down. `openKit` opens its apply kit afterwards (the person asked for it).
+function commitApproval(withKit = false) {
+  const p = S.pendingApprove; if (!p) return null;
+  clearTimeout(p.timer); S.pendingApprove = null;
+  return busy('approve', async () => {
+    const out = await api(`/api/jobs/${p.id}/approve`, { method: 'POST', body: { override: p.override, note: p.note } });
+    await load();
+    if (withKit) openKit(p.id);
+    return out;
+  }, out => `${p.title}: ${out?.approval_override ? 'approved below your minimum' : 'approved'}${p.effect === 'auto' ? ' · queued for the guarded submission' : ' · its apply kit is under Approved'}`);
+}
+function renderApproveUndo() {
+  const p = S.pendingApprove; if (!p) return '';
+  return `<div class="undo-bar" role="status"><span class="grow">Approving <b>${esc(p.title)}</b>${p.effect === 'auto' ? ' and queueing the guarded submission' : ''} in a few seconds</span>
+    <button type="button" class="btn sm" data-act="approve-undo">Undo</button><button type="button" class="btn sm good" data-act="approve-now" data-kit="${p.effect === 'auto' ? '' : '1'}">${p.effect === 'auto' ? 'Approve now' : 'Approve now & open kit'}</button></div>`;
 }
 // After a decision, move on to the next job that still needs one, so the queue is worked top to bottom.
 async function advanceApproval(id) {
@@ -1662,14 +1709,19 @@ async function advanceApproval(id) {
   S.revising = null; S.rejecting = null; S.apprFull = false;
   await load();
 }
-const APPR_KEYS = [['J / K', 'Next / previous job'], ['A', 'Approve'], ['R', 'Send back for revision'], ['X', 'Reject'], ['S', 'Star'], ['Space', 'Select the job'], ['?', 'Show or hide these shortcuts']];
-function renderApprovalsBody(list) {
-  if (!list.length) return `<section class="card">${empty('The queue is clear', 'Tailored packets land here for your sign-off.', btn('Go to Tailor', 'go', { screen: 'tailor' }, 'primary'))}</section>`;
-  const a = D.approval;
-  // One number everywhere: what still needs a decision, new or sent back (the sidebar badge counts the same).
+const APPR_KEYS = [['J / K', 'Next / previous job'], ['F', 'Full screen on or off'], ['A', 'Approve'], ['R', 'Send back for revision'], ['X', 'Reject'], ['S', 'Star'], ['Space', 'Select the job'], ['?', 'Show or hide these shortcuts']];
+// The queue column. Collapsed, it is a narrow rail with the position and ‹ › (the detail takes the width).
+function renderApprovalQueue(list, minScore) {
   const fresh = list.filter(x => x.waiting).length;
   const toDecide = list.filter(x => x.to_decide).length;
-  const minScore = D.approvalFacets?.min_review_score ?? D.approval?.min_review_score ?? 70;
+  const at = list.findIndex(q => q.id === S.approvalJob);
+  if (S.apprQueueHidden) {
+    return `<section class="card flush appr-queue appr-rail" aria-label="Queue (collapsed)">
+      <button type="button" class="rail-btn" data-act="appr-queue-toggle" title="Show the queue" aria-label="Show the queue">›</button>
+      <div class="rail-pos" title="${toDecide} to decide">${at + 1}<span>of ${list.length}</span></div>
+      <button type="button" class="rail-btn" data-act="appr-step" data-dir="-1" title="Previous job (K)" aria-label="Previous job">↑</button>
+      <button type="button" class="rail-btn" data-act="appr-step" data-dir="1" title="Next job (J)" aria-label="Next job">↓</button></section>`;
+  }
   const allOn = list.every(q => S.approvalPicked.has(q.id));
   const rows = approvalGroups(list).map(group => {
     const [first, ...rest] = [...group].sort((x, y) => (y.reviewer_score ?? -1) - (x.reviewer_score ?? -1));
@@ -1677,10 +1729,24 @@ function renderApprovalsBody(list) {
     const open = rest.length > 0 && (S.dupOpen.has(first.duplicate_key) || rest.some(q => q.id === S.approvalJob));
     return approvalRow(first, list, minScore, { extra: rest.length, open }) + (open ? rest.map(q => approvalRow(q, list, minScore, { child: true })).join('') : '');
   }).join('');
-  const queue = `<section class="card flush c-narrow appr-queue"><div class="card-head row gap10"><span class="appr-check" data-act="approval-check-all" role="checkbox" aria-checked="${allOn}" tabindex="0" aria-label="Select every job in the queue"><input type="checkbox" tabindex="-1" aria-hidden="true" ${allOn ? 'checked' : ''}></span><span class="card-title sm grow">Queue · ${toDecide} to decide</span>${toDecide ? `<span class="xs muted none">${fresh} new · ${toDecide - fresh} sent back</span>` : ''}</div>
-    <div class="appr-scroll">${rows}</div>
-    <div class="xs faint" style="padding:8px 16px;border-top:1px solid var(--line2)"><a href="#" data-act="appr-keys">Keyboard shortcuts (?)</a></div></section>`;
-  if (!a) return `<div class="split appr">${queue}<section class="card c-main">${loading()}</section></div>`;
+  const legend = `rev: the reviewer's score of the packet. Green at or above your minimum (${minScore}), amber within 10 of it, red below. fit: how well the job matches you.`;
+  return `<section class="card flush c-narrow appr-queue"><div class="card-head row gap8 appr-qhead"><span class="appr-check" data-act="approval-check-all" role="checkbox" aria-checked="${allOn}" tabindex="0" aria-label="Select every job in the queue"><input type="checkbox" tabindex="-1" aria-hidden="true" ${allOn ? 'checked' : ''}></span><span class="small b grow" title="${fresh} new · ${toDecide - fresh} sent back">Queue · ${toDecide} to decide</span>
+      <span class="help-dot" title="${attr(legend)}" tabindex="0" aria-label="${attr(legend)}">?</span><button type="button" class="icon-btn" data-act="appr-keys" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">⌨</button><button type="button" class="icon-btn" data-act="appr-queue-toggle" title="Collapse the queue" aria-label="Collapse the queue">‹</button></div>
+    <div class="appr-scroll">${rows}</div></section>`;
+}
+function renderApprovalsBody(list) {
+  if (!list.length) return `<section class="card">${empty('The queue is clear', 'Tailored packets land here for your sign-off.', btn('Go to Tailor', 'go', { screen: 'tailor' }, 'primary'))}</section>`;
+  const minScore = D.approvalFacets?.min_review_score ?? D.approval?.min_review_score ?? 70;
+  const queue = renderApprovalQueue(list, minScore);
+  const cls = `split appr ${S.apprQueueHidden ? 'no-queue' : ''}`;
+  if (!D.approval) return `<div class="${cls}">${queue}<section class="card c-main">${loading()}</section></div>`;
+  // Full screen holds the one copy of the detail (its fields have ids): the page shows where it went.
+  const detail = S.apprFocus ? `<section class="card c-main appr-detail">${empty('Open in full screen', 'This job is open in full screen.', btn('Back to the page', 'appr-focus-close', {}, ''))}</section>` : renderApprovalDetail(D.approval, list);
+  return `<div class="${cls}">${queue}${detail}</div>`;
+}
+// One job's decision: header (title, scores, actions, facts) and the body. The same markup on the page and in full
+// screen (`focus`), so both behave alike.
+function renderApprovalDetail(a, list, focus = false) {
   const r = a.resume, job = a.job;
   const approved = job.status === 'approved';
   // A packet the reviewer scored below your minimum can still be approved — deliberately, and on the record.
@@ -1690,27 +1756,42 @@ function renderApprovalsBody(list) {
   const decide = approved ? btn('Open apply kit', 'open-kit', { id: job.id }, 'good')
     : `<span title="${attr(effect.detail)}">${btn(label('approve', below ? 'Approve anyway…' : effect.label, 'Approving…'), approveAct, { id: job.id }, 'good', isBusy('approve') || !r)}</span>`;
   const keys = S.apprKeys ? `<div class="appr-sec" style="background:var(--soft)"><div class="row between mb8"><span class="small b">Keyboard shortcuts</span><a href="#" class="small" data-act="appr-keys">Close</a></div><div class="grid-auto" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:6px">${APPR_KEYS.map(([k, t]) => `<div class="xs"><span class="kbd">${esc(k)}</span> ${esc(t)}</div>`).join('')}</div></div>` : '';
-  return `<div class="split appr">${queue}
-  <section class="card flush c-main appr-detail"><div class="appr-head">
-    <div class="row between wrap gap12"><div style="min-width:0"><div class="row gap8 wrap" style="font-size:17px;font-weight:600">${starButton(job)}<span>${esc(job.title)} · ${esc(job.company)}</span></div>
-      <div class="xs muted mt4">${statusPill(job.status)} Fit ${fitTxt(job.fit)} · reviewer ${fitTxt(r?.reviewer_score)} · tailored ${esc(r?.generated || '')} ${postingClosedPill(job)}${list.find(x => x.id === job.id)?.easy_apply ? ` ${pill('Easy Apply', 'brand')}` : ''}
-        · <a href="#" data-act="open-job" data-id="${job.id}">Job details</a>${job.url ? ` · <a href="${attr(job.url)}" target="_blank" rel="noopener">Open posting ↗</a>` : ''}</div></div>
-      <div class="row gap8 wrap">${btn(label('reject', 'Reject', 'Rejecting…'), 'reject-open', { id: job.id }, 'danger-outline', isBusy('reject'))}${approved ? '' : btn('Send back', 'revise-open', { id: job.id }, '', isBusy('revise') || !r)}${decide}</div></div>
-    ${renderApprovalFacts(a.facts)}</div>
+  const score = (name, value, tone) => `<span class="score-chip ${tone || ''}">${name} <b>${fitTxt(value)}</b></span>`;
+  const revTone = r?.reviewer_score == null ? '' : r.reviewer_score >= a.min_review_score ? 'good' : 'bad';
+  const hasNotes = (fv('approvalNotes', job.id, a.notes) || '').trim();
+  return `<section class="card flush c-main appr-detail ${focus ? 'focus' : ''}"><div class="appr-head">
+    <div class="row between gap10 appr-head-row"><div class="row gap8" style="min-width:0;flex:1 1 320px">${starButton(job)}<span class="appr-h-title ellipsis" title="${attr(`${job.title} · ${job.company}`)}">${esc(job.title)} <span class="muted">· ${esc(job.company)}</span></span>${statusPill(job.status)}${postingClosedPill(job)}</div>
+      <div class="row gap6 wrap end">${score('fit', job.fit)}${score('rev', r?.reviewer_score, revTone)}<span class="xs faint">tailored ${esc(r?.generated || '')}</span></div></div>
+    <div class="row between gap8 wrap mt8">${renderApprovalFacts(a.facts, job)}
+      <div class="row gap6 wrap end appr-actions">${focus ? '' : `<button type="button" class="icon-btn lg" data-act="appr-focus" title="Open full screen (F)" aria-label="Open full screen">⤢</button>`}${btn(`Notes${hasNotes ? ' •' : ''}`, 'appr-notes', { id: job.id }, 'ghost sm', false)}${btn(label('reject', 'Reject', 'Rejecting…'), 'reject-open', { id: job.id }, 'danger-outline sm', isBusy('reject'))}${approved ? '' : btn('Send back', 'revise-open', { id: job.id }, 'sm', isBusy('revise') || !r)}${decide}</div></div>
+    ${a.stale ? `<div class="banner ${a.stale.kind === 'closed' ? 'bad' : 'warn'} mt8" style="display:block"><b>${a.stale.kind === 'closed' ? 'Posting closed.' : 'Old posting.'}</b> ${esc(a.stale.text)}</div>` : ''}
+    ${S.apprNotes === job.id ? `<div class="mt8"><textarea class="textarea" id="approval-notes" data-act-blur="save-notes" data-id="${job.id}" placeholder="Notes for yourself. Saved when you click away; Send back offers them to the revision.">${esc(fv('approvalNotes', job.id, a.notes))}</textarea></div>` : ''}</div>
     <div class="appr-body">
     ${keys}
-    ${pipelineBanner({ ...job, pipeline: a.pipeline }, '12px 22px 0')}
-    ${a.approval?.override ? `<div class="banner warn" style="margin:12px 22px 0;display:block"><b>Approved below your reviewer minimum.</b>${a.approval.note ? ` ${esc(a.approval.note)}` : ''}</div>` : ''}
+    ${pipelineBanner({ ...job, pipeline: a.pipeline }, '12px 18px 0')}
+    ${a.approval?.override ? `<div class="banner warn" style="margin:12px 18px 0;display:block"><b>Approved below your reviewer minimum.</b>${a.approval.note ? ` ${esc(a.approval.note)}` : ''}</div>` : ''}
     ${S.rejecting === job.id ? renderRejectPicker(job, a) : ''}
     ${S.revising === job.id ? renderRevisionPicker(job, r) : ''}
     ${S.overriding === job.id ? renderApprovalOverride(job, a, r) : ''}
-    ${r ? `${renderApprovalChecks(a.checklist, job)}
+    ${r ? `<div class="appr-cols"><div class="appr-col">${renderApprovalChecks(a.checklist, job)}
     ${renderApprovalReview(job, r, a.min_review_score, a.role_gaps)}
-    ${renderApprovalPacket(job, r)}
-    <div class="appr-sec"><div class="base b mb10">This job's application questions</div>${renderJobAnswers(a.answers)}</div>
-    ${renderInsightsCard(job.id)}
-    <div class="appr-sec"><div class="base b mb8">Notes for yourself</div><textarea class="textarea" id="approval-notes" data-act-blur="save-notes" data-id="${job.id}" placeholder="Saved when you click away. Sending back offers them to the revision.">${esc(fv('approvalNotes', job.id, a.notes))}</textarea></div>` : empty('No packet', 'This job has no tailored resume.')}
-  </div></section></div>`;
+    <div class="appr-sec"><div class="base b mb10">This job's application questions</div>${renderJobAnswers(a.answers)}</div></div>
+    <div class="appr-col">${renderApprovalPacket(job, r, focus)}
+    ${renderInsightsCard(job.id)}</div></div>` : empty('No packet', 'This job has no tailored resume.')}
+  </div></section>`;
+}
+// Full screen: the same detail over the whole window, with the queue position and ‹ › on top. Decisions move on to
+// the next job here too, so the whole queue can be worked without leaving it.
+function renderApprovalFocus() {
+  if (!S.apprFocus || S.screen !== 'approvals') return '';
+  const list = D.approvals || [], a = D.approval;
+  const at = list.findIndex(q => q.id === S.approvalJob);
+  return `<div class="overlay appr-focus-wrap"><div class="appr-focus" role="dialog" aria-modal="true" aria-label="Approval, full screen">
+    <div class="appr-focus-bar"><button type="button" class="btn sm ghost" data-act="appr-step" data-dir="-1" title="Previous job (K)">‹ Previous</button>
+      <span class="small muted">${at + 1} of ${list.length} · ${list.filter(x => x.to_decide).length} to decide</span>
+      <button type="button" class="btn sm ghost" data-act="appr-step" data-dir="1" title="Next job (J)">Next ›</button><span class="grow"></span>
+      <button type="button" class="btn sm" data-act="appr-focus-close" title="Back to the page (Esc)">Exit full screen ⤡</button></div>
+    ${a ? renderApprovalDetail(a, list, true) : `<div style="padding:40px">${loading()}</div>`}</div></div>`;
 }
 // Acting on several picked jobs, across the full width above the queue. An action that applies to none of them is
 // hidden, not greyed out; each button says how many it acts on and, where some are left out, why.
@@ -1764,7 +1845,7 @@ function approvalTaskPill(q) {
 // The daily posting check found this posting closed; the job stays because you approved it.
 const postingClosedPill = job => job.posting_closed ? `<span title="${attr(`The posting was found closed ${job.posting_closed.ago || ''}. Kept because you approved it.`)}">${pill('posting closed', 'bad')}</span>` : '';
 // A star marks a job to come back to. It is a bookmark only: it changes no workflow state.
-const starButton = job => `<button type="button" class="star-btn ${job.starred ? 'on' : ''}" data-act="approval-star" data-id="${job.id}" aria-pressed="${job.starred ? 'true' : 'false'}" aria-label="${job.starred ? 'Unstar' : 'Star'} ${attr(job.title)}" title="${job.starred ? 'Starred — click to unstar' : 'Star this job'}">${job.starred ? '★' : '☆'}</button>`;
+const starButton = job => `<button type="button" class="star-btn ${job.starred ? 'on' : ''}" data-act="approval-star" data-id="${job.id}" aria-pressed="${job.starred ? 'true' : 'false'}" aria-label="${job.starred ? 'Unstar' : 'Star'} ${attr(job.title)}" title="${job.starred ? 'Starred: pinned to the top of the queue. Click to unpin.' : 'Star to pin this job to the top of the queue (a bookmark only)'}">${job.starred ? '★' : '☆'}</button>`;
 // Only web links are opened in a new tab; a posting URL comes from a job board and is not trusted.
 function postingUrl(url) { return /^https?:\/\//i.test(url || '') ? url : ''; }
 // One tab per picked posting. window.open runs inside the click itself, before any await, or the browser
@@ -1945,7 +2026,7 @@ function renderKitQuestions(k) {
   };
   return `<div class="mt10"><div class="small b">${left ? `${left} of ${qs.length} question${qs.length === 1 ? '' : 's'} to answer` : 'All answered: it continues on the next pass'}</div>
     <div class="xs muted mt4 pretty">The form asks these and nothing verified answers them yet. What you save here goes to the Knowledge bank as a verified answer, and is reused for the same question on other applications.</div>
-    ${qs.map(q => `<div class="box mt8" style="padding:10px;border-radius:10px"><div class="small pretty">${esc(q.question)}${q.sensitive ? ` ${pill('Sensitive · confirmed per application', 'bad')}` : ''}</div>
+    ${qs.map(q => `<div class="box mt8" style="padding:10px;border-radius:10px"><div class="small pretty">${esc(q.question)}${q.sensitive ? ` ${pill('Sensitive · confirmed per application', 'bad')}` : ''}</div>${q.note ? `<div class="xs mt4" style="color:var(--warn-deep)">${esc(q.note)}</div>` : ''}
       ${q.answered ? `<div class="row gap8 mt6"><span class="small b pretty grow">${esc(q.answer)}</span>${pill('Saved', 'good')}</div>`
         : `<div class="mt6">${field(q)}</div>${btn(label(`kitq-${q.id}`, 'Save answer', 'Saving…'), 'kit-answer', { qid: q.id }, 'sm mt6', isBusy(`kitq-${q.id}`))}`}</div>`).join('')}
     ${btn('Open these in the Knowledge bank', 'kit-open-questions', { ids: qs.map(q => q.id).join(',') }, 'sm ghost mt8')}</div>`;
@@ -2505,12 +2586,28 @@ function render() {
   if (D.summary) $('#side-meta').textContent = `${D.summary.model || D.summary.llm_provider || ''} · ${(D.summary.application_mode || '').replace('_', ' ')}`;
   if (D.summary?.profile) $('#brand-sub').textContent = [D.summary.profile.name, D.summary.profile.headline].filter(Boolean).join(' · ') || 'Set up your profile';
   $('#top').innerHTML = renderTop();
+  $('#top').classList.toggle('compact', S.screen === 'approvals');
   $('#view').innerHTML = RENDER[S.screen]();
-  $('#overlays').innerHTML = (S.jobOpen ? renderJobModal() : '') + (S.kitJob ? renderKit() : '') + (S.paletteOpen ? renderPalette() : '') + (S.mon?.request ? renderMonRequestModal() : '')
+  $('#overlays').innerHTML = renderApprovalFocus() + (S.jobOpen ? renderJobModal() : '') + (S.kitJob ? renderKit() : '') + (S.paletteOpen ? renderPalette() : '') + (S.mon?.request ? renderMonRequestModal() : '')
     + (S.boardReview ? renderBoardReview() : '') + (S.mon?.ext?.request ? renderMonExtRequestModal() : '') + (S.mon?.logs?.entry ? renderMonLogModal() : '');
-  document.body.style.overflow = (S.jobOpen || S.kitJob || S.paletteOpen || S.mon?.request || S.boardReview) ? 'hidden' : '';
+  document.body.style.overflow = (S.jobOpen || S.kitJob || S.paletteOpen || S.mon?.request || S.boardReview || (S.apprFocus && S.screen === 'approvals')) ? 'hidden' : '';
   restoreView(kept);
+  fitApprovals();
 }
+// Approvals on a desktop: the queue and the decision fill exactly the height left under the filters, so each scrolls
+// on its own and the page itself does not (nothing to do on a phone, where they stack).
+function fitApprovals() {
+  const split = document.querySelector('.split.appr');
+  if (!split) return;
+  if (!window.matchMedia?.('(min-width: 901px)').matches) { split.style.height = ''; return; }
+  const top = split.getBoundingClientRect().top + window.scrollY;
+  let height = Math.max(480, window.innerHeight - top - 16);
+  split.style.height = `${height}px`;
+  // Whatever still scrolls the page (its own bottom padding) comes off the split too.
+  const over = document.scrollingElement.scrollHeight - window.innerHeight;
+  if (over > 0 && height - over >= 480) { height -= over; split.style.height = `${height}px`; }
+}
+window.addEventListener('resize', () => fitApprovals());
 
 /* ───────────── background tailoring ───────────── */
 let taskTimer = null;
@@ -3414,16 +3511,27 @@ const A = {
   'select-approval': el => selectApproval(Number(el.dataset.id)),
   'approve-override-open': el => { S.overriding = Number(el.dataset.id); S.rejecting = null; delete S.forms.override; render(); },
   'approve-override-close': (el, e) => { e?.preventDefault?.(); S.overriding = null; delete S.forms.override; render(); },
-  approve: el => busy('approve', async () => {
-    const override = el.dataset.override === '1';
-    const out = await api(`/api/jobs/${el.dataset.id}/approve`, { method: 'POST',
-      body: { override, note: override ? fv('override', 'note', '') : '' } });
+  // Approving waits UNDO_MS before anything reaches the server, so Undo is a plain cancel: no approval to revoke, no
+  // automatic submission to stop. The queue moves on at once; the bar at the bottom counts down.
+  approve: el => {
+    const id = Number(el.dataset.id), override = el.dataset.override === '1';
+    commitApproval();  // a previous approval still counting down is sent now
+    const q = (D.approvals || []).find(x => x.id === id) || D.approval?.job || {};
+    S.pendingApprove = { id, override, note: override ? fv('override', 'note', '') : '', title: `${q.title || ''} · ${q.company || ''}`,
+      effect: D.approval?.job?.id === id ? D.approval.approve_effect?.kind : null, until: Date.now() + UNDO_MS };
+    S.pendingApprove.timer = setTimeout(() => commitApproval(), UNDO_MS);
     S.overriding = null; delete S.forms.override;
-    const id = Number(el.dataset.id), effect = D.approval?.approve_effect?.kind;
-    await advanceApproval(id);
-    if (effect !== 'auto') openKit(id);
-    return out;
-  }, out => `${out.approval_override ? 'Approved below your minimum' : 'Approved'}${S.kitJob ? ' — here is your apply kit' : ' — queued for the guarded submission'}`),
+    const next = nextToDecide(id);
+    if (next) selectApproval(next); else render();
+  },
+  'approve-undo': (el, e) => {
+    e?.preventDefault?.();
+    const p = S.pendingApprove; if (!p) return;
+    clearTimeout(p.timer); S.pendingApprove = null;
+    selectApproval(p.id);
+    toast('Not approved');
+  },
+  'approve-now': (el, e) => { e?.preventDefault?.(); return commitApproval(el?.dataset?.kit === '1'); },
   // The whole gutter toggles the row (a collapsed row of duplicate postings toggles them all); shift-click picks
   // every row between this one and the last one picked.
   'approval-check': (el, e) => {
@@ -3454,11 +3562,36 @@ const A = {
   'role-gaps-all': () => { S.roleGapsAll = !S.roleGapsAll; render(); },
   'appr-tab': el => { S.apprTab = el.dataset.id; render(); },
   'appr-full': () => { S.apprFull = !S.apprFull; render(); },
+  'appr-focus': () => { S.apprFocus = true; S.pfOpen = null; render(); document.querySelector('.appr-focus [data-act="appr-focus-close"]')?.focus(); },
+  'appr-focus-close': () => { S.apprFocus = false; render(); document.querySelector(`.appr-row[data-id="${S.approvalJob}"]`)?.scrollIntoView?.({ block: 'nearest' }); },
+  'appr-queue-toggle': () => { S.apprQueueHidden = !S.apprQueueHidden; storeFlag('appr-queue-hidden', S.apprQueueHidden); render(); },
+  // The previous or next job in the order the queue shows it (the rail, and ‹ › in full screen).
+  'appr-step': el => {
+    const rows = [...document.querySelectorAll('.appr-row')].map(x => Number(x.dataset.id));
+    const order = rows.length ? rows : (D.approvals || []).map(q => q.id);
+    const at = order.indexOf(S.approvalJob), next = order[Math.min(order.length - 1, Math.max(0, at + Number(el.dataset.dir)))];
+    if (next && next !== S.approvalJob) selectApproval(next);
+  },
+  'pf-open': (el, e) => { e?.stopPropagation?.(); S.pfOpen = S.pfOpen === el.dataset.kind ? null : el.dataset.kind; render(); },
+  'appr-notes': () => { S.apprNotes = S.apprNotes === S.approvalJob ? null : S.approvalJob; render(); document.getElementById('approval-notes')?.focus(); },
   'appr-keys': (el, e) => { e?.preventDefault?.(); S.apprKeys = !S.apprKeys; render(); },
   'appr-edit': el => busy('appr-edit', async () => {
     await api(`/api/resumes/${el.dataset.resume}/edits/${el.dataset.index}`, { method: 'PATCH', body: { status: el.dataset.status } });
     D.approval = await api(`/api/approvals/${el.dataset.job}`);
   }, el.dataset.status === 'reverted' ? 'Edit reverted' : 'Edit accepted'),
+  'appr-edit-start': el => { S.apprEditing = Number(el.dataset.index); render(); document.getElementById(`appr-edit-text-${el.dataset.index}`)?.focus(); },
+  'appr-edit-cancel': () => { S.apprEditing = null; render(); },
+  // Read the typed text before busy() re-renders and replaces the textarea.
+  'appr-edit-save': el => { const text = document.getElementById(`appr-edit-text-${el.dataset.index}`).value; return busy('appr-edit', async () => {
+    await api(`/api/resumes/${el.dataset.resume}/edits/${el.dataset.index}`, { method: 'PATCH', body: { text, status: 'accepted' } });
+    S.apprEditing = null;
+    D.approval = await api(`/api/approvals/${el.dataset.job}`);
+  }, 'Edit saved'); },
+  'appr-cover-save': el => busy('cover', async () => {
+    await api(`/api/resumes/${el.dataset.resume}/cover-letter`, { method: 'PUT', body: { text: fv('cover' + el.dataset.resume, 'text', D.approval?.resume?.cover_letter || '') } });
+    delete S.forms['cover' + el.dataset.resume];
+    D.approval = await api(`/api/approvals/${el.dataset.job}`);
+  }, 'Cover letter saved'),
   'revise-open': el => { S.revising = Number(el.dataset.id); S.rejecting = null; S.overriding = null; delete S.forms.revise; render(); document.querySelector('[data-act="revise-close"]')?.closest('.appr-sec')?.scrollIntoView?.({ block: 'nearest' }); },
   'revise-close': (el, e) => { e?.preventDefault?.(); S.revising = null; delete S.forms.revise; render(); },
   'revise-pick': el => {
@@ -3469,6 +3602,7 @@ const A = {
     setF('revise', 'picked', [...picked]);
   },
   'revise-retailor': el => setF('revise', 'retailor', el.checked),
+  'revise-notes': el => setF('revise', 'with_notes', el.checked),
   'approval-check-all': () => {
     const list = D.approvals || [];
     S.approvalPicked = list.every(q => S.approvalPicked.has(q.id)) ? new Set() : new Set(list.map(q => q.id));
@@ -3532,7 +3666,8 @@ const A = {
     const note = String(fv('revise', 'note', '')).trim();
     const out = await api(`/api/jobs/${id}/revision`, { method: 'POST', body: {
       notes: fv('approvalNotes', id, D.approval?.job?.id === id ? D.approval.notes || '' : ''),
-      requests: [...picked, ...(note ? [note] : [])], retailor: fv('revise', 'retailor', true) } });
+      requests: [...picked, ...(note ? [note] : []), ...(fv('revise', 'with_notes', false) ? [String(fv('approvalNotes', id, D.approval?.notes || '')).trim()].filter(Boolean) : [])],
+      retailor: fv('revise', 'retailor', true) } });
     S.revising = null; delete S.forms.revise;
     await advanceApproval(id);
     refreshTasks();
@@ -3559,7 +3694,7 @@ const A = {
     if (!q) return;
     if (!answer) { toast('Type or choose an answer first', true); return; }
     return busy(`kitq-${q.id}`, async () => {
-      await api(`/api/knowledge/${q.id}`, { method: 'PUT', body: { question: q.question, answer, category: q.category, answer_type: q.answer_type, verified: true, sensitive: q.sensitive } });
+      await api(`/api/knowledge/${q.id}`, { method: 'PUT', body: { question: q.question, answer, category: q.category, answer_type: q.answer_type, verified: true, sensitive: q.sensitive, ...(q.other_job ? { for_job_id: Number(S.kitJob) } : {}) } });
       if (S.forms.kitq) delete S.forms.kitq[`q${q.id}`];
       D.kit = await api(`/api/jobs/${S.kitJob}/apply-kit`);
     }, 'Saved to the Knowledge bank');
@@ -3740,6 +3875,7 @@ document.addEventListener('click', e => {
   if (knowledgeLink && S.screen === 'knowledge' && !e.metaKey && !e.ctrlKey) { e.preventDefault(); knowledgeNavigate(knowledgeLink.hash.split('/')[1]); return; }
   const link = e.target.closest('a[href^="#settings/"]');
   if (link && S.screen === 'settings' && !e.metaKey && !e.ctrlKey) { e.preventDefault(); settingsNavigate(link.hash.split('/')[1]); return; }
+  if (S.pfOpen && !e.target.closest('.pf-pop, [data-act="pf-open"]')) { S.pfOpen = null; render(); }
   const el = e.target.closest('[data-act]');
   if (!el || el.disabled) return;
   const fn = A[el.dataset.act]; if (!fn) return;
@@ -3827,14 +3963,14 @@ function commitTag(el, redraw = true) {
 // Approvals shortcuts (APPR_KEYS). Each one clicks the same control the screen shows, so it does exactly what the
 // button does and nothing a button would not. True when the key was handled.
 function approvalKey(e) {
-  const key = e.key.toLowerCase(), rows = [...document.querySelectorAll('.appr-row')].map(x => Number(x.dataset.id));
-  const at = rows.indexOf(S.approvalJob);
+  const key = e.key.toLowerCase();
   const click = act => { const b = document.querySelector(`.appr-head [data-act="${act}"]:not([disabled])`); if (b) b.click(); return !!b; };
-  if (key === 'j' || key === 'k') { const next = rows[Math.min(rows.length - 1, Math.max(0, at + (key === 'j' ? 1 : -1)))]; if (next) selectApproval(next); }
+  if (key === 'j' || key === 'k') A['appr-step']({ dataset: { dir: key === 'j' ? 1 : -1 } });
   else if (key === 'a') { if (!click('approve') && !click('approve-override-open')) return false; }
   else if (key === 'r') { if (!click('revise-open')) return false; }
   else if (key === 'x') { if (!click('reject-open')) return false; }
   else if (key === 's') { if (!click('approval-star')) return false; }
+  else if (key === 'f') { S.apprFocus ? A['appr-focus-close']() : A['appr-focus'](); }
   else if (key === ' ' || key === 'spacebar') { const g = document.activeElement?.classList?.contains('appr-check') ? document.activeElement : document.querySelector(`.appr-row[data-id="${S.approvalJob}"] .appr-check`); if (!g) return false; A[g.dataset.act](g, e); }
   else if (e.key === '?') { S.apprKeys = !S.apprKeys; render(); }
   else return false;
@@ -3851,6 +3987,8 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && S.rangeEdit) { const { scope, field } = S.rangeEdit; S.rangeEdit = null; S.rangeError = ''; render(); document.querySelector(`[data-range-pill="${scope}:${field}"]`)?.focus(); return; }
   if (e.key === 'Escape' && S.datePop) { S.datePop = false; render(); document.getElementById('flt-date')?.focus(); return; }
   if (e.key === 'Escape' && S.moreFilters && document.getElementById('flt-more') && !S.paletteOpen && !S.jobOpen && !S.kitJob && !S.boardReview) { S.moreFilters = false; render(); document.querySelector('[data-act="toggle-more-filters"]')?.focus(); return; }
+  if (e.key === 'Escape' && S.pfOpen) { S.pfOpen = null; render(); document.querySelector('[data-act="pf-open"]')?.focus(); return; }
+  if (e.key === 'Escape' && S.apprFocus && !S.paletteOpen && !S.jobOpen && !S.kitJob) { A['appr-focus-close'](); return; }
   if (e.key === 'Escape') { if (S.boardReview && !S.paletteOpen && !S.jobOpen && !S.kitJob) { S.boardReview = null; render(); return; } if (S.paletteOpen || S.jobOpen || S.kitJob) { S.paletteOpen = false; S.jobOpen = null; S.kitJob = null; render(); } return; }
   if (el.dataset && el.dataset.tag) {
     if (e.key === 'Enter' || (e.key === ',' && el.dataset.split !== 'newline')) { e.preventDefault(); if (el.value.trim()) commitTag(el); return; }
@@ -3895,7 +4033,7 @@ window.addEventListener('hashchange', () => {
   }
 });
 window.addEventListener('beforeunload', e => {
-  if ((S.screen === 'settings' && settingsAnyDirty()) || screenFormDirty()) { e.preventDefault(); e.returnValue = ''; }
+  if ((S.screen === 'settings' && settingsAnyDirty()) || screenFormDirty() || S.pendingApprove) { e.preventDefault(); e.returnValue = ''; }
 });
 document.addEventListener('submit', e => {
   if (e.target.id === 'knowledge-editor-form') { e.preventDefault(); knowledgeSave(); }

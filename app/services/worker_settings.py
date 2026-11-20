@@ -101,7 +101,11 @@ FIELDS: dict[str, tuple[Field, ...]] = {
                  Field("max_attempts", "Attempts per job", "How often research is tried when every source fails.",
                        "int", "job_insights_max_attempts", 1, 10),
                  Field("retry_seconds", "First retry wait (seconds)", "Doubles with each attempt.", "int",
-                       "job_insights_retry_seconds", 60, 86400)),
+                       "job_insights_retry_seconds", 60, 86400),
+                 Field("before_approval_min_fit", "Research before approval (minimum fit)",
+                       "0 = off: research starts when you approve a job. Set a fit score and a packet that reaches "
+                       "Approvals with at least that fit is researched then, so you see the company while deciding. "
+                       "Each one uses your AI model.", "int", 0, 0, 100)),
     "indexing": (AUTO,
                  Field("max_attempts", "Attempts per entry",
                        "How often a fact or answer is sent to the embedding model before it is marked failed.", "int",

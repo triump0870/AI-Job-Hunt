@@ -2032,13 +2032,15 @@ PACKET_SORTS = {
     "reviewer": lambda r: (r["reviewer_score"] is None, -(r["reviewer_score"] or 0), -r["id"]),
     "company": lambda r: (r["company"].lower(), -r["id"]),
     "new": lambda r: (r["discovered_at"],),  # reversed below
+    # The employer's posting date, newest first; a job whose board gave none goes last.
+    "posted": lambda r: (r.get("posted_at") is not None, r.get("posted_at") or ""),  # reversed below: undated last
 }
 
 
 def filter_packet_rows(rows: list[dict], *, q: str, min_fit: int, min_review: int, board: str, status: str,
                        sort: str, status_filters: dict, with_facets: bool, location: str = "all",
                        easy_apply_only: bool = False, max_fit: int = 0, max_review: int = 0,
-                       work_mode: str = "all"):
+                       work_mode: str = "all", salary_only: bool = False):
     """Filter and sort Tailor or Approvals rows. The unfiltered order is kept for sort="" (the screen's default).
 
     Returns the plain list unless `with_facets`, which adds totals and the boards and locations present before
@@ -2059,16 +2061,18 @@ def filter_packet_rows(rows: list[dict], *, q: str, min_fit: int, min_review: in
                 and (board in ("all", "") or r["board"] == board)
                 and (location in ("all", "") or location_key(r["location"]) == location)
                 and (not easy_apply_only or r.get("easy_apply"))
-                and (work_mode in ("all", "") or (r.get("work_mode") or "not_stated") == work_mode)]
+                and (work_mode in ("all", "") or (r.get("work_mode") or "not_stated") == work_mode)
+                and (not salary_only or r.get("salary"))]
     out = [r for r in matching if status in ("all", "") or status_filters[status](r)]
     if sort in PACKET_SORTS:
-        out.sort(key=PACKET_SORTS[sort], reverse=sort == "new")
+        out.sort(key=PACKET_SORTS[sort], reverse=sort in ("new", "posted"))
     if not with_facets:
         return out
     return {"items": out, "total": len(out), "total_all": len(rows), "boards": sorted({r["board"] for r in rows}),
             "locations": location_facets([r["location"] for r in rows]),
             "easy_apply": sum(1 for r in rows if r.get("easy_apply")),
-            **({"work_modes": dict(Counter(r.get("work_mode") or "not_stated" for r in rows))}
+            **({"work_modes": dict(Counter(r.get("work_mode") or "not_stated" for r in rows)),
+                "with_salary": sum(1 for r in rows if r.get("salary"))}
                if rows and "work_mode" in rows[0] else {}),
             "status_counts": {"all": len(matching), **{k: sum(1 for r in matching if test(r))
                                                        for k, test in status_filters.items()}}}
@@ -2186,11 +2190,13 @@ APPROVAL_QUEUE_STATUSES = ("tailored", "pending_approval", "approved", "rejected
 def approvals(q: str = "", min_fit: int = 0, max_fit: int = 0, min_review: int = 0, max_review: int = 0,
               board: str = "all", location: str = "all", status: str = "all", sort: str = "default",
               easy_apply_filter: str = Query("all", alias="easy_apply"), work_mode: str = "all",
-              with_facets: bool = False, db: Session = Depends(get_user_db)):
+              salary: str = "all", with_facets: bool = False, db: Session = Depends(get_user_db)):
     if easy_apply_filter not in ("all", "", "only"):
         raise HTTPException(422, f"Unknown easy_apply filter: {easy_apply_filter}")
     if work_mode not in ("all", "", "remote", "hybrid", "onsite", "not_stated"):
         raise HTTPException(422, "work_mode must be remote, hybrid, onsite or not_stated")
+    if salary not in ("all", "", "only"):
+        raise HTTPException(422, f"Unknown salary filter: {salary}")
     jobs = db.scalars(select(Job).where(Job.status.in_(APPROVAL_QUEUE_STATUSES), reviewed_or_approved())
                       .order_by(desc(Job.id))).all()
     inputs = run_inputs(db, jobs)
@@ -2217,7 +2223,8 @@ def approvals(q: str = "", min_fit: int = 0, max_fit: int = 0, min_review: int =
     out = filter_packet_rows(rows, q=q, min_fit=min_fit, min_review=min_review, board=board, status=status, sort=sort,
                              status_filters=APPROVAL_STATUS_FILTERS, with_facets=with_facets,
                              location=location, easy_apply_only=easy_apply_filter == "only",
-                             max_fit=max_fit, max_review=max_review, work_mode=work_mode)
+                             max_fit=max_fit, max_review=max_review, work_mode=work_mode,
+                             salary_only=salary == "only")
     if with_facets:
         out["min_review_score"] = settings_for(db).min_review_score
         out["preferred_locations"] = list(get_profile(db).preferred_locations or [])
@@ -2225,7 +2232,8 @@ def approvals(q: str = "", min_fit: int = 0, max_fit: int = 0, min_review: int =
         out["status_counts"]["rejected"] = len(filter_packet_rows(
             rejected, q=q, min_fit=min_fit, min_review=min_review, board=board, status="all", sort="",
             status_filters=APPROVAL_STATUS_FILTERS, with_facets=False, location=location,
-            easy_apply_only=easy_apply_filter == "only", max_fit=max_fit, max_review=max_review, work_mode=work_mode))
+            easy_apply_only=easy_apply_filter == "only", max_fit=max_fit, max_review=max_review, work_mode=work_mode,
+                             salary_only=salary == "only"))
     return out
 
 
@@ -2237,8 +2245,8 @@ def approval_detail(job_id: int, db: Session = Depends(get_user_db)):
     profile = get_profile(db)
     answers = answers_for(db)
     questions = approval_review.job_answers(db, job)
-    checklist = (approval_review.checklist(job, data, latest_resume(db, job.id), profile, answers, questions)
-                 if resume else [])
+    variant = latest_resume(db, job.id)
+    checklist = approval_review.checklist(job, data, variant, profile, answers, questions) if resume else []
     app = job.application
     return {**data, "checklist": checklist, "pipeline": ranker.pipeline_status(db, job),
             "notes": app.notes if app else "", "application_id": app.id if app else None,
@@ -2246,7 +2254,9 @@ def approval_detail(job_id: int, db: Session = Depends(get_user_db)):
             "rejection_reasons": [{"id": key, "label": label} for key, label in REJECTION_REASONS.items()],
             "profile": {"name": profile.name, "headline": profile.headline, "location": profile.location},
             "answers": questions, "facts": approval_review.facts(db, job, profile),
-            "approve_effect": approval_review.approve_effect(db, job), "role_gaps": approval_review.role_gaps(job)}
+            "approve_effect": approval_review.approve_effect(db, job), "role_gaps": approval_review.role_gaps(job),
+            "score_why": approval_review.score_why(variant, data["min_review_score"]),
+            "stale": approval_review.stale(job)}
 
 
 class NotesIn(BaseModel):
@@ -3058,6 +3068,8 @@ class KnowledgeUpdateIn(BaseModel):
     answer_type: str = "text"
     verified: bool = False
     sensitive: bool = False
+    # Answered for one job (the Apply kit): a job-specific answer ("Why this role?") then belongs to that job.
+    for_job_id: int | None = None
 
 
 @router.put("/api/knowledge/{item_id}")
@@ -3065,11 +3077,14 @@ def knowledge_put(item_id: int, payload: KnowledgeUpdateIn, db: Session = Depend
     item = db.get(KnowledgeAnswer, item_id)
     if not item:
         raise HTTPException(404, "Knowledge answer not found")
+    if payload.for_job_id is not None:
+        get_job(db, payload.for_job_id)  # the account's own job, or 404
+        item.source_job_id = payload.for_job_id
     key = question_key(payload.question)
     clash = db.scalar(select(KnowledgeAnswer).where(KnowledgeAnswer.question_key == key, KnowledgeAnswer.id != item.id))
     if clash:
         raise HTTPException(409, "Another saved answer already covers this question")
-    for field, value in payload.model_dump().items():
+    for field, value in payload.model_dump(exclude={"for_job_id"}).items():
         setattr(item, field, value)
     item.question_key = key
     if item.verified and (item.answer or "").strip():

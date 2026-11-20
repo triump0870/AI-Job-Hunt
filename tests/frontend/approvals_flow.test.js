@@ -46,7 +46,7 @@ beforeEach(() => {
   }
   context.fetch = fetchMock;
   Object.assign(ui.S, { forms: {}, busy: {}, screen: 'approvals', approvalJob: 1, rejecting: null, overriding: null, revising: null,
-    approvalPicked: new Set(), approvalLast: null, dupOpen: new Set(), bulkRejecting: false, apprKeys: false });
+    approvalPicked: new Set(), approvalLast: null, dupOpen: new Set(), bulkRejecting: false, apprKeys: false, apprFocus: false, apprQueueHidden: false, pfOpen: null });
   ui.S.pf.approvals = ui.pfDefaults('approvals');
   Object.assign(ui.D, {
     tasks: [], insights: {},
@@ -65,7 +65,7 @@ describe('the Approvals queue', () => {
   it('collapses postings of one role behind their best-scored posting, and picking it picks them all', () => {
     expect(rows()).toEqual([1, 3, 4]);
     const toggle = view().querySelector('[data-act="approval-dup-toggle"]');
-    expect(toggle.textContent).toBe('+1 other posting of this role');
+    expect(toggle.textContent).toBe('+1');
     ui.A['approval-check'](view().querySelector('.appr-row[data-id="3"] .appr-check'), {});
     expect([...ui.S.approvalPicked].sort()).toEqual([2, 3]);
     ui.A['approval-dup-toggle'](toggle, {});
@@ -83,7 +83,7 @@ describe('the Approvals queue', () => {
     const text = view().textContent;
     expect(text).toContain('EUR 110K–135K/yr');
     expect(view().querySelector('.fact.warn').textContent).toBe('Dublin');
-    expect(view().querySelector('.check-item.bad').textContent).toContain('Fix in Tailor');
+    expect(view().querySelector('.check-row.bad').textContent).toContain('Fix in Tailor');
     expect(view().querySelector('.ok-chip').textContent).toContain('Length');
     expect(view().querySelector('[data-act="approve"]').textContent).toBe('Approve → apply kit');
     expect(text).toContain('HOW YOU MEET THE REQUIREMENTS · 0 of 1 met');
@@ -110,5 +110,55 @@ describe('the Approvals queue', () => {
     expect(ui.S.approvalJob).toBe(1);
     document.dispatchEvent(new window.KeyboardEvent('keydown', { key: '?', bubbles: true }));
     expect(view().textContent).toContain('Keyboard shortcuts');
+  });
+
+  it('edits a change and the cover letter in place, and keeps notes beside the decision', async () => {
+    ui.D.approval = { ...approval(1), resume: { ...approval(1).resume, edits: [{ index: 0, section: 'SUMMARY', before: 'Old', after: 'New', status: 'review', evidence: 'e1' }] } };
+    ui.S.apprTab = 'edits'; ui.render();
+    ui.A['appr-edit-start']({ dataset: { index: '0' } });
+    document.getElementById('appr-edit-text-0').value = 'Newer';
+    await ui.A['appr-edit-save']({ dataset: { index: '0', resume: '9', job: '1' } });
+    const [, method, body] = calls.find(([url]) => url.includes('/api/resumes/9/edits/0'));
+    expect(method).toBe('PATCH');
+    expect(body).toEqual({ text: 'Newer', status: 'accepted' });
+    ui.S.apprTab = 'cover'; ui.render();
+    expect(document.getElementById('cover9-text').value).toBe('Dear team');
+    ui.S.apprTab = 'resume';
+    ui.A['appr-notes']();
+    expect(view().querySelector('.appr-head #approval-notes')).not.toBeNull();
+  });
+
+  it('explains the score and warns about an old posting', () => {
+    ui.D.approval = { ...approval(1), stale: { kind: 'old', text: 'Posted 45 days ago: it may be filled.' },
+      score_why: { score: 80, minimum: 70, summary: 'Solid backend match', recommendation: 'APPLY', confidence: 80, decision: 'PASS', decision_reasons: ['meets your minimum'], disputed: 1, checks_failed: 0 } };
+    ui.render();
+    expect(view().querySelector('.appr-head .banner').textContent).toContain('Posted 45 days ago');
+    const why = view().querySelector('#approval-review details');
+    expect(why.querySelector('summary').textContent).toBe('Why 80? clears your minimum of 70');
+    expect(why.textContent).toContain('1 disputed claim');
+  });
+
+  it('opens the job full screen, moves through the queue there and closes with Esc', async () => {
+    ui.A['appr-focus']();
+    const overlay = document.querySelector('#overlays .appr-focus');
+    expect(overlay).not.toBeNull();
+    expect(overlay.querySelector('.appr-head [data-act="approve"]').textContent).toBe('Approve → apply kit');
+    expect(view().querySelector('.appr-head')).toBeNull();  // one copy of the detail: its fields have ids
+    expect(overlay.querySelector('.appr-focus-bar').textContent).toContain('1 of 4');
+    document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'j', bubbles: true }));
+    expect(ui.S.approvalJob).toBe(3);
+    document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    expect(ui.S.apprFocus).toBe(false);
+    expect(document.querySelector('#overlays .appr-focus')).toBeNull();
+  });
+
+  it('collapses the queue to a rail, and steps through jobs from it', () => {
+    ui.A['appr-queue-toggle']();
+    expect(view().querySelector('.appr-rail')).not.toBeNull();
+    expect(view().querySelector('.appr-rail .rail-pos').textContent).toContain('1');
+    ui.A['appr-step']({ dataset: { dir: '1' } });
+    expect(ui.S.approvalJob).toBe(2);
+    ui.A['appr-queue-toggle']();
+    expect(view().querySelector('.appr-rail')).toBeNull();
   });
 });

@@ -33,12 +33,6 @@ LIST_RE = re.compile(r"\[[^\]]*\]")
 # The count lines decide_review adds next to the claim lists themselves; the claims are shown instead.
 COUNT_RE = re.compile(r"^\d+ (unsupported|overstated) claim\(s\) found by the reviewer$")
 CODE_RE = re.compile(r"^([A-Z][A-Z_]+): (.*)$", re.DOTALL)
-# Questions whose answer is about one employer or one role: an answer written for another job reads wrong here.
-JOB_SPECIFIC_RE = re.compile(
-    r"\bwhy\b[^?]*\b(?:interested|want to (?:work|join)|wish to (?:work|join)|(?:this|our|the) "
-    r"(?:role|position|job|company|team|opportunity))\b|"
-    r"\bwhat\b[^?]*\b(?:excites|attracts|interests|draws) you\b",
-    re.IGNORECASE)
 MAX_ANSWERS = 20
 
 
@@ -196,7 +190,9 @@ def clean_question(question: str) -> str:
 
 
 def job_specific(question: str) -> bool:
-    return bool(JOB_SPECIFIC_RE.search(question or ""))
+    from app.services.knowledge import job_specific as specific
+
+    return specific(question)
 
 
 def _asked_by(row: KnowledgeAnswer, job_id: int) -> bool:
@@ -212,7 +208,7 @@ def _library_state(row: KnowledgeAnswer | None, job: Job, question: str) -> tupl
     if not row.verified:
         return "unverified", "Not verified"
     if job_specific(question) and row.source_job_id != job.id:
-        return "other_job", "Written for another job — check it fits"
+        return "other_job", "Written for another job — auto-apply drafts one for this job and asks you to save it"
     return "verified", "Verified"
 
 
@@ -373,3 +369,40 @@ def duplicate_key(job: Job) -> str:
     whole on purpose — "Engineer, Backend (Cards)" and "Engineer, Fullstack (Marketplace)" are different roles."""
     words = lambda text: " ".join(re.findall(r"[a-z0-9+#]+", (text or "").lower()))
     return f"{words(job.company)}|{words(job.title)}"
+
+
+STALE_DAYS = 30
+
+
+def stale(job: Job) -> dict[str, str] | None:
+    """Why this posting may no longer be worth applying to: closed by the employer, or posted long ago. Informs only;
+    the person may approve anyway."""
+    from datetime import UTC, datetime
+
+    if job.posting_closed_at is not None:
+        return {"kind": "closed", "text": "The daily posting check found this posting closed."}
+    if job.posted_at is not None:
+        days = (datetime.now(UTC).replace(tzinfo=None) - job.posted_at).days
+        if days > STALE_DAYS:
+            return {"kind": "old", "text": f"Posted {days} days ago: it may be filled. Check the posting before you "
+                                           "approve."}
+    return None
+
+
+def score_why(variant: Any, minimum: int) -> dict[str, Any] | None:
+    """What stands behind the reviewer's score, from its own stored review: its summary, recommendation and
+    confidence, the decision and its reasons, and how many claims it disputed. Nothing is recomputed."""
+    notes = (variant.reviewer_notes or {}) if variant is not None else {}
+    if variant is None or variant.reviewer_score is None or not notes:
+        return None
+    confidence = notes.get("confidence")
+    return {"score": variant.reviewer_score, "minimum": minimum, "summary": str(notes.get("summary") or "")[:600],
+            "recommendation": notes.get("recommendation") or None,
+            "confidence": round(float(confidence) * 100) if isinstance(confidence, int | float) else None,
+            "decision": notes.get("decision") or None,
+            # In words, as the review rows show them: no codes, and no "N claim(s) found" count lines (the claims
+            # themselves are listed under the score).
+            "decision_reasons": [_reason_text(str(r)) for r in notes.get("decision_reasons") or []
+                                 if str(r).strip() and not COUNT_RE.match(str(r).strip())][:5],
+            "disputed": len(notes.get("unsupported_claims") or []) + len(notes.get("overstated_claims") or []),
+            "checks_failed": len(notes.get("deterministic_issues") or [])}

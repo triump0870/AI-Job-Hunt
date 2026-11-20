@@ -46,6 +46,25 @@ PROFILE_ANSWERS = {
 }
 
 
+# Questions whose answer is about one employer or one role ("Why are you interested in this position?"): an answer
+# written for one job reads wrong on another, so it is reused only on the job it was written for (`fits_job`).
+JOB_SPECIFIC_RE = re.compile(
+    r"\bwhy\b[^?]*\b(?:interested|want to (?:work|join)|wish to (?:work|join)|(?:this|our|the) "
+    r"(?:role|position|job|company|team|opportunity))\b|"
+    r"\bwhat\b[^?]*\b(?:excites|attracts|interests|draws) you\b",
+    re.IGNORECASE)
+
+
+def job_specific(question: str) -> bool:
+    return bool(JOB_SPECIFIC_RE.search(question or ""))
+
+
+def fits_job(row: KnowledgeAnswer, job_id: int) -> bool:
+    """Whether a saved answer may be used on this job: any answer may, except a job-specific one written for another
+    job (or for none). Saving it for a job (`source_job_id`) makes it that job's."""
+    return not job_specific(row.question) or row.source_job_id == job_id
+
+
 def question_key(question: str) -> str:
     normalized = re.sub(r"[^a-z0-9]+", " ", question.lower()).strip()
     return hashlib.sha256(normalized.encode()).hexdigest()

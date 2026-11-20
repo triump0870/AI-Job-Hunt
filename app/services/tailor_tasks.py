@@ -109,6 +109,10 @@ def packet_outcome(db: Session, job: Job, resume: ResumeVariant, *, auto_approve
             auto_approved = True
         except ApprovalRefused:  # the job's state cannot reach ready-to-apply: a person decides
             db.rollback()
+    if not auto_approved and resume.reviewer_score is not None:
+        from app.services.job_insights import tasks as insight_tasks
+
+        insight_tasks.on_packet_ready(db, job)  # research before approval, when the account turned it on
     return {"resume_id": resume.id, "version": resume.version, "reviewer_score": resume.reviewer_score,
             "markdown": resume.markdown, "cover_letter": resume.cover_letter,
             "reviewer_notes": resume.reviewer_notes, "auto_approved": auto_approved,

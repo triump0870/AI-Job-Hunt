@@ -46,7 +46,7 @@ beforeEach(() => {
   }
   context.fetch = fetchMock; context.confirm = confirm;
   ui.S.forms = {}; ui.S.busy = {}; ui.S.screen = 'approvals'; ui.S.approvalJob = 7; ui.S.rejecting = null;
-  ui.S.overriding = null; ui.S.kitJob = null; ui.D.kit = null;
+  ui.S.overriding = null; ui.S.kitJob = null; ui.D.kit = null; clearTimeout(ui.S.pendingApprove?.timer); ui.S.pendingApprove = null;
   ui.S.pf = { tailor: { q: '', min_fit: 0, min_review: 0, board: 'all', status: 'all', sort: 'default' },
               approvals: { q: '', min_fit: 0, min_review: 0, board: 'all', status: 'all', sort: 'default' } };
   Object.assign(ui.D, {
@@ -124,7 +124,7 @@ describe('the Approvals queue header and rows', () => {
     ui.render();
     const text = view().textContent;
     expect(text).toContain('Queue · 2 to decide');
-    expect(text).toContain('1 new · 1 sent back');
+    expect(view().querySelector('.appr-qhead [title="1 new · 1 sent back"]')).not.toBeNull();
     expect(text).toContain('rev 45');
     expect(text).toContain('fit 92');
   });
@@ -203,7 +203,10 @@ describe('rejecting a job from Approvals', () => {
     expect(panel).toContain('your minimum does not change');
     expect(view().querySelector('a[href="#workers/settings"]').textContent).toBe('Change my minimum');
 
-    await ui.A.approve({ dataset: { id: '7', override: '1' } });
+    ui.A.approve({ dataset: { id: '7', override: '1' } });
+    expect(fetchMock.mock.calls.some(([u]) => u.endsWith('/approve'))).toBe(false);  // counting down: Undo still possible
+    expect(document.querySelector('.undo-bar').textContent).toContain('Undo');
+    await ui.A['approve-now']();
     const [url, options] = fetchMock.mock.calls.find(([u]) => u.endsWith('/approve'));
     expect(url).toBe('/api/jobs/7/approve');
     expect(JSON.parse(options.body).override).toBe(true);
@@ -216,9 +219,19 @@ describe('rejecting a job from Approvals', () => {
     expect(view().querySelector('[data-act="approve"]').textContent).toBe('Approve → apply kit');
     expect(view().querySelector('[data-act="approve-override-open"]')).toBeNull();
 
-    await ui.A.approve({ dataset: { id: '7' } });
+    ui.A.approve({ dataset: { id: '7' } });
+    await ui.A['approve-now']();
     const [, options] = fetchMock.mock.calls.find(([u]) => u.endsWith('/approve'));
     expect(JSON.parse(options.body)).toEqual({ override: false, note: '' });
+  });
+
+  it('cancels an approval that is still counting down, without telling the server anything', () => {
+    ui.D.approval = approval({ resume: { markdown: '# Rohan', reviewer_score: 80, generated: '3d ago', edits: [] } });
+    ui.render();
+    ui.A.approve({ dataset: { id: '7' } });
+    ui.A['approve-undo']();
+    expect(ui.S.pendingApprove).toBeNull();
+    expect(fetchMock.mock.calls.some(([u]) => u.endsWith('/approve'))).toBe(false);
   });
 
   it('says afterwards that a packet was approved below the minimum', () => {

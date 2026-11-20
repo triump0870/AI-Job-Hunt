@@ -279,3 +279,81 @@ def test_the_queue_filters_by_work_mode(owner):
     assert office in [r["id"] for r in rows(work_mode="not_stated")]
     assert rows(with_facets=True)["work_modes"]["remote"] == 1
     assert client.get("/api/approvals", params={"work_mode": "moon"}).status_code == 422
+
+
+def _form(label):
+    from app.services.ats_forms import ApplicationForm, FormField, SubmitControl
+    return ApplicationForm(adapter="test", host="example.com", submit=SubmitControl(present=True, label="Submit"),
+                           fields=[FormField(id="why", label=label, kind="textarea", required=True, locator="#why")])
+
+
+def test_auto_apply_never_sends_another_jobs_motivation_answer(owner):
+    from app.services import answer_resolver
+
+    first, second = make_job(owner), make_job(owner)
+    row = answer(owner, "Why are you interested in this position?", "Logitech's mice", job_id=first, asked_by=[first])
+    reusable = answer(owner, "Why are you looking for a new job?", "Growth", job_id=first)
+    with SessionLocal() as db:
+        db.info["user_id"] = owner
+        job = db.get(Job, second)
+        plan = answer_resolver.plan(db, job, _form("Why are you interested in this position?"))
+        assert plan["fields"]["why"]["status"] == "NEEDS_INPUT" and plan["needs_input"] == [row]
+        assert answer_resolver.plan(db, db.get(Job, first), _form("Why are you interested in this position?")
+                                    )["fields"]["why"]["status"] == "RESOLVED", "the job it was written for uses it"
+        assert answer_resolver.plan(db, job, _form("Why are you looking for a new job?")
+                                    )["fields"]["why"]["status"] == "RESOLVED", "not about one employer: reused"
+    assert reusable
+    # Answering it for this job (the Apply kit) makes the saved answer this job's.
+    out = client.put(f"/api/knowledge/{row}", json={"question": "Why are you interested in this position?",
+                                                    "answer": "Logitech builds what I use", "verified": True,
+                                                    "category": "approval-review-test", "for_job_id": second})
+    assert out.status_code == 200
+    with SessionLocal() as db:
+        db.info["user_id"] = owner
+        assert answer_resolver.plan(db, db.get(Job, second), _form("Why are you interested in this position?")
+                                    )["fields"]["why"]["status"] == "RESOLVED"
+
+
+def test_job_insights_draft_a_motivation_answer_written_for_another_job(owner):
+    from app.services.job_insights import application_form
+
+    first, second = make_job(owner), make_job(owner)
+    answer(owner, "Why are you interested in this position?", "Logitech's mice", job_id=first)
+    with SessionLocal() as db:
+        db.info["user_id"] = owner
+        waiting: set[str] = set()
+        assert application_form.before_model(db, "q", "Why are you interested in this position?", "FORM", waiting,
+                                             second) is None and waiting == {"q"}, "drafted for this job instead"
+        settled = application_form.before_model(db, "q", "Why are you interested in this position?", "FORM", set(),
+                                                first)
+        assert settled["status"] == "LIBRARY"
+        assert all(not approval_review.job_specific(a["question"])
+                   for a in application_form.known_answers(db, owner)), "never shown to the drafting model"
+
+
+def test_salary_filter_posted_sort_and_stale_postings(owner):
+    from datetime import datetime, timedelta
+
+    paid, old, fresh = make_job(owner), make_job(owner), make_job(owner)
+    with SessionLocal() as db:
+        db.get(Job, paid).salary_min = 100000
+        db.get(Job, old).posted_at = datetime.now() - timedelta(days=45)
+        db.get(Job, fresh).posted_at = datetime.now() - timedelta(days=2)
+        db.commit()
+    assert [r["id"] for r in rows(salary="only")] == [paid]
+    assert [r["id"] for r in rows(sort="posted")][:2] == [fresh, old], "undated postings last"
+    assert client.get(f"/api/approvals/{old}").json()["stale"]["kind"] == "old"
+    assert client.get(f"/api/approvals/{fresh}").json()["stale"] is None
+    why = client.get(f"/api/approvals/{paid}").json()["score_why"]
+    assert why["score"] == 74 and why["disputed"] == 2 and why["checks_failed"] == 1
+
+
+def test_why_the_score_reads_as_sentences(owner):
+    job = make_job(owner)
+    with SessionLocal() as db:
+        variant = db.scalar(select(ResumeVariant).where(ResumeVariant.job_id == job))
+        variant.reviewer_notes = {**NOTES, "decision_reasons": NOTES["reject_reasons"]}
+        db.commit()
+    reasons = client.get(f"/api/approvals/{job}").json()["score_why"]["decision_reasons"]
+    assert reasons == [("Resume: “s3-backed” isn't in the master resume, your profile or verified evidence — add it "
+                        "there first, or leave it out")]

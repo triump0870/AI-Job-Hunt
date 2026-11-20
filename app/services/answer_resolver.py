@@ -10,6 +10,8 @@ Order, per field:
   3. `knowledge.search` on the field's label: a verified saved answer to the same question (ANSWERED). For a select or
      radio the answer must be one of the form's own options, or the field is not answered;
   4. a sensitive saved answer (NEEDS_CONFIRMATION) is used only once the person confirmed it for this execution;
+     a job-specific answer ("Why this role?") written for another job is never used: the field waits on it
+     (NEEDS_INPUT) until the person saves one for this job (`knowledge.fits_job`);
   5. anything else a *required* field needs is saved for the person (`knowledge.request_answer`) and the execution
      waits (NEEDS_INPUT). Optional fields that cannot be answered, and voluntary self-identification (EEO), stay empty.
 
@@ -75,7 +77,7 @@ def plan(db: Session, job: Job, form: ApplicationForm, *, confirmed: list[int] |
     needs_confirmation: list[int] = []
     for field in form.fields:
         entry = _resolve(db, job, profile, field, confirmed_ids)
-        if entry["status"] == NEEDS_INPUT and field.required:
+        if entry["status"] == NEEDS_INPUT and field.required and not entry.get("other_job"):
             if before_write is not None:
                 before_write()
             saved = knowledge.request_answer(
@@ -129,6 +131,11 @@ def _resolve(db: Session, job: Job, profile: Any, field: FormField, confirmed: s
     status = found["status"]
     if status == "ANSWERED" and (found.get("answer_source") or "").startswith("knowledge_answer:"):
         answer = found["answer"]
+        row = db.get(KnowledgeAnswer, int(found["answer_source"].split(":", 1)[1]))
+        if row is not None and not knowledge.fits_job(row, job.id):
+            # "Why this role?" answered for another employer: never sent here. The run waits on that question; the
+            # Apply kit offers this job's own draft (job insights), and saving it makes the answer this job's.
+            return _entry(field, NEEDS_INPUT, why="written for another job", question_id=row.id, other_job=True)
         if _chooses(field) and _option_for(field, answer) is None:
             return _entry(field, NEEDS_INPUT, why="the saved answer is not one of the form's options")
         return _entry(field, RESOLVED, found["answer_source"])
