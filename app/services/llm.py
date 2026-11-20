@@ -436,7 +436,9 @@ class LLMClient:
             except RateLimitedCooldown as waiting:
                 raise _rate_limited(waiting) from waiting
         call = call or LLMCall()
-        route = self._direct_route(config, call.worker_type or worker_for_prompt(prompt_name) or STAGE_WORKERS.get(task))
+        route = (call.direct if call.direct is not None and provider == "openrouter"
+                 else self._direct_route(config, call.worker_type or worker_for_prompt(prompt_name)
+                                         or STAGE_WORKERS.get(task)))
         model = route.model if route else config["stage_models"].get(task) or config["model"]
         attempt = Attempt(provider=provider, requested_model=model, user_id=self.user_id, call=call,
                           prompt_name=prompt_name, prompt_version=prompt_version, system=system, user=user)

@@ -279,7 +279,7 @@ def discover_openrouter(db: Session, user_id: int, ids: list[str]) -> dict[str, 
         if row is not None and row.removed_at is not None:
             if model_id not in chosen:
                 continue  # a person removed it: a refresh leaves it removed
-            row.removed_at = None  # choosing it again brings it back, as adding a removed model does
+            row.removed_at, row.enabled = None, True  # choosing it again brings it back usable, as Restore does
         market = listed[model_id]
         if row is None:
             row = AIModel(user_id=user_id, litellm_model_name=name, display_name=market.name or model_id,
@@ -344,6 +344,9 @@ def test_model(db: Session, user_id: int, name: str) -> dict[str, Any]:
     row = db.scalar(select(AIModel).where(AIModel.user_id == user_id, AIModel.litellm_model_name == name))
     if row is not None and row.model_type == "EMBEDDING":
         return test_embedding_model(db, user_id, name, row)
+    if row is not None and _direct_openrouter(db, user_id) and model_resolution.is_openrouter_model(
+            name, {"provider": row.provider, "underlying_model": row.underlying_model}):
+        return _test_model_direct(db, user_id, row)
     prompt = build_model_health_prompt()
     structured = row is None or row.supports_structured_output is not False
     # The same model timeout as real requests (LLM_REQUEST_TIMEOUT_SECONDS): a slow or cold-loading local model
@@ -389,6 +392,51 @@ def test_model(db: Session, user_id: int, name: str) -> dict[str, Any]:
     return result
 
 
+def _direct_openrouter(db: Session, user_id: int) -> bool:
+    """Workers call OpenRouter directly (the LiteLLM route is off and the direct provider is OpenRouter)."""
+    status = config.gateway_status(db, user_id)
+    return not status["gateway_enabled"] and status["direct_provider"] == "openrouter"
+
+
+def _test_model_direct(db: Session, user_id: int, row: AIModel) -> dict[str, Any]:
+    """The health test of a model synced from OpenRouter, sent the way a worker would send it on the direct route
+    (the LLM layer, with the account's own OpenRouter key and free-only guard). A configuration problem (no key, the
+    free-only guard) is reported without calling the model unhealthy."""
+    from app.services.llm import LLMCall, LLMClient, LLMConfigError, LLMError
+
+    name = row.litellm_model_name
+    worker = model_resolution.ResolvedWorker(worker_type="MODEL_TEST", mode="FIXED", configured=name, model=name)
+    route = model_resolution.DirectRoute(worker, str(row.underlying_model), ())
+    client = LLMClient.for_user(db, user_id)
+    db.commit()  # no transaction across the model call; its telemetry is written from another session
+    result: dict[str, Any] = {"model": name, "route": "OPENROUTER", "success": False, "latency_ms": None,
+                              "model_group": None, "underlying_model": row.underlying_model,
+                              "structured_output": None, "error": None}
+    clock = time.monotonic()
+    health = True
+    try:
+        answer = client.generate_prompt(build_model_health_prompt(),
+                                        LLMCall(workflow_type="system", worker_type="MODEL_TEST", direct=route))
+        result.update(success=True, underlying_model=answer.model or row.underlying_model,
+                      structured_output=isinstance(answer.data, dict) and answer.data.get("ok") is True)
+    except LLMConfigError as exc:
+        health = False
+        result["error"] = redact_text(str(exc), 500)
+    except (LLMError, ValueError) as exc:
+        result["error"] = redact_text(str(exc), 500)
+    result["latency_ms"] = int((time.monotonic() - clock) * 1000)
+    row = db.get(AIModel, row.id)
+    if row is not None and health:
+        row.health_status = "HEALTHY" if result["success"] else "UNHEALTHY"
+        row.health_checked_at, row.health_latency_ms, row.health_error = config.utcnow(), result["latency_ms"], \
+            result["error"]
+    config.audit(db, user_id, "MODEL_TEST", actor=config._actor(db, user_id),
+                 result="SUCCEEDED" if result["success"] else "FAILED", changes=[{"model": name, "route": "OPENROUTER"}],
+                 error=result["error"])
+    db.commit()
+    return result
+
+
 def _schema_check(expected: dict[str, str]):
     def check(data: dict[str, Any]) -> dict[str, Any]:
         def wrong(value: Any, kind: str) -> bool:
@@ -428,8 +476,12 @@ def test_worker(db: Session, user_id: int, worker_type: str, *, use_draft: bool 
         return {"worker_type": worker_type, "configuration": "draft" if use_draft else "active", **out}
     resolved = model_resolution.resolve(snapshot, worker_type, None if use_draft else active.version_number)
     prompt, expected = build_worker_test_prompt(worker_type)
-    client = LLMClient(overrides={"llm_provider": "litellm"}, user_id=user_id,
-                       gateway=config.gateway_settings(db, user_id))
+    # On the direct OpenRouter route a worker assigned a model synced from OpenRouter is tested the way it runs:
+    # straight to OpenRouter. Anything else is tested through the gateway, as before.
+    direct = model_resolution.direct_route_for(snapshot, resolved) if _direct_openrouter(db, user_id) else None
+    client = (LLMClient.for_user(db, user_id) if direct is not None else
+              LLMClient(overrides={"llm_provider": "litellm"}, user_id=user_id,
+                        gateway=config.gateway_settings(db, user_id)))
     db.commit()  # no transaction across the model call; its telemetry is written from another session
     out: dict[str, Any] = {"worker_type": worker_type, "configuration": "draft" if use_draft else "active",
                            "model": resolved.model, "assignment": resolved.configured, "note": resolved.note,
@@ -437,7 +489,8 @@ def test_worker(db: Session, user_id: int, worker_type: str, *, use_draft: bool 
     clock = time.monotonic()
     try:
         result = client.generate_prompt(prompt, LLMCall(workflow_type="system", worker_type=worker_type,
-                                                        resolved=resolved, validate=_schema_check(expected)))
+                                                        resolved=resolved, direct=direct,
+                                                        validate=_schema_check(expected)))
         out.update(success=True, schema_ok=True, routing=result.routing,
                    answered_by=result.model, latency_ms=(result.routing or {}).get("latency_ms"),
                    input_tokens=result.usage.input_tokens if result.usage else None,

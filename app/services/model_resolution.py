@@ -321,7 +321,12 @@ def openrouter_route(user_id: int | None, worker_type: str | None) -> DirectRout
     Only the model and its backups carry over: escalation, failover resting and token pacing stay LiteLLM features.
     The backups go to OpenRouter as its own fallbacks, so a backup that is not an OpenRouter model is left out."""
     version, snapshot = active_snapshot(user_id)
-    worker = resolve(snapshot, worker_type, version)
+    return direct_route_for(snapshot, resolve(snapshot, worker_type, version))
+
+
+def direct_route_for(snapshot: dict[str, Any], worker: ResolvedWorker) -> DirectRoute | None:
+    """`worker` (resolved from `snapshot`, active or draft) on the direct OpenRouter route, or None when its model is
+    not a model synced from OpenRouter."""
     model = openrouter_id(snapshot, worker.model)
     if model is None:
         return None

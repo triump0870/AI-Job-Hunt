@@ -147,6 +147,7 @@ def test_a_resync_refreshes_facts_keeps_removals_and_never_deletes_a_delisted_mo
     account.call("POST", "/models/sync-openrouter", json={"ids": ["vendor/mid"]})
     mid = catalog(account.user_id)["openrouter/vendor/mid"]
     assert mid.removed_at is None and mid.context_window == 200000, "choosing it again brings it back, refreshed"
+    assert mid.enabled is True, "and usable: removing it had disabled it"
 
 
 def test_an_accounts_openrouter_models_are_its_own(account, web):
@@ -188,6 +189,10 @@ def direct(account, web, monkeypatch):
     account.gateway(False)
     monkeypatch.setattr(get_settings(), "llm_provider", "openrouter")  # the direct route's provider
     account.call("POST", "/models/sync-openrouter", json={"ids": ["vendor/cheap:free", "vendor/mid"]})
+    from app.services import user_settings
+    real_keys = user_settings.user_keys
+    monkeypatch.setattr(user_settings, "user_keys", lambda db, user_id=None: {**real_keys(db, user_id),
+                                                                             "openrouter": "sk-or-test"})
     account.fake = fake
     return account
 
@@ -243,3 +248,28 @@ def test_on_the_gateway_an_openrouter_model_must_still_be_served_by_litellm(dire
     direct.worker("RANKER", model_mode="FIXED", primary_model="openrouter/vendor/mid")
     refused = direct.apply(expect=422)
     assert "not served by LiteLLM" in str(refused)
+
+
+# ───────────── testing a model or a worker on the direct route ─────────────
+
+def test_a_synced_model_is_tested_through_openrouter_on_the_direct_route(direct):
+    out = direct.call("POST", "/models/openrouter/vendor/mid/test")
+    assert out["success"] is True and out["route"] == "OPENROUTER" and out["error"] is None
+    assert direct.fake.requests[-1]["model"] == "vendor/mid", "the OpenRouter id, never the catalog name"
+    assert catalog(direct.user_id)["openrouter/vendor/mid"].health_status == "HEALTHY"
+
+
+def test_a_configuration_problem_is_reported_without_calling_the_model_unhealthy(direct, monkeypatch):
+    monkeypatch.setattr(get_settings(), "openrouter_require_free", True)
+    out = direct.call("POST", "/models/openrouter/vendor/mid/test")
+    assert out["success"] is False and "OPENROUTER_REQUIRE_FREE" in out["error"]
+    assert direct.fake.requests == []
+    assert catalog(direct.user_id)["openrouter/vendor/mid"].health_status != "UNHEALTHY"
+
+
+def test_a_worker_on_a_synced_model_is_tested_through_openrouter(direct):
+    direct.worker("RANKER", model_mode="FIXED", primary_model="openrouter/vendor/mid",
+                  fallback_model="openrouter/vendor/cheap:free")
+    direct.call("POST", "/workers/RANKER/test", json={})
+    sent = direct.fake.requests[-1]
+    assert sent["model"] == "vendor/mid" and sent["extra_body"]["models"] == ["vendor/cheap:free"]
