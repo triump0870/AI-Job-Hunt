@@ -24,6 +24,7 @@ beforeEach(() => {
     runInContext('load = async () => {}; render = () => {};', context);
   }
   ui.S.pf.approvals = ui.pfDefaults('approvals'); ui.S.rangeEdit = null; ui.S.rangeError = '';
+  ui.S.pfOpen = 'approvals';  // Approvals keeps these filters in its Filters popover
 });
 
 describe('Packet filter bar', () => {
@@ -104,5 +105,19 @@ describe('Packet filter bar', () => {
     root.querySelector('#range-lo').value = '60'; root.querySelector('#range-hi').value = '';
     ui.A['range-apply']();
     expect([ui.S.pf.approvals.min_fit, ui.S.pf.approvals.max_fit, ui.S.rangeEdit]).toEqual([60, 0, null]);
+  });
+
+  it('keeps Approvals to one row: the other filters wait in a popover that counts the active ones', () => {
+    ui.S.pfOpen = null;
+    Object.assign(ui.S.pf.approvals, { min_fit: 70, work_mode: 'remote' });
+    let root = view(facets({ work_modes: { remote: 2 } }));
+    expect(root.querySelector('#pf-approvals-fit')).toBeNull();
+    const open = root.querySelector('[data-act="pf-open"]');
+    expect(open.textContent).toContain('Filters');
+    expect(open.querySelector('.pf-tab-count').textContent).toBe('2');
+    ui.S.pfOpen = 'approvals';
+    root = view(facets({ work_modes: { remote: 2 } }));
+    expect(root.querySelector('.pf-pop #pf-approvals-fit')).not.toBeNull();
+    expect(root.querySelector('.pf-pop #pf-approvals-work_mode').value).toBe('remote');
   });
 });

@@ -220,7 +220,7 @@ def test_revise_makes_each_run_a_revision_pass_on_the_latest_review(monkeypatch)
 
     asked, given = [], []
     monkeypatch.setattr(tailor_tasks, "_revision_feedback",
-                        lambda db, job, variant_id: asked.append(variant_id) or {"fix": ["cite evidence"]})
+                        lambda db, job, variant_id, requests=None: asked.append(variant_id) or {"fix": ["cite evidence"]})
     real_tailor = tailor_tasks.tailor_job
 
     def spy(db, job, progress, pages=None, feedback=None):
@@ -242,3 +242,37 @@ def test_revise_makes_each_run_a_revision_pass_on_the_latest_review(monkeypatch)
     with SessionLocal() as db:
         retried = db.query(TailorTask).filter(TailorTask.job_id == job_id, TailorTask.status == "queued").one()
         assert retried.options == {"revise_from": latest}
+
+
+def test_sending_a_packet_back_queues_a_revision_with_the_persons_requests(monkeypatch):
+    """Needs revision is never a dead end: it queues the revision pass at once, and what the person ticked reaches
+    the Tailor's previous review as person_requests."""
+    use_resume_text(client, "Built Python FastAPI services at 10k rps", name="Test Candidate", headline="Engineer")
+    job_id = tailored_job()
+    out = client.post(f"/api/jobs/{job_id}/revision",
+                      json={"notes": "", "requests": ["Unsupported: the S3 claim", "  Shorter summary  ", ""]}).json()
+    assert out["status"] == "pending_approval"
+    [queued] = out["retailor"]["queued"]
+    with SessionLocal() as db:
+        options = db.get(TailorTask, queued["id"]).options
+    assert options["person_requests"] == ["Unsupported: the S3 claim", "Shorter summary"] and options["revise_from"]
+
+    given = []
+    real_tailor = tailor_tasks.tailor_job
+    monkeypatch.setattr(tailor_tasks, "tailor_job", lambda db, job, progress, pages=None, feedback=None:
+                        given.append(feedback) or real_tailor(db, job, progress=progress, pages=pages,
+                                                              feedback=feedback))
+    assert tailor_tasks.run_pending(SessionLocal) == 1
+    assert given[0]["previous_review"]["person_requests"] == ["Unsupported: the S3 claim", "Shorter summary"]
+
+    again = client.post(f"/api/jobs/{job_id}/revision", json={"retailor": False}).json()
+    assert again["retailor"] is None, "the person can send it back without queueing a pass"
+
+
+def test_sending_back_in_bulk_starts_each_revision():
+    use_resume_text(client, "Built Python FastAPI services at 10k rps", name="Test Candidate", headline="Engineer")
+    job_id = tailored_job()
+    out = client.post("/api/approvals/bulk", json={"action": "revise", "job_ids": [job_id]}).json()
+    assert out["done"] == [job_id] and [t["job_id"] for t in out["retailor"]["queued"]] == [job_id]
+    with SessionLocal() as db:
+        assert "person_requests" not in (db.get(TailorTask, out["retailor"]["queued"][0]["id"]).options or {})

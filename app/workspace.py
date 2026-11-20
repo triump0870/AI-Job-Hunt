@@ -12,7 +12,7 @@ from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from statistics import median
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
 from bs4 import BeautifulSoup
@@ -2032,12 +2032,15 @@ PACKET_SORTS = {
     "reviewer": lambda r: (r["reviewer_score"] is None, -(r["reviewer_score"] or 0), -r["id"]),
     "company": lambda r: (r["company"].lower(), -r["id"]),
     "new": lambda r: (r["discovered_at"],),  # reversed below
+    # The employer's posting date, newest first; a job whose board gave none goes last.
+    "posted": lambda r: (r.get("posted_at") is not None, r.get("posted_at") or ""),  # reversed below: undated last
 }
 
 
 def filter_packet_rows(rows: list[dict], *, q: str, min_fit: int, min_review: int, board: str, status: str,
                        sort: str, status_filters: dict, with_facets: bool, location: str = "all",
-                       easy_apply_only: bool = False, max_fit: int = 0, max_review: int = 0):
+                       easy_apply_only: bool = False, max_fit: int = 0, max_review: int = 0,
+                       work_mode: str = "all", salary_only: bool = False):
     """Filter and sort Tailor or Approvals rows. The unfiltered order is kept for sort="" (the screen's default).
 
     Returns the plain list unless `with_facets`, which adds totals and the boards and locations present before
@@ -2057,15 +2060,20 @@ def filter_packet_rows(rows: list[dict], *, q: str, min_fit: int, min_review: in
                 and (not max_review or (r["reviewer_score"] is not None and r["reviewer_score"] <= max_review))
                 and (board in ("all", "") or r["board"] == board)
                 and (location in ("all", "") or location_key(r["location"]) == location)
-                and (not easy_apply_only or r.get("easy_apply"))]
+                and (not easy_apply_only or r.get("easy_apply"))
+                and (work_mode in ("all", "") or (r.get("work_mode") or "not_stated") == work_mode)
+                and (not salary_only or r.get("salary"))]
     out = [r for r in matching if status in ("all", "") or status_filters[status](r)]
     if sort in PACKET_SORTS:
-        out.sort(key=PACKET_SORTS[sort], reverse=sort == "new")
+        out.sort(key=PACKET_SORTS[sort], reverse=sort in ("new", "posted"))
     if not with_facets:
         return out
     return {"items": out, "total": len(out), "total_all": len(rows), "boards": sorted({r["board"] for r in rows}),
             "locations": location_facets([r["location"] for r in rows]),
             "easy_apply": sum(1 for r in rows if r.get("easy_apply")),
+            **({"work_modes": dict(Counter(r.get("work_mode") or "not_stated" for r in rows)),
+                "with_salary": sum(1 for r in rows if r.get("salary"))}
+               if rows and "work_mode" in rows[0] else {}),
             "status_counts": {"all": len(matching), **{k: sum(1 for r in matching if test(r))
                                                        for k, test in status_filters.items()}}}
 
@@ -2181,10 +2189,14 @@ APPROVAL_QUEUE_STATUSES = ("tailored", "pending_approval", "approved", "rejected
 @router.get("/api/approvals")
 def approvals(q: str = "", min_fit: int = 0, max_fit: int = 0, min_review: int = 0, max_review: int = 0,
               board: str = "all", location: str = "all", status: str = "all", sort: str = "default",
-              easy_apply_filter: str = Query("all", alias="easy_apply"),
-              with_facets: bool = False, db: Session = Depends(get_user_db)):
+              easy_apply_filter: str = Query("all", alias="easy_apply"), work_mode: str = "all",
+              salary: str = "all", with_facets: bool = False, db: Session = Depends(get_user_db)):
     if easy_apply_filter not in ("all", "", "only"):
         raise HTTPException(422, f"Unknown easy_apply filter: {easy_apply_filter}")
+    if work_mode not in ("all", "", "remote", "hybrid", "onsite", "not_stated"):
+        raise HTTPException(422, "work_mode must be remote, hybrid, onsite or not_stated")
+    if salary not in ("all", "", "only"):
+        raise HTTPException(422, f"Unknown salary filter: {salary}")
     jobs = db.scalars(select(Job).where(Job.status.in_(APPROVAL_QUEUE_STATUSES), reviewed_or_approved())
                       .order_by(desc(Job.id))).all()
     inputs = run_inputs(db, jobs)
@@ -2195,7 +2207,10 @@ def approvals(q: str = "", min_fit: int = 0, max_fit: int = 0, min_review: int =
         age = (f"approved {day_label(app.approved_at)}" if job.status == "approved" and app and app.approved_at
                else "sent back" if job.status == "pending_approval" else "rejected" if job.status == "rejected"
                else f"tailored {ago(resume.created_at) if resume else ''}")
+        pay = approval_review.salary(job)
         rows.append({**job_card(job), "reviewer_score": resume.reviewer_score if resume else None, "age": age,
+                     "work_mode": approval_review.work_mode(job), "salary": pay["text"] if pay else None,
+                     "duplicate_key": approval_review.duplicate_key(job),
                      "waiting": job.status == "tailored", "to_decide": job.status in TO_DECIDE_STATUSES,
                      "easy_apply": easy_apply(job, inputs.get(job.search_run_id)),
                      "approval_override": bool(app.approval_override) if app else False})
@@ -2208,14 +2223,17 @@ def approvals(q: str = "", min_fit: int = 0, max_fit: int = 0, min_review: int =
     out = filter_packet_rows(rows, q=q, min_fit=min_fit, min_review=min_review, board=board, status=status, sort=sort,
                              status_filters=APPROVAL_STATUS_FILTERS, with_facets=with_facets,
                              location=location, easy_apply_only=easy_apply_filter == "only",
-                             max_fit=max_fit, max_review=max_review)
+                             max_fit=max_fit, max_review=max_review, work_mode=work_mode,
+                             salary_only=salary == "only")
     if with_facets:
         out["min_review_score"] = settings_for(db).min_review_score
+        out["preferred_locations"] = list(get_profile(db).preferred_locations or [])
         # The Rejected tab counts what the other filters would show, though rejected rows are out of "All".
         out["status_counts"]["rejected"] = len(filter_packet_rows(
             rejected, q=q, min_fit=min_fit, min_review=min_review, board=board, status="all", sort="",
             status_filters=APPROVAL_STATUS_FILTERS, with_facets=False, location=location,
-            easy_apply_only=easy_apply_filter == "only", max_fit=max_fit, max_review=max_review))
+            easy_apply_only=easy_apply_filter == "only", max_fit=max_fit, max_review=max_review, work_mode=work_mode,
+                             salary_only=salary == "only"))
     return out
 
 
@@ -2226,14 +2244,19 @@ def approval_detail(job_id: int, db: Session = Depends(get_user_db)):
     resume = data["resume"]
     profile = get_profile(db)
     answers = answers_for(db)
-    checklist = approval_review.checklist(job, data, latest_resume(db, job.id), profile, answers) if resume else []
+    questions = approval_review.job_answers(db, job)
+    variant = latest_resume(db, job.id)
+    checklist = approval_review.checklist(job, data, variant, profile, answers, questions) if resume else []
     app = job.application
     return {**data, "checklist": checklist, "pipeline": ranker.pipeline_status(db, job),
             "notes": app.notes if app else "", "application_id": app.id if app else None,
             "approval": {"override": bool(app.approval_override), "note": app.approval_note or ""} if app else None,
             "rejection_reasons": [{"id": key, "label": label} for key, label in REJECTION_REASONS.items()],
             "profile": {"name": profile.name, "headline": profile.headline, "location": profile.location},
-            "answers": approval_review.job_answers(db, job)}
+            "answers": questions, "facts": approval_review.facts(db, job, profile),
+            "approve_effect": approval_review.approve_effect(db, job), "role_gaps": approval_review.role_gaps(job),
+            "score_why": approval_review.score_why(variant, data["min_review_score"]),
+            "stale": approval_review.stale(job)}
 
 
 class NotesIn(BaseModel):
@@ -2347,12 +2370,39 @@ def send_back_one(db: Session, job: Job, notes: str | None) -> None:
     preparation.on_decision(db, job, "revise")  # a waiting preparation graph run tailors again (bounded)
 
 
+class RevisionIn(BaseModel):
+    notes: str | None = None  # the notes for yourself; None keeps the ones on file
+    # What the revision should change: the reviewer's findings the person ticked, and their own words.
+    requests: list[str] = Field(default_factory=list, max_length=20)
+    retailor: bool = True  # queue the revision pass now
+
+
+def retailor_sent_back(db: Session, jobs: list[Job], requests: list[str] | None = None) -> dict[str, Any]:
+    """Queue a revision pass for packets just sent back, so "Needs revision" is never a dead end. A job whose
+    preparation graph run is waiting for the decision is left to that run (preparation.on_decision tailors it
+    again), so it is never tailored twice. Returns tailor_tasks.enqueue's {queued, skipped}."""
+    from app.services import preparation, tailor_tasks
+
+    ids, skipped = [], []
+    for job in jobs:
+        if preparation.active_task(db, job.id) is not None:
+            skipped.append({"id": job.id, "reason": "the preparation run revises it"})
+        else:
+            ids.append(job.id)
+    requests = tailor_tasks.person_requests(requests)
+    out = (tailor_tasks.enqueue(db, ids, "tailor", True, revise=True,
+                                options={"person_requests": requests} if requests else None)
+           if ids else {"queued": [], "skipped": []})
+    return {"queued": out["queued"], "skipped": out["skipped"] + skipped}
+
+
 @router.post("/api/jobs/{job_id}/revision")
-def send_back(job_id: int, payload: NotesIn, db: Session = Depends(get_user_db)):
+def send_back(job_id: int, payload: RevisionIn, db: Session = Depends(get_user_db)):
     job = get_job(db, job_id)
     send_back_one(db, job, payload.notes)
     db.commit()
-    return {"ok": True, "status": job.status}
+    retailor = retailor_sent_back(db, [job], payload.requests) if payload.retailor else None
+    return {"ok": True, "status": job.status, "retailor": retailor}
 
 
 # What the approval queue can do to several jobs at once. Approving in bulk only approves packets that cleared
@@ -2409,7 +2459,10 @@ def bulk_approval(payload: BulkApprovalIn, db: Session = Depends(get_user_db)):
     if done and payload.action in ("reject", "approve"):
         feedback_learning.after_feedback(db, db.info["user_id"])
         db.commit()
-    return {"ok": True, "action": payload.action, "done": done, "skipped": skipped}
+    retailor = None
+    if done and payload.action == "revise":
+        retailor = retailor_sent_back(db, list(db.scalars(select(Job).where(Job.id.in_(done))).all()))
+    return {"ok": True, "action": payload.action, "done": done, "skipped": skipped, "retailor": retailor}
 
 
 @router.put("/api/jobs/{job_id}/notes")
@@ -3015,6 +3068,8 @@ class KnowledgeUpdateIn(BaseModel):
     answer_type: str = "text"
     verified: bool = False
     sensitive: bool = False
+    # Answered for one job (the Apply kit): a job-specific answer ("Why this role?") then belongs to that job.
+    for_job_id: int | None = None
 
 
 @router.put("/api/knowledge/{item_id}")
@@ -3022,11 +3077,14 @@ def knowledge_put(item_id: int, payload: KnowledgeUpdateIn, db: Session = Depend
     item = db.get(KnowledgeAnswer, item_id)
     if not item:
         raise HTTPException(404, "Knowledge answer not found")
+    if payload.for_job_id is not None:
+        get_job(db, payload.for_job_id)  # the account's own job, or 404
+        item.source_job_id = payload.for_job_id
     key = question_key(payload.question)
     clash = db.scalar(select(KnowledgeAnswer).where(KnowledgeAnswer.question_key == key, KnowledgeAnswer.id != item.id))
     if clash:
         raise HTTPException(409, "Another saved answer already covers this question")
-    for field, value in payload.model_dump().items():
+    for field, value in payload.model_dump(exclude={"for_job_id"}).items():
         setattr(item, field, value)
     item.question_key = key
     if item.verified and (item.answer or "").strip():

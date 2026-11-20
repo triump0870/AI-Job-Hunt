@@ -315,11 +315,17 @@ function renderJobInsights(jobId) {
   return `<div class="ins" style="padding:16px 22px 22px">${insHeader(x, jobId)}${insTabs(tab)}<div class="mt14">${body(x, jobId)}</div></div>`;
 }
 // The Approvals card: the overview, and a way into the full package.
+// Approvals: one control that follows the research's state — start it, watch it run, then read the summary and
+// open the full report. An empty card stays one line so it never pushes the decision down.
 function renderInsightsCard(jobId) {
   const x = D.insights?.[jobId];
   if (!x) return '';
-  return `<div class="ins-card" style="padding:16px 22px;border-bottom:1px solid var(--line2)"><div class="row between wrap gap8 mb10"><div class="row gap8"><span class="base b">Job insights</span>${x.status !== 'NONE' ? pill(insWords(x.status), x.status === 'COMPLETED' ? 'good' : x.status === 'FAILED' ? 'bad' : 'warn') : ''}</div>
-      ${btn('Open insights', 'ins-open', { id: jobId }, 'sm')}</div>${insHeader(x, jobId)}${x.status === 'NONE' ? '' : `<div class="mt10">${insOverview(x)}</div>`}</div>`;
+  const never = x.status === 'NONE' && !x.researching;
+  const head = (state, action) => `<div class="row between wrap gap8"><div class="row gap8 wrap"><span class="base b">Company research</span>${state}</div>${action}</div>`;
+  if (never) return `<div class="appr-sec ins-card">${head('<span class="xs muted" title="To research packets automatically before you decide, set Research before approval in Running workers → Settings → Job insights">Company, team, pay and red flags for this job · not researched yet</span>', btn(label('insrefresh' + jobId, 'Research this company', 'Queueing…'), 'ins-refresh', { id: jobId }, 'sm', isBusy('insrefresh' + jobId)))}</div>`;
+  if (x.researching) return `<div class="appr-sec ins-card">${head(`${pill(x.task?.status === 'PROCESSING' ? 'Researching…' : 'Queued', 'brand')} <span class="xs muted">Runs in the background; this updates on its own.</span>`, '')}</div>`;
+  return `<div class="appr-sec ins-card">${head(pill(insWords(x.status), x.status === 'COMPLETED' ? 'good' : x.status === 'FAILED' ? 'bad' : 'warn'), `<span class="row gap6">${btn(label('insrefresh' + jobId, 'Refresh', 'Queueing…'), 'ins-refresh', { id: jobId }, 'sm ghost', isBusy('insrefresh' + jobId))}${btn('Full report', 'ins-open', { id: jobId }, 'sm')}</span>`)}
+    ${x.refresh_failed ? `<div class="xs mt6" style="color:var(--bad)">The last refresh failed${x.last_successful_at ? `; showing ${esc(insAgo(x.last_successful_at))}'s research` : ''}.</div>` : ''}<div class="mt10">${insOverview(x)}</div></div>`;
 }
 // The Tracker: what to prepare next for the application's stage.
 function renderStagePrep(app) {

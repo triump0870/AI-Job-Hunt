@@ -36,6 +36,7 @@ log = logging.getLogger("jobhunt.job_insights")
 PENDING, PROCESSING, COMPLETED, PARTIAL, FAILED, SKIPPED = (
     "PENDING", "PROCESSING", "COMPLETED", "PARTIAL", "FAILED", "SKIPPED")
 AUTO_APPROVED, USER_REQUEST, REFRESH, BACKLOG = "AUTO_APPROVED", "USER_REQUEST", "REFRESH", "BACKLOG"
+BEFORE_APPROVAL = "BEFORE_APPROVAL"
 FULL, APPLICATION_FORM = "FULL", "APPLICATION_FORM"  # JobInsightTask.scope
 KIND = "insights"  # the Running workers kind (app.services.workers, app.services.worker_settings)
 WORKER = "JOB_INSIGHTS"
@@ -102,6 +103,25 @@ def on_approved(db: Session, job: Job) -> None:
         pass  # another writer queued it at the same moment
     except Exception:
         log.exception("Could not queue job insights for job %s", job.id)
+
+
+def on_packet_ready(db: Session, job: Job) -> bool:
+    """A reviewed packet just reached Approvals: research the job now when the account turned "Research before
+    approval" on (a minimum fit above 0) and the job's fit reaches it. Off by default: research then waits for the
+    approval. Never fails the packet; does not commit. True when a task was queued."""
+    if not get_settings().job_insights_enabled or job.fit_score is None:
+        return False
+    try:
+        threshold = int(worker_settings.get(db, job.user_id, KIND, "before_approval_min_fit") or 0)
+        if threshold <= 0 or job.fit_score < threshold:
+            return False
+        with db.begin_nested():
+            return enqueue(db, job, reason=BEFORE_APPROVAL) is not None
+    except IntegrityError:
+        return False  # another writer queued it at the same moment
+    except Exception:
+        log.exception("Could not queue research before approval for job %s", job.id)
+        return False
 
 
 def sweep(db: Session, limit: int | None = None, *, now: datetime | None = None) -> dict[str, int]:

@@ -268,8 +268,11 @@ def _ready_to_continue(db: Session, task: ApplicationExecutionTask) -> bool:
         return bool(waiting.get("continued"))  # the person said they finished in the window
     needed = list(waiting.get("question_ids") or [])
     if needed:
+        from app.services.knowledge import fits_job
+
         rows = db.scalars(select(KnowledgeAnswer).where(KnowledgeAnswer.id.in_(needed))).all()
-        if len(rows) != len(set(needed)) or not all(r.verified and (r.answer or "").strip() for r in rows):
+        if len(rows) != len(set(needed)) or not all(r.verified and (r.answer or "").strip()
+                                                    and fits_job(r, task.job_id) for r in rows):
             return False
     confirm = set(waiting.get("confirm_question_ids") or [])
     return confirm <= set(task.confirmed_question_ids or [])
@@ -703,11 +706,37 @@ def questions(db: Session, task: ApplicationExecutionTask) -> list[dict[str, Any
     ids = list((task.interrupt or {}).get("question_ids") or []) if task.stage in WAITING_STAGES else []
     if not ids:
         return []
+    from app.services.knowledge import fits_job
+
     rows = {r.id: r for r in db.scalars(select(KnowledgeAnswer).where(KnowledgeAnswer.id.in_(ids))).all()}
-    return [{"id": i, "question": rows[i].question, "answer": rows[i].answer or "", "verified": rows[i].verified,
-             "answered": bool(rows[i].verified and (rows[i].answer or "").strip()),
-             "answer_type": rows[i].answer_type, "answer_options": rows[i].answer_options or [],
-             "category": rows[i].category, "sensitive": rows[i].sensitive} for i in ids if i in rows]
+    out = []
+    for i in ids:
+        if i not in rows:
+            continue
+        row = rows[i]
+        other = not fits_job(row, task.job_id)
+        # A job-specific answer written for another job: offer this job's own draft (job insights) in its place.
+        answer = (_insight_draft(db, task.job_id, row.question) or "") if other else (row.answer or "")
+        out.append({"id": i, "question": row.question, "answer": answer, "verified": row.verified and not other,
+                    "answered": bool(row.verified and (row.answer or "").strip()) and not other,
+                    "answer_type": row.answer_type, "answer_options": row.answer_options or [],
+                    "category": row.category, "sensitive": row.sensitive, "other_job": other,
+                    "note": "Your saved answer was written for another job. This is a draft for this one: check it "
+                            "and save it." if other else None})
+    return out
+
+
+def _insight_draft(db: Session, job_id: int, question: str) -> str | None:
+    """This job's drafted answer to the same question (job insights' application questions), if one was drafted."""
+    from app.models import JobInsight
+    from app.services import knowledge
+
+    insight = db.scalar(select(JobInsight).where(JobInsight.job_id == job_id))
+    for item in (insight.application_questions if insight else None) or []:
+        if item.get("status") == "DRAFTED" and item.get("answer") \
+                and knowledge.same_question(question, item.get("question") or ""):
+            return str(item["answer"])
+    return None
 
 
 def confirmations(db: Session, task: ApplicationExecutionTask) -> list[dict[str, Any]]:

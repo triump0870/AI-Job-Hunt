@@ -34,3 +34,9 @@ def test_max_review_is_inclusive_and_leaves_out_unreviewed_packets():
     out = filter_packet_rows(rows, q="", min_fit=0, min_review=60, max_review=70, board="all", status="all", sort="",
                              status_filters=APPROVAL_STATUS_FILTERS, with_facets=False)
     assert [r["id"] for r in out] == [2]
+
+
+def test_a_work_mode_prefix_is_not_a_place():
+    from app.services.locations import location_key
+    assert location_key("Hybrid - Bengaluru") == location_key("Bengaluru, Karnataka") == "Bengaluru"
+    assert location_key("On-site: Pune, India") == "Pune" and location_key("Hybrid - Remote") == "Remote"

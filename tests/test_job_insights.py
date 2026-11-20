@@ -171,6 +171,22 @@ def test_approval_queues_research_without_waiting_for_it(owner):
     assert insight_of(job_id) is None, "approval only writes a task row; nothing is researched yet"
 
 
+def test_research_before_approval_is_off_until_the_account_sets_a_fit(owner):
+    from app.services import worker_settings
+
+    low, high = new_job(owner, approve=False, fit_score=70), new_job(owner, approve=False, fit_score=85)
+    with SessionLocal() as db:
+        db.info["user_id"] = owner
+        assert not tasks.on_packet_ready(db, db.get(Job, high)), "off by default: research waits for approval"
+        worker_settings.update(db, owner, {"insights": {"before_approval_min_fit": 80}})
+        assert not tasks.on_packet_ready(db, db.get(Job, low))
+        assert tasks.on_packet_ready(db, db.get(Job, high))
+        db.commit()
+        worker_settings.update(db, owner, {"insights": {"before_approval_min_fit": 0}})
+        db.commit()
+    assert [t.reason for t in tasks_of(high)] == ["BEFORE_APPROVAL"] and tasks_of(low) == []
+
+
 def test_approval_stands_when_queueing_research_fails(owner, monkeypatch):
     def broken(*args, **kwargs):
         raise RuntimeError("queue unavailable")
